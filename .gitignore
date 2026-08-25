@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local runtime state (real credentials, usage history, logs — never commit)
+*.log
+.claude-unlimited/
+
+# Tool-specific working directories not part of the shipped project
+.impeccable/
+graphify-out/
+.claude/
+
+# Internal-only documents — kept locally, never published.
+# Everything below stays on this machine on purpose: it is either working
+# material, internal decision history, or not relevant to someone using or
+# contributing to the project.
+docs/archive/
+CONTEXT.md
+PRODUCT.md
+docs/RELEASING.md
+docs/adr/0003-consumer-oauth-pooling-and-export-crypto-on-hold.md
+docs/adr/0004-user-accepted-risk-and-scope-decisions.md
+
+# No changelog until the first tagged release.
+CHANGELOG.md

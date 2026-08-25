@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # The daemon's install/service backends are macOS-only-verified today
+    # (see docs/adr/0005-*.md) — the test suite itself mocks all OS-level
+    # calls, so it runs the same on any runner, but macOS is what actually
+    # matches a real user's environment for this project right now.
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package
+        run: pip install -e .
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -v
+
+      - name: Check JS syntax
+        run: node --check claude_unlimited/static/app.js

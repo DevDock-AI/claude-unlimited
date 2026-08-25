@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-unlimited"
+version = "0.1.0"
+description = "Local daemon that pools Claude Pro/Max subscriptions, Anthropic API keys, and ChatGPT/Codex accounts behind one proxy, with a web Dashboard"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "DevDock" }]
+keywords = ["claude", "claude-code", "anthropic", "openai", "codex", "proxy", "rotation", "daemon", "dashboard"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Utilities",
+]
+# The ONE approved exception to "zero backend dependencies" — see
+# a recorded, deliberate exception. Used only
+# by claude_unlimited/export_import.py, for authenticated encryption of
+# Export bundles containing real credentials. No other module may import it.
+dependencies = ["cryptography>=42"]
+
+[project.urls]
+Homepage = "https://github.com/DevDock-AI/claude-unlimited"
+Repository = "https://github.com/DevDock-AI/claude-unlimited"
+Issues = "https://github.com/DevDock-AI/claude-unlimited/issues"
+Funding = "https://ko-fi.com/devdock"
+
+[project.scripts]
+claude-unlimited = "claude_unlimited.cli:main"
+
+[tool.setuptools]
+packages = ["claude_unlimited", "claude_unlimited.secret_store", "claude_unlimited.daemon_installer"]
+
+[tool.setuptools.package-data]
+# static/ and locales/ are plain data directories (no __init__.py, so they're
+# not "packages") — without this, a real `pip install .` silently omits the
+# Dashboard's HTML/JS and every locale file from the installed package: the
+# daemon would start, but / and /app.js would 404 and i18n would have
+# nothing to load. Caught before it ever shipped, by actually building the
+# install rather than assuming `packages` alone covers it.
+claude_unlimited = ["static/*", "locales/*"]

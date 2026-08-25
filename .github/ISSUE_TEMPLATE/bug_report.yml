@@ -1,0 +1,82 @@
+name: Bug report
+description: Something isn't working the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        **Please never paste credentials.** No API keys, no OAuth tokens, no
+        `~/.claude-unlimited/config.json` contents, no screenshots showing a
+        real token. Redact anything that looks like a secret.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `claude-unlimited doctor`
+      description: This is redaction-safe — it never prints credentials.
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Linux and Windows backends are an unverified first cut — see the README.
+      options:
+        - macOS
+        - Linux
+        - Windows
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: From `claude-unlimited doctor`, or the commit you are on.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: profile-kind
+    attributes:
+      label: Which kind of Profile is involved?
+      options:
+        - Claude subscription (OAuth)
+        - Anthropic API / gateway key
+        - ChatGPT / Codex
+        - Several, or not sure
+        - Not Profile-specific
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: From `~/.claude-unlimited/logs/`. Redact anything sensitive.
+      render: shell
+    validations:
+      required: false

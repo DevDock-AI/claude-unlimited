@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest an improvement or a new capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening this, it's worth skimming the README's Roadmap and
+        `docs/ARCHITECTURE.md` — a few things are deliberately not built yet,
+        with the reasoning written down.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation you hit, not just the feature you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything you tried or considered instead?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Project constraints
+      description: These keep the project small and auditable. Please confirm you've considered them.
+      options:
+        - label: This does not require a new backend dependency (stdlib only, see CONTRIBUTING.md)
+          required: false
+        - label: This does not require a frontend build step
+          required: false

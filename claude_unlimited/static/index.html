@@ -1,0 +1,1967 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="csrf-token" content="__CSRF_TOKEN__">
+<title>Claude Unlimited</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  :root {
+    --bg: #0A0A0C; --bg-rail: #0E0E11; --bg-panel: #131316; --bg-panel-alt: #1B1B20; --bg-field: #0E0F12;
+    --border: rgba(255,255,255,0.08); --border-soft: rgba(255,255,255,0.05);
+    --text: #F2F2F3; --text-dim: #9A9AA1; --text-faint: #6E6E76;
+    --accent: #43C6FF; --accent-ink: #04141F; --accent-soft: rgba(67,198,255,0.14); --accent-border: rgba(67,198,255,0.4);
+    --warn: #FFB020; --warn-soft: rgba(255,176,32,0.14); --warn-border: rgba(255,176,32,0.32);
+    --good: #35D07F; --good-soft: rgba(53,208,127,0.14);
+    --bad: #FF5C5C; --bad-soft: rgba(255,92,92,0.12); --bad-border: rgba(255,92,92,0.35);
+    /* Codex/OpenAI Profiles get their own accent, distinct from --accent (the
+       Claude/Anthropic blue used by oauth+api), applied consistently across
+       their icon, badge, and type-card. */
+    --codex: #2FD9C4; --codex-soft: rgba(47,217,196,0.14); --codex-border: rgba(47,217,196,0.38);
+    --track: #1E1E23; --track-marker: rgba(255,255,255,0.5); --chip-off: #2A2A2F; --knob-on: #0A0A0C;
+    --fs-micro: 10.5px; --fs-body: 13px; --fs-name: 16px; --fs-stat: 20px;
+  }
+  html.light-theme, .app.light-theme {
+    --bg: #F5F6F8; --bg-rail: #FFFFFF; --bg-panel: #FFFFFF; --bg-panel-alt: #F1F2F4; --bg-field: #FFFFFF;
+    --border: rgba(0,0,0,0.1); --border-soft: rgba(0,0,0,0.06);
+    --text: #14151A; --text-dim: #5B5F66; --text-faint: #8A8F98;
+    --accent: #0B78B4; --accent-ink: #FFFFFF; --accent-soft: rgba(11,120,180,0.12); --accent-border: rgba(11,120,180,0.35);
+    --warn: #B3690A; --warn-soft: rgba(179,105,10,0.12); --warn-border: rgba(179,105,10,0.3);
+    --good: #1C8A3E; --good-soft: rgba(28,138,62,0.12);
+    --bad: #D42B2B; --bad-soft: rgba(212,43,43,0.1); --bad-border: rgba(212,43,43,0.3);
+    --codex: #0E8F80; --codex-soft: rgba(14,143,128,0.12); --codex-border: rgba(14,143,128,0.32);
+    --track: #E7E9EC; --track-marker: rgba(0,0,0,0.35); --chip-off: #DDE0E4; --knob-on: #FFFFFF;
+  }
+  body {
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  a { color: var(--accent); }
+
+  .app { display: flex; min-height: 100vh; position: relative; }
+  .ambient-glow { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+  .ambient-glow::before, .ambient-glow::after {
+    content: ""; position: absolute; width: 640px; height: 640px; border-radius: 50%; filter: blur(90px); opacity: .35;
+  }
+  .ambient-glow::before { top: -220px; left: 10%; background: radial-gradient(circle, var(--accent) 0%, transparent 70%); }
+  .ambient-glow::after { bottom: -260px; right: 6%; background: radial-gradient(circle, #7C5CFF 0%, transparent 70%); opacity: .2; }
+  .light-theme .ambient-glow::before, .light-theme .ambient-glow::after { opacity: .12; }
+  .cursor-glow {
+    position: fixed; width: 480px; height: 480px; border-radius: 50%; pointer-events: none; z-index: 0;
+    background: radial-gradient(circle, var(--accent-soft) 0%, transparent 72%);
+    transform: translate(calc(var(--mx, 50vw) - 50%), calc(var(--my, 50vh) - 50%));
+    opacity: 0; transition: opacity 400ms ease;
+  }
+  .cursor-glow.on { opacity: 1; }
+
+  @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+  @keyframes grow-x { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+  @keyframes grow-y { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+  @keyframes fade-up { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes scale-in { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: scale(1); } }
+  @keyframes slide-in-right { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes slide-out-right { from { opacity: 1; transform: translateX(0); max-height: 200px; margin-bottom: 10px; } to { opacity: 0; transform: translateX(24px); max-height: 0; margin-bottom: 0; } }
+  @keyframes ring-draw { from { stroke-dashoffset: var(--ring-full); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Live-update morphing (see setLiveHtml/_morphChildren in app.js): a new
+     keyed list item plays .live-enter once on insertion, a removed one plays
+     live-exit-fade before leaving the DOM.
+     !important so these always win over an element's own base animation,
+     regardless of source order. */
+  .live-enter { animation: fade-up 320ms cubic-bezier(.23,1,.32,1) both !important; }
+  .live-exit { animation: live-exit-fade 300ms cubic-bezier(.23,1,.32,1) both !important; pointer-events: none; }
+  @keyframes live-exit-fade { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(0.96); } }
+
+  /* ---- rail ---- */
+  .rail { width: 80px; flex-shrink: 0; background: var(--bg-rail); border-right: 1px solid var(--border);
+          display: flex; flex-direction: column; align-items: center; padding: 20px 0; gap: 20px;
+          position: relative; z-index: 1; }
+  .rail-mark { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(160deg,#43C6FF,#2E7FCF);
+               display:flex;align-items:center;justify-content:center; font-weight:800; font-size:var(--fs-body); color:#04141F; }
+  .rail-nav { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+  .rail-item { width: 56px; padding: 6px 0 5px; border-radius: 9px; display: flex; flex-direction: column;
+               align-items: center; gap: 4px; color: var(--text-faint); cursor: pointer; }
+  .rail-item svg { width: 18px; height: 18px; }
+  .rail-item-label { font-size: 9px; font-weight: 600; }
+  .rail-item.active { background: var(--accent-soft); color: var(--accent); }
+  .rail-spacer { flex: 1; }
+  .rail-lang { width: 40px; height: 26px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-field);
+               color: var(--text-dim); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+               font-weight: 700; letter-spacing: 0.02em; display: flex; align-items: center; justify-content: center;
+               cursor: pointer; text-transform: uppercase; }
+  .rail-lang:hover { color: var(--text); border-color: var(--accent-border); }
+  .rail-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); animation: pulse-dot 2.4s ease-in-out infinite; }
+
+  /* ---- Floating support button — reuses the MAX badge's shimmer/spark
+     treatment. Set only right/bottom: a fixed element with all four offsets
+     stretches to fill the gap instead of hugging its content. */
+  .floating-support { position: fixed; right: 20px; bottom: 20px; z-index: 45; display: flex;
+                       align-items: center; gap: 6px;
+                       padding: 8px 14px 8px 10px; border-radius: 999px; text-decoration: none; cursor: pointer;
+                       font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+                       white-space: nowrap; color: #FFE9B8; text-shadow: 0 0 6px rgba(255,208,140,0.6);
+                       background: linear-gradient(120deg, #7B3FE4, #C86DD7 45%, #FFB05C 80%, #7B3FE4);
+                       background-size: 260% 100%; animation: plan-shimmer 5s linear infinite;
+                       border: 1px solid rgba(255,208,140,0.5); box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+                       transition: transform 0.15s ease; }
+  .floating-support:hover { transform: scale(1.08); }
+  .floating-support svg { width: 13px; height: 13px; flex-shrink: 0; position: relative; z-index: 1; }
+  .floating-support span { position: relative; z-index: 1; }
+  .floating-support .spark { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: #FFE9B8;
+                              box-shadow: 0 0 5px 1px #FFE9B8; opacity: 0; }
+  .floating-support .spark:nth-child(1) { top: 4px; left: 10px; animation: plan-spark 2.4s ease-in-out infinite; }
+  .floating-support .spark:nth-child(2) { top: 18px; left: 34px; animation: plan-spark 2.4s ease-in-out 0.8s infinite; }
+  .floating-support .spark:nth-child(3) { top: 8px; left: 58px; animation: plan-spark 2.4s ease-in-out 1.6s infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .floating-support { transition: none; animation: none; background-position: 40% 50%; }
+    .floating-support .spark { display: none; }
+  }
+
+  /* ---- shell ---- */
+  .main { flex: 1; padding: 24px 30px 60px; position: relative; z-index: 1; display: flex; justify-content: center; }
+  .main-inner { max-width: 1180px; width: 100%; min-width: 0; }
+  .view[style*="display:none"] { display: none; }
+
+  /* Actions (theme/chart/refresh/add) must never drop to a second row under
+     the title. A longer translated label set widens .topbar-left, so the
+     title chips wrap instead of pushing .topbar-actions down. */
+  .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: nowrap; gap: 12px; }
+  .topbar-left { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0; flex: 1 1 auto; }
+  .topbar-actions { flex-shrink: 0; }
+  .brand { font-size: var(--fs-name); font-weight: 700; letter-spacing: -0.01em; }
+  .host-chip { display: inline-flex; align-items: center; gap: 7px; font-size: var(--fs-body); color: var(--text-dim);
+               background: var(--bg-panel); border: 1px solid var(--border); padding: 5px 10px; border-radius: 7px; }
+  .host-chip svg { width: 12px; height: 12px; }
+  .host-chip .mono { color: var(--accent); }
+  .uptime { font-size: var(--fs-body); color: var(--text-faint); }
+
+  .page-title { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+  .page-sub { font-size: var(--fs-body); color: var(--text-faint); margin-top: 2px; }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-body); font-weight: 600;
+         padding: 8px 14px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-panel);
+         color: var(--text); cursor: pointer; }
+  .btn svg { width: 13px; height: 13px; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .btn.danger { background: var(--bad-soft); color: var(--bad); border-color: var(--bad-border); }
+  .btn.btn-disabled { opacity: .45; cursor: not-allowed; pointer-events: none; }
+
+  .panel-title { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+                 color: var(--text-faint); margin: 22px 0 10px; display: flex; align-items: center; justify-content: space-between; }
+  .panel-title:first-child { margin-top: 0; }
+
+  /* ---- stat strip (Overview) ---- */
+  .stat-strip { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-bottom: 4px; }
+  .stat-chip { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 11px 14px; }
+  .stat-chip-label { font-size: var(--fs-micro); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+  .stat-chip-value { font-size: var(--fs-name); font-weight: 700; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stat-chip-value.accent { color: var(--accent); }
+
+  /* ---- profile cards ---- */
+  .profiles { display: flex; flex-direction: column; gap: 8px; }
+
+  /* "Cells" view (Overview only — the Profiles page has its own table).
+     Halves the row count for a large Profile pool and tightens each card's
+     vertical padding. Layout-only CSS over the same markup renderProfileCard()
+     already produces, so no field can go missing in one view but not the
+     other. */
+  .profiles.cells-view { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  @media (max-width: 780px) { .profiles.cells-view { grid-template-columns: 1fr; } }
+  .profiles.cells-view .p-card { padding: 10px 12px; }
+  .profiles.cells-view .p-top { margin-bottom: 6px; gap: 7px; }
+  .profiles.cells-view .p-bars { gap: 14px; }
+  /* The bar's threshold tag sits above the track and its usage tag below, so
+     that padding is what actually drives card height — trim it rather than
+     hiding either number. */
+  .profiles.cells-view .bar-visual { padding-top: 12px; padding-bottom: 13px; }
+  .profiles.cells-view .bar-group { min-width: 110px; }
+  .profiles.cells-view .p-foot { margin-top: 8px; gap: 8px; }
+  .p-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px;
+            position: relative; overflow: hidden; animation: fade-up 400ms ease-out both;
+            transition: border-color 250ms ease; }
+  .p-card.has-tag { border-color: color-mix(in srgb, var(--tag-color) 55%, var(--border)); }
+  .p-card.active-card { border-color: var(--accent-border); }
+  .p-card.active-card.has-tag { border-color: var(--tag-color); }
+  .p-card.active-card::before {
+    content: ""; position: absolute; inset: -40% -20% auto auto; width: 240px; height: 240px;
+    background: radial-gradient(circle, var(--accent-soft), transparent 70%); pointer-events: none;
+  }
+  /* flex-wrap matches .p-bars/.p-foot below. Without it a long name + plan
+     badge + kind label + status word can exceed the card width and get
+     clipped by .p-card's overflow:hidden instead of wrapping. */
+  .p-top { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; position: relative; flex-wrap: wrap; }
+  .p-icon { width: 24px; height: 24px; border-radius: 7px; background: var(--bg-panel-alt); display: flex;
+            align-items: center; justify-content: center; color: var(--text-dim); flex-shrink: 0;
+            transition: background 250ms ease, color 250ms ease, width 250ms ease, height 250ms ease; }
+  .p-icon svg { width: 12px; height: 12px; transition: width 250ms ease, height 250ms ease; }
+  /* A Profile's tag color, carried on the card/row as --tag-color, makes its
+     icon bolder and bigger so the color reads as a Profile identity rather
+     than a cosmetic dot. */
+  .p-icon.has-tag { width: 30px; height: 30px; color: var(--tag-color); background: color-mix(in srgb, var(--tag-color) 20%, transparent); }
+  .p-icon.has-tag svg { width: 16px; height: 16px; }
+  .p-icon-lg.has-tag { color: var(--tag-color); background: color-mix(in srgb, var(--tag-color) 20%, transparent); }
+  /* An explicit tag color always wins over the provider accent below, the
+     same priority order tag-color has over any kind-based default. */
+  .p-icon.kind-codex:not(.has-tag) { color: var(--codex); background: var(--codex-soft); }
+  .p-icon-lg.kind-codex:not(.has-tag) { color: var(--codex); background: var(--codex-soft); }
+  .p-name { font-size: var(--fs-body); font-weight: 700; }
+  .p-kind { font-size: var(--fs-micro); color: var(--text-faint); margin-left: 2px; }
+  .p-status-word { font-size: var(--fs-micro); font-weight: 700; margin-left: auto; padding: 2px 7px; border-radius: 5px; white-space: nowrap; }
+  /* A ranked chip (ascending-bars icon + bare number, no "P" prefix) so it
+     reads as position in a list rather than ticket severity; the tooltip
+     spells out "rotation order". */
+  .p-priority { font-size: var(--fs-micro); color: var(--text-faint); display: inline-flex; align-items: center;
+                 gap: 3px; background: var(--bg-panel-alt); padding: 2px 6px 2px 5px; border-radius: 5px; }
+  .p-priority-icon { width: 9px; height: 9px; flex-shrink: 0; }
+  .p-disabled-badge { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+                       color: var(--text-faint); background: var(--bg-panel-alt); padding: 2px 7px; border-radius: 5px; margin-left: auto; }
+  .mono-num { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+  /* Plan badge — Pro/Max/API, styled distinctly per tier. */
+  .plan-badge { display: inline-flex; align-items: center; gap: 3px; font-size: var(--fs-micro); font-weight: 700;
+                text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 7px 2px 6px; border-radius: 5px;
+                white-space: nowrap; position: relative; overflow: hidden; }
+  .plan-badge svg { width: 10px; height: 10px; flex-shrink: 0; position: relative; z-index: 1; }
+  .plan-badge span { position: relative; z-index: 1; }
+  .plan-badge.api { color: var(--text-dim); background: var(--bg-panel-alt); }
+  .plan-badge.codex { color: var(--codex); background: var(--codex-soft); border: 1px solid var(--codex-border); }
+  .plan-badge.pro { color: #0B7FA8; background: rgba(67,198,255,0.16); border: 1px solid rgba(67,198,255,0.3); }
+  html.light-theme .plan-badge.pro, .app.light-theme .plan-badge.pro { color: #085E80; }
+  .plan-badge.pro .spark { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: #6FE0FF;
+                            box-shadow: 0 0 4px 1px #6FE0FF; opacity: 0; }
+  .plan-badge.pro .spark:nth-child(1) { top: 2px; left: 8px; animation: plan-spark 2.6s ease-in-out infinite; }
+  .plan-badge.pro .spark:nth-child(2) { top: 9px; left: 22px; animation: plan-spark 2.6s ease-in-out 0.9s infinite; }
+  .plan-badge.pro .spark:nth-child(3) { top: 4px; left: 34px; animation: plan-spark 2.6s ease-in-out 1.7s infinite; }
+  .plan-badge.max { color: #FFE9B8; background: linear-gradient(120deg, #7B3FE4, #C86DD7 45%, #FFB05C 80%, #7B3FE4);
+                     background-size: 260% 100%; border: 1px solid rgba(255,208,140,0.5);
+                     animation: plan-shimmer 5s linear infinite; text-shadow: 0 0 6px rgba(255,208,140,0.6); }
+  html.light-theme .plan-badge.max, .app.light-theme .plan-badge.max { color: #FFF6E5; }
+  @keyframes plan-spark {
+    0%, 100% { opacity: 0; transform: scale(0.4); }
+    50% { opacity: 1; transform: scale(1.15); }
+  }
+  @keyframes plan-shimmer {
+    0% { background-position: 0% 50%; }
+    100% { background-position: 260% 50%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .plan-badge.pro .spark { display: none; }
+    .plan-badge.max { animation: none; background-position: 40% 50%; }
+  }
+
+  .p-bars { display: flex; gap: 20px; position: relative; flex-wrap: wrap; }
+  .bar-group { flex: 1; min-width: 140px; }
+  .bar-label-row { display: flex; justify-content: space-between; font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 4px; }
+  .bar-label-row .mono-num { color: var(--text); font-weight: 600; }
+  /* .bar-visual stacks three rows: the gray threshold number above its
+     marker line, the track, and the usage number below where the bar ends.
+     Each figure sits at its own x-position so neither can be misread as the
+     other. */
+  .bar-visual { position: relative; padding-top: 13px; padding-bottom: 15px; }
+  .bar-track { position: relative; height: 5px; border-radius: 3px; background: var(--track); }
+  .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; transform-origin: left; animation: grow-x 700ms cubic-bezier(.16,1,.3,1) both; }
+  .bar-threshold { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--track-marker); }
+  .bar-threshold::after { content: ""; position:absolute; top:-3px; left:-2px; width:5px; height:5px; border-radius:50%; background: var(--track-marker); }
+  .bar-threshold-tag { position: absolute; top: 0; font-size: 9px; color: var(--text-faint); white-space: nowrap;
+                        font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .bar-usage-tag { position: absolute; bottom: 0; font-size: 10px; font-weight: 700; white-space: nowrap;
+                    font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .bar-usage-tag.not-observed { position: static; font-size: var(--fs-micro); font-weight: 400; color: var(--text-faint); }
+
+  .p-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; font-size: var(--fs-micro); color: var(--text-faint); position: relative; flex-wrap: wrap; }
+  .p-foot .mono-num { color: var(--text-dim); }
+  .p-foot-spacer { flex: 1; }
+  .toggle { width: 30px; height: 17px; border-radius: 9px; background: var(--good); position: relative; cursor: pointer; flex-shrink: 0; }
+  .toggle.off { background: var(--chip-off); }
+  /* --knob-on (defined in :root/light-theme above) exists for this knob so
+     the "on" state switches with the theme — the same ink-on-accent pattern
+     as --accent-ink. */
+  .toggle-knob { position: absolute; top: 2px; right: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--knob-on); }
+  .toggle.off .toggle-knob { right: auto; left: 2px; background: var(--text-faint); }
+
+  .empty { color: var(--text-faint); font-size: var(--fs-body); padding: 24px; text-align: center;
+           border: 1px dashed var(--border); border-radius: 12px; }
+
+  /* ---- usage by project ---- */
+  .exp-badge { font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+               color: var(--warn); background: var(--warn-soft); padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
+  .side-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+  .chart-sub { font-size: var(--fs-micro); color: var(--text-faint); margin-bottom: 10px; }
+  .model-list { display: flex; flex-direction: column; gap: 9px; }
+  .model-row { display: flex; align-items: center; gap: 10px; font-size: var(--fs-body); }
+  .model-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  /* A fixed name-column width, not a max-width cap, so every row's
+     .model-bar-track is the same width. With only a max-width, track width
+     depends on that row's own name length, and a long-named row can render a
+     shorter bar than a short-named row with a smaller share. Ellipsis is the
+     safety net for a model id longer than this width. */
+  .model-name { flex: 0 0 200px; color: var(--text-dim); font-weight: 600;
+                font-family: ui-monospace, "SF Mono", Menlo, monospace;
+                font-size: var(--fs-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-bar-track { flex: 1; min-width: 20px; height: 5px; border-radius: 3px; background: var(--track); }
+  .model-bar-fill { height: 100%; border-radius: 3px; transform-origin: left; animation: grow-x 700ms cubic-bezier(.16,1,.3,1) both; background: var(--accent); }
+  .model-pct { width: 46px; text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: var(--fs-micro); }
+
+  /* ---- activity ---- */
+  .activity-panel { display: flex; flex-direction: column; gap: 6px; }
+  /* One line per entry: time and text share a single baseline-aligned row
+     and the text ellipsizes. The full timestamp stays on the hover tooltip
+     and `meta` renders inline after the text. */
+  .activity-row { display: flex; gap: 10px; background: var(--bg-panel); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 6px 12px; align-items: center; animation: fade-up 300ms ease-out both; }
+  .activity-icon { width: 18px; height: 18px; border-radius: 5px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .activity-icon svg { width: 10px; height: 10px; }
+  .activity-body { display: flex; flex-direction: row; align-items: baseline; gap: 8px; min-width: 0; flex: 1; }
+  .activity-time { position: relative; font-size: var(--fs-micro); color: var(--text-faint); font-family: ui-monospace, "SF Mono", Menlo, monospace;
+                    cursor: default; border-bottom: 1px dotted var(--border); width: fit-content; }
+  .activity-time-tip {
+    position: absolute; bottom: 100%; left: 0; margin-bottom: 6px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-micro); white-space: nowrap;
+    color: var(--text-dim); background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 7px; opacity: 0; pointer-events: none; transition: opacity 150ms ease; z-index: 5;
+    box-shadow: 0 4px 12px rgba(0,0,0,.25);
+  }
+  .activity-time:hover .activity-time-tip { opacity: 1; }
+  /* Fixed-width so every row's text starts at the same x; a ragged left edge
+     makes a dense log hard to scan. */
+  .activity-time { flex-shrink: 0; width: 62px; }
+  .activity-text { font-size: var(--fs-body); color: var(--text); line-height: 1.4;
+                    min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .activity-meta { font-size: var(--fs-micro); color: var(--text-faint); margin-left: 4px; }
+
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .filter-chip { display: flex; align-items: center; gap: 6px; font-size: var(--fs-body); font-weight: 600; padding: 7px 13px;
+                 border-radius: 20px; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg-panel); cursor: pointer; }
+  .filter-chip .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .filter-chip.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+
+  /* ---- settings ---- */
+  .section { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+             animation: fade-up 400ms ease-out both; margin-bottom: 16px; }
+  .section.danger { border-color: var(--bad-border); }
+  .section-head { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  .section-title { font-size: var(--fs-name); font-weight: 700; }
+  .section-sub { font-size: var(--fs-body); color: var(--text-faint); margin-top: 2px; }
+  .section-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+
+  .field-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  .field-text { display: flex; flex-direction: column; gap: 2px; }
+  .field-title { font-size: var(--fs-body); font-weight: 700; }
+  .field-sub { font-size: var(--fs-micro); color: var(--text-faint); }
+
+  .cmd-row { display: flex; flex-direction: column; gap: 6px; padding: 3px 0; }
+  .cmd-row .code-row { margin-top: 0; }
+  .cmd-row .code-row code { flex: none; color: var(--accent); font-weight: 700; white-space: nowrap; }
+  .cmd-optional { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-body); color: var(--text-faint); }
+  .cmd-row .code-row .copy-btn { margin-left: auto; }
+  .cmd-row .field-sub { font-size: var(--fs-body); color: var(--text-dim); }
+
+  select { background: var(--bg-field); border: 1px solid var(--border); border-radius: 8px;
+           padding: 8px 12px; color: var(--text); font-size: var(--fs-body); font-weight: 600; }
+
+  .status-pill { display: flex; align-items: center; gap: 6px; font-size: var(--fs-body); font-weight: 600; color: var(--good); }
+  .status-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); }
+  .status-pill.off { color: var(--text-faint); }
+  .status-pill.off .dot { background: var(--text-faint); }
+
+  .divider { height: 1px; background: var(--border-soft); }
+
+  .code-row { display: flex; align-items: center; gap: 10px; background: var(--bg-field); border: 1px solid var(--border);
+              border-radius: 8px; padding: 10px 12px; margin-top: 8px; }
+  .code-row code { flex: 1; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-body); color: var(--text);
+                    overflow-x: auto; white-space: pre-line; }
+  .copy-btn { display: flex; align-items: center; gap: 5px; font-size: var(--fs-micro); font-weight: 700; color: var(--text-faint); cursor: pointer; flex-shrink: 0; }
+  .copy-btn svg { width: 12px; height: 12px; }
+
+  .notif-list { display: flex; flex-direction: column; gap: 4px; }
+  .notif-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; gap: 14px; flex-wrap: wrap; }
+  .notif-text { display: flex; align-items: center; gap: 10px; }
+  .notif-icon { width: 26px; height: 26px; border-radius: 7px; background: var(--bg-panel-alt); display: flex;
+                align-items: center; justify-content: center; color: var(--text-dim); flex-shrink: 0; }
+  .notif-icon svg { width: 13px; height: 13px; }
+
+  /* ---- modals ---- */
+  .modal-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 10; animation: fade-in 200ms ease-out both; }
+  .modal-scrim.open { display: flex; }
+  .modal { width: 620px; max-width: calc(100vw - 40px); max-height: calc(100vh - 60px); background: var(--bg-panel);
+           border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 30px 70px -20px rgba(0,0,0,0.6);
+           display: flex; flex-direction: column; overflow: hidden; animation: scale-in 220ms cubic-bezier(.16,1,.3,1) both; }
+  .modal.wide { width: 780px; }
+  .modal-head { display: flex; align-items: flex-start; justify-content: space-between; padding: 20px 24px; border-bottom: 1px solid var(--border); }
+  .modal-title { font-size: var(--fs-name); font-weight: 700; }
+  .modal-sub { font-size: var(--fs-body); color: var(--text-faint); margin-top: 3px; }
+  .close-btn { width: 28px; height: 28px; border-radius: 8px; background: var(--bg-panel-alt); display: flex;
+               align-items: center; justify-content: center; color: var(--text-dim); cursor: pointer; flex-shrink: 0; }
+  .close-btn svg { width: 13px; height: 13px; }
+  .modal-body { padding: 22px 24px; display: flex; flex-direction: column; gap: 18px; overflow: auto; }
+  #manualPane, #importPane { display: flex; flex-direction: column; gap: 18px; }
+  .modal-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 16px 24px; border-top: 1px solid var(--border); }
+
+  .type-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .type-card { border: 1px solid var(--border); border-radius: 12px; padding: 14px; display: flex; flex-direction: column;
+               gap: 8px; background: var(--bg-panel-alt); cursor: pointer; text-align: left; }
+  .type-card.sel { border-color: var(--accent-border); background: var(--accent-soft); }
+  .type-icon { width: 28px; height: 28px; border-radius: 8px; background: var(--bg-field); display: flex; align-items: center; justify-content: center; color: var(--text-dim); }
+  .type-card.sel .type-icon { color: var(--accent); }
+  .type-icon svg { width: 14px; height: 14px; }
+  .type-name { font-size: var(--fs-body); font-weight: 700; }
+  .type-desc { font-size: var(--fs-micro); color: var(--text-faint); line-height: 1.4; }
+  /* Codex/OpenAI selects into the provider accent rather than the generic
+     --accent, matching the icon and plan badge shown once a Profile
+     exists. */
+  .type-card.sel[data-type-card="codex"] { border-color: var(--codex-border); background: var(--codex-soft); }
+  .type-card.sel[data-type-card="codex"] .type-icon { color: var(--codex); }
+  .model-map-table { width: 100%; border-collapse: collapse; font-size: var(--fs-micro); margin-top: 4px; }
+  .model-map-table th, .model-map-table td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border-soft); color: var(--text-dim); }
+  .model-map-table th { color: var(--text-faint); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+  .model-map-table td.mono { color: var(--text); }
+  .model-map-table tr:last-child td { border-bottom: none; }
+
+  .field-group { display: flex; flex-direction: column; gap: 7px; }
+  .field-label { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
+  .field-help { font-size: var(--fs-micro); color: var(--text-faint); }
+  .text-input { width: 100%; background: var(--bg-field); border: 1px solid var(--border); border-radius: 8px;
+                padding: 10px 12px; font-size: var(--fs-body); color: var(--text); }
+  .input-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .input-row .field-group { flex: 1; min-width: 140px; }
+
+  .seg-row { display: flex; background: var(--bg-field); border: 1px solid var(--border); border-radius: 8px; padding: 3px; gap: 2px; }
+  .seg-btn { flex: 1; text-align: center; font-size: var(--fs-body); font-weight: 600; padding: 7px 0; border-radius: 6px; color: var(--text-dim); cursor: pointer; }
+  .seg-btn.on { background: var(--accent); color: var(--accent-ink); }
+
+  .credential-input { position: relative; display: flex; align-items: center; }
+  .credential-input .text-input { padding-right: 36px; font-family: ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0.02em; }
+  .eye-btn { position: absolute; right: 10px; color: var(--text-faint); cursor: pointer; background: none; border: none; padding: 0; }
+  .eye-btn svg { width: 15px; height: 15px; }
+
+  .advanced-toggle { display: flex; align-items: center; gap: 6px; font-size: var(--fs-body); font-weight: 700; color: var(--text-dim); cursor: pointer; user-select: none; }
+  .advanced-toggle svg { width: 12px; height: 12px; transition: transform 150ms ease; }
+  .advanced-toggle.open svg { transform: rotate(180deg); }
+  .advanced-body { display: none; flex-direction: column; gap: 16px; padding-top: 14px; margin-top: 4px; border-top: 1px solid var(--border-soft); }
+  .advanced-body.open { display: flex; }
+  .adv-row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .adv-row .field-group { flex: 1; min-width: 120px; }
+
+  /* The Detail modal's codex-only fields sit in one block rather than
+     .modal-body's rows, so they need the same 18px rhythm the rest of the
+     modal uses (see #manualPane, #importPane above). */
+  #pd_codex_fields { display: flex; flex-direction: column; gap: 18px; }
+  /* The static mapping table is reference material, not a control: a tinted,
+     bordered block (same idea as .code-row) sets it apart, reusing the
+     .advanced-toggle/.advanced-body disclosure collapsed by default. */
+  .mapping-block { background: var(--bg-panel-alt); border: 1px solid var(--border-soft); border-radius: 10px; padding: 12px 14px; }
+  .mapping-block .advanced-toggle { font-size: var(--fs-micro); text-transform: uppercase; letter-spacing: 0.05em; }
+  .mapping-block .advanced-body { gap: 0; }
+  .stepper { display: flex; align-items: center; background: var(--bg-field); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .stepper-btn { width: 30px; height: 34px; display: flex; align-items: center; justify-content: center; color: var(--text-dim); cursor: pointer; user-select: none; }
+  .stepper-val { flex: 1; text-align: center; font-size: var(--fs-body); font-weight: 700; }
+
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; background: var(--bg-panel-alt);
+                border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; gap: 12px; }
+  .toggle-row-text { display: flex; flex-direction: column; gap: 2px; }
+  .toggle-row-title { font-size: var(--fs-body); font-weight: 700; }
+  .toggle-row-sub { font-size: var(--fs-micro); color: var(--text-faint); }
+
+  .tag-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tag-dot { width: 22px; height: 22px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
+  .tag-dot.sel { border-color: var(--text); }
+
+  .check-row { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; background: var(--bg-panel-alt);
+               border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+  .checkbox { width: 18px; height: 18px; border-radius: 5px; border: 1.5px solid var(--border); background: var(--bg-field);
+              flex-shrink: 0; margin-top: 1px; display: flex; align-items: center; justify-content: center; }
+  .checkbox svg { display: none; width: 11px; height: 11px; }
+  .checkbox.on, .checkbox.warn-on { color: var(--accent-ink); }
+  .checkbox.on svg, .checkbox.warn-on svg { display: block; }
+  .checkbox.on { background: var(--accent); border-color: var(--accent); }
+  .checkbox.warn-on { background: var(--warn); border-color: var(--warn); color: #2B1B00; }
+  .check-text { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+  .check-title-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .check-title { font-size: var(--fs-body); font-weight: 700; }
+  .check-sub { font-size: var(--fs-micro); color: var(--text-faint); }
+  .lock-tag { display: flex; align-items: center; gap: 4px; font-size: 9px; font-weight: 700; text-transform: uppercase; color: var(--warn); background: var(--warn-soft); padding: 2px 7px; border-radius: 4px; }
+  .lock-tag svg { width: 9px; height: 9px; }
+
+  .passphrase-block { padding: 14px 16px; background: var(--bg-field); border: 1px solid var(--warn-border); border-radius: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .passphrase-warn { display: flex; gap: 8px; font-size: var(--fs-micro); color: var(--warn); line-height: 1.5; }
+  .passphrase-warn svg { width: 13px; height: 13px; flex-shrink: 0; margin-top: 1px; }
+
+  .import-status { font-size: var(--fs-micro); padding: 8px 10px; border-radius: 8px; }
+  .import-status.ok { background: var(--good-soft); color: var(--good); }
+  .import-status.err { background: var(--bad-soft); color: var(--bad); }
+  .divider-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; font-size: var(--fs-micro);
+                 color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
+  .divider-line { flex: 1; height: 1px; background: var(--border); }
+  .error-text { color: var(--bad); font-size: var(--fs-micro); }
+
+  /* ---- toasts ---- */
+  .toast-container { position: fixed; top: 20px; right: 20px; z-index: 100; display: flex; flex-direction: column;
+                      gap: 10px; width: 360px; max-width: calc(100vw - 40px); }
+  .toast { display: flex; gap: 12px; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border);
+           background: var(--bg-panel); box-shadow: 0 20px 40px -20px rgba(0,0,0,0.5);
+           animation: slide-in-right 350ms cubic-bezier(.16,1,.3,1) both; }
+  .toast.leaving { animation: slide-out-right 220ms ease-in both; overflow: hidden; }
+  .toast-icon { width: 30px; height: 30px; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .toast-icon svg { width: 15px; height: 15px; }
+  .toast-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .toast-title { font-size: var(--fs-body); font-weight: 700; }
+  .toast-sub { font-size: var(--fs-micro); color: var(--text-faint); line-height: 1.4; }
+
+  /* ---- banner ---- */
+  .banner { display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-radius: 12px;
+            background: var(--bad-soft); border: 1px solid var(--bad-border); animation: fade-up 300ms ease-out both;
+            margin-bottom: 16px; flex-wrap: wrap; }
+  .banner-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex-shrink: 0; animation: pulse-dot 1.6s ease-in-out infinite; }
+  .banner-text { font-size: var(--fs-body); font-weight: 600; color: var(--bad); }
+  .banner-sub { font-size: var(--fs-micro); color: var(--text-faint); }
+  .banner-spacer { flex: 1; }
+  .banner-btn { font-size: var(--fs-body); font-weight: 700; color: var(--bad); border: 1px solid var(--bad-border);
+                padding: 6px 14px; border-radius: 7px; cursor: pointer; }
+
+  /* ---- kebab context menu ---- */
+  .kebab-btn { width: 26px; height: 26px; border-radius: 7px; display: flex; align-items: center; justify-content: center;
+               color: var(--text-faint); background: var(--bg-panel-alt); cursor: pointer; flex-shrink: 0; position: relative; }
+  .kebab-btn svg { width: 13px; height: 13px; }
+  .kebab-btn.open { color: var(--accent); background: var(--accent-soft); }
+  .menu-pop { position: absolute; width: 220px; background: var(--bg-panel-alt); border: 1px solid var(--border);
+              border-radius: 12px; padding: 6px; box-shadow: 0 20px 40px -20px rgba(0,0,0,0.6);
+              animation: fade-up 160ms ease-out both; z-index: 20; }
+  .menu-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px; font-size: var(--fs-body);
+               color: var(--text); cursor: pointer; }
+  .menu-item svg { width: 14px; height: 14px; color: var(--text-faint); flex-shrink: 0; }
+  .menu-item:hover { background: var(--bg-panel); }
+  .menu-item.danger { color: var(--bad); }
+  .menu-item.danger svg { color: var(--bad); }
+  .menu-divider { height: 1px; background: var(--border); margin: 5px 4px; }
+
+  /* ---- custom dropdown (replaces native <select>) ---- */
+  .select-input { display: inline-flex; align-items: center; justify-content: flex-start; gap: 10px; background: var(--bg-field);
+                  border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: var(--fs-body);
+                  font-weight: 600; color: var(--text); cursor: pointer; position: relative; width: fit-content; min-width: 90px; }
+  .select-input svg { width: 11px; height: 11px; color: var(--text-faint); flex-shrink: 0; transition: transform 150ms ease; }
+  .select-input.open svg { transform: rotate(180deg); }
+  .select-input .select-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .select-pop { position: absolute; top: calc(100% + 6px); left: 0; right: 0; min-width: 100%; background: var(--bg-panel-alt);
+                border: 1px solid var(--border); border-radius: 10px; padding: 5px; box-shadow: 0 20px 40px -20px rgba(0,0,0,0.6);
+                z-index: 20; animation: fade-up 140ms ease-out both; max-height: 260px; overflow: auto; }
+  .select-pop-item { padding: 8px 10px; border-radius: 7px; font-size: var(--fs-body); color: var(--text); cursor: pointer;
+                      white-space: nowrap; }
+  .select-pop-item:hover { background: var(--bg-panel); }
+  .select-pop-item.sel { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+
+  /* ---- Profiles table ---- */
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .search-box { flex: 1; min-width: 160px; display: flex; align-items: center; gap: 8px; background: var(--bg-panel);
+                border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+  .search-box svg { width: 14px; height: 14px; color: var(--text-faint); flex-shrink: 0; }
+  .search-box input { border: none; background: none; outline: none; color: var(--text); font-size: var(--fs-body); width: 100%; }
+  .search-box input::placeholder { color: var(--text-faint); }
+  .filter-chips { display: flex; gap: 6px; }
+  .filter-chip { display: flex; align-items: center; gap: 6px; font-size: var(--fs-body); font-weight: 600; padding: 7px 13px;
+                 border-radius: 20px; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg-panel); cursor: pointer; }
+  .filter-chip .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .filter-chip.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+
+  .table { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+  .table-head { display: grid; grid-template-columns: 30px 1.8fr 1.2fr 1.2fr 110px 76px 90px; gap: 12px; padding: 12px 18px;
+                font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint);
+                border-bottom: 1px solid var(--border); }
+  .row { display: grid; grid-template-columns: 30px 1.8fr 1.2fr 1.2fr 110px 76px 90px; gap: 12px; align-items: center;
+         padding: 14px 18px; border-bottom: 1px solid var(--border-soft); animation: fade-up 350ms ease-out both;
+         box-shadow: inset 3px 0 0 transparent; transition: box-shadow 250ms ease; }
+  .row.has-tag { box-shadow: inset 3px 0 0 var(--tag-color); }
+  .row:last-child { border-bottom: none; }
+  .row.dim { opacity: 0.55; }
+  .row.drag-over { border-top: 2px solid var(--accent); }
+  .row.dragging { opacity: 0.4; }
+  .drag-handle { color: var(--text-faint); cursor: grab; display: flex; align-items: center; }
+  .drag-handle svg { width: 14px; height: 14px; }
+  .row-name-cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .row-name-text { min-width: 0; }
+  .used-now-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 9px; font-weight: 700;
+                    text-transform: uppercase; letter-spacing: .02em; color: var(--good); background: var(--good-soft);
+                    padding: 3px 8px 3px 7px; border-radius: 20px; margin-left: 6px; white-space: nowrap; }
+  .used-now-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); flex-shrink: 0;
+                   animation: pulse-dot 2.4s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) { .used-now-dot { animation: none; } }
+  .bar-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .threshold-chip { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-body); font-weight: 600;
+                     padding: 5px 10px; border-radius: 7px; background: var(--bg-panel-alt); color: var(--text);
+                     border: 1px solid var(--border); cursor: pointer; }
+  .threshold-chip svg { width: 10px; height: 10px; color: var(--text-faint); }
+  .priority-cell { display: flex; align-items: center; gap: 6px; font-size: var(--fs-body); font-weight: 700; }
+  .priority-num { width: 22px; height: 22px; border-radius: 6px; background: var(--bg-panel-alt); display: flex;
+                  align-items: center; justify-content: center; font-size: 11px; }
+  .row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+
+  /* ---- file dropzone ---- */
+  .dropzone { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+              padding: 28px 18px; border: 1.5px dashed var(--border); border-radius: 12px; background: var(--bg-field);
+              cursor: pointer; text-align: center; transition: border-color 150ms ease, background 150ms ease; }
+  .dropzone:hover, .dropzone.drag-over { border-color: var(--accent-border); background: var(--accent-soft); }
+  .dropzone-icon { width: 38px; height: 38px; border-radius: 10px; background: var(--bg-panel-alt); color: var(--text-dim);
+                    display: flex; align-items: center; justify-content: center; }
+  .dropzone-icon svg { width: 18px; height: 18px; }
+  .dropzone-title { font-size: var(--fs-body); font-weight: 700; }
+  .dropzone-sub { font-size: var(--fs-micro); color: var(--text-faint); }
+  .file-row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; background: var(--bg-panel-alt);
+              border: 1px solid var(--border); border-radius: 10px; }
+  .file-icon { width: 34px; height: 34px; border-radius: 9px; background: var(--accent-soft); color: var(--accent);
+               display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .file-icon svg { width: 16px; height: 16px; }
+  .file-name { font-size: var(--fs-body); font-weight: 700; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-meta { font-size: var(--fs-micro); color: var(--text-faint); }
+  .file-change { margin-left: auto; font-size: var(--fs-micro); font-weight: 700; color: var(--accent); cursor: pointer;
+                 flex-shrink: 0; }
+
+  /* ---- Usage/Cost charts (Overview) ---- */
+  .toggle-group { display: flex; align-items: center; gap: 6px; background: var(--bg-panel); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 3px; }
+  .seg2 { display: flex; gap: 2px; }
+  .seg2-item { font-size: var(--fs-body); font-weight: 600; padding: 5px 10px; border-radius: 6px; color: var(--text-dim); cursor: pointer; }
+  .seg2-item.on { background: var(--accent); color: var(--accent-ink); }
+  .btn.spinning svg { animation: spin 700ms linear infinite; }
+
+  .usage-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .usage-grid { grid-template-columns: 1fr; } }
+  /* In the narrow right-hand column a 1.5fr/1fr split leaves each chart
+     ~160-250px, too tight for the tokens bars and the model-split legend.
+     Stack them instead; the column width already constrains them. */
+  .col-activity .usage-grid { grid-template-columns: 1fr; }
+  .chart-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+  .chart-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .chart-title { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
+  .chart-title-note { text-transform: none; font-weight: 400; letter-spacing: normal; opacity: .72; }
+  .mini-chart-toggle { display: inline-flex; gap: 2px; padding: 2px; border-radius: 7px; background: var(--bg-field); border: 1px solid var(--border); flex-shrink: 0; }
+  .mini-chart-opt { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; border-radius: 5px; color: var(--text-faint); cursor: pointer; transition: background 120ms ease, color 120ms ease; }
+  .mini-chart-opt svg { width: 12px; height: 12px; }
+  .mini-chart-opt.on { background: var(--accent-soft); color: var(--accent); }
+  .mini-chart-opt:not(.on):hover { color: var(--text-dim); }
+  .chart-total { font-size: var(--fs-stat); font-weight: 700; text-align: right; }
+  .chart-total .mono-num { color: var(--accent); }
+  .mini-metric-toggle { display: inline-flex; gap: 2px; padding: 2px; border-radius: 7px; background: var(--bg-field); border: 1px solid var(--border); flex-shrink: 0; }
+  .mini-metric-opt { min-width: 20px; height: 20px; padding: 0 5px; display: flex; align-items: center; justify-content: center;
+                      border-radius: 5px; color: var(--text-faint); cursor: pointer; font-size: 10px; font-weight: 700;
+                      font-family: ui-monospace, "SF Mono", Menlo, monospace; transition: background 120ms ease, color 120ms ease; }
+  .mini-metric-opt.on { background: var(--accent-soft); color: var(--accent); }
+  .mini-metric-opt:not(.on):hover { color: var(--text-dim); }
+  .select-input-compact { padding: 4px 8px; min-width: 0; gap: 6px; font-size: var(--fs-micro); }
+  .select-input-compact svg { width: 9px; height: 9px; }
+
+  /* overflow-x is intentionally not auto: bars-col has min-width:0, so
+     columns shrink to fit rather than scroll. With auto, an invisible
+     (opacity:0) tooltip pseudo-element extending past the row's edge still
+     counts toward scrollable overflow and produces a scrollbar. */
+  .bars-row { display: flex; align-items: flex-end; gap: 10px; height: 110px; }
+  .bars-col { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+  .bars-col-track { width: 100%; height: 100%; display: flex; align-items: flex-end; }
+  .bars-col-fill { width: 100%; border-radius: 4px 4px 0 0; background: var(--accent); transform-origin: bottom;
+                    animation: grow-y 700ms cubic-bezier(.16,1,.3,1) both; min-height: 2px; }
+  .bars-col-label { font-size: var(--fs-micro); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+
+  .rings-row { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .ring-item { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .ring-item-label { font-size: var(--fs-micro); color: var(--text-faint); }
+  .ring-item svg circle:nth-child(2) { animation: ring-draw 900ms cubic-bezier(.16,1,.3,1) both; }
+
+  .donut-wrap { display: flex; align-items: center; gap: 16px; margin-top: 8px; flex-wrap: wrap; }
+  .donut-wrap svg circle { animation: ring-draw 900ms cubic-bezier(.16,1,.3,1) both; }
+  .donut-legend { display: flex; flex-direction: column; gap: 6px; }
+  .donut-legend-row { display: flex; align-items: center; gap: 7px; font-size: var(--fs-body); color: var(--text-dim); }
+
+  .heat-grid { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; margin-top: 10px; }
+  .heat-cell { aspect-ratio: 1; border-radius: 2.5px; animation: fade-in 500ms ease-out both; }
+  .heat-labels { display: flex; justify-content: space-between; font-size: 9px; color: var(--text-faint); margin-top: 5px; }
+
+  /* Styled hover tooltip for chart elements (bar segments, donut slices,
+     heatmap cells, ring items); an element opts in with data-tooltip="...".
+     Positioned by JS (see wireDataTooltips() in app.js) rather than a CSS
+     ::after, because a pseudo-element is clipped by any overflow:hidden
+     ancestor — e.g. .stack-bars-track, which needs that clip for its rounded
+     corners. One shared element on <body> can't be clipped by the page. */
+  .js-tooltip {
+    position: fixed; transform: translate(-50%, calc(-100% - 7px));
+    background: var(--bg-panel); border: 1px solid var(--border); color: var(--text);
+    font-size: var(--fs-micro); font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    white-space: nowrap; padding: 5px 9px; border-radius: 7px; box-shadow: 0 6px 16px rgba(0,0,0,0.28);
+    opacity: 0; pointer-events: none; transition: opacity 120ms ease; z-index: 9999;
+  }
+  .js-tooltip.on { opacity: 1; }
+  @media (prefers-reduced-motion: reduce) { .js-tooltip { transition: opacity 80ms linear; } }
+
+  /* Per-account token usage — same bars-row skeleton as the Tokens/day
+     chart, but each column is a stack of colored segments (one per
+     Profile, tinted with its own tag_color) instead of one solid fill. */
+  .stack-bars-row { display: flex; align-items: flex-end; gap: 10px; height: 110px; }
+  .stack-bars-col { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+  .stack-bars-track { width: 100%; height: 100%; display: flex; flex-direction: column-reverse; border-radius: 4px 4px 0 0; overflow: hidden; }
+  .stack-bar-seg { width: 100%; min-height: 2px; animation: grow-y 700ms cubic-bezier(.16,1,.3,1) both; transform-origin: bottom; }
+  .stack-bars-col-label { font-size: var(--fs-micro); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+  .stack-legend { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 12px; }
+  /* Taller than the default bars row so 7 daily bars still read clearly at
+     the narrower activity-log column's width. */
+  .account-usage-card .stack-bars-row { height: 150px; }
+  .stack-legend-row { display: flex; align-items: center; gap: 7px; font-size: var(--fs-body); color: var(--text-dim); }
+  .stack-legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+  .cost-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .cost-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .cost-label-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .cost-label { font-size: var(--fs-micro); color: var(--text-faint); font-weight: 700; text-transform: uppercase;
+                letter-spacing: 0.05em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-tag { font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; padding: 1px 5px;
+              border-radius: 4px; background: var(--bg-panel-alt); color: var(--text-faint); flex-shrink: 0; }
+  .cost-tag.metered { color: var(--accent); background: var(--accent-soft); }
+  .cost-value { font-size: var(--fs-name); font-weight: 700; margin-top: 4px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .cost-sub { font-size: var(--fs-micro); color: var(--text-dim); margin-top: 2px; }
+
+  /* ---- date range ---- */
+  .date-range { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .date-range input[type="datetime-local"] { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
+                                    padding: 7px 10px; color: var(--text); font-size: var(--fs-body); color-scheme: dark; }
+  .light-theme .date-range input[type="datetime-local"] { color-scheme: light; }
+  .date-range-sep { color: var(--text-faint); font-size: var(--fs-micro); }
+
+  /* ---- Profile Detail modal ---- */
+  .p-icon-lg { width: 44px; height: 44px; border-radius: 12px; background: var(--bg-panel-alt); display: flex;
+               align-items: center; justify-content: center; color: var(--accent); flex-shrink: 0; }
+  .p-icon-lg svg { width: 20px; height: 20px; }
+  .warn-tag { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--warn); background: var(--warn-soft);
+              padding: 2px 7px; border-radius: 5px; margin-left: 8px; }
+  .bars-block { display: flex; flex-direction: column; gap: 14px; background: var(--bg-panel-alt); border: 1px solid var(--border);
+                border-radius: 12px; padding: 16px 18px; }
+  .danger-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--bad-soft);
+                border: 1px solid var(--bad-border); border-radius: 10px; padding: 12px 16px; flex-wrap: wrap; }
+  .danger-text { font-size: var(--fs-body); color: var(--bad); font-weight: 600; }
+
+  /* ---- Confirm modal ---- */
+  .modal.confirm-modal { width: 440px; padding: 24px; border-color: var(--bad-border); }
+  .confirm-modal .icon-wrap { width: 44px; height: 44px; border-radius: 12px; background: var(--bad-soft); color: var(--bad);
+                               display: flex; align-items: center; justify-content: center; margin-bottom: 14px; }
+  .confirm-modal .icon-wrap svg { width: 22px; height: 22px; }
+  .confirm-modal .modal-title { font-size: 18px; }
+  .modal-body-text { font-size: var(--fs-body); color: var(--text-dim); line-height: 1.55; margin-top: 8px; }
+  .confirm-input { margin-top: 14px; width: 100%; background: var(--bg-field); border: 1px solid var(--border);
+                    border-radius: 8px; padding: 10px 12px; font-size: var(--fs-body); color: var(--text);
+                    font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .confirm-hint { font-size: var(--fs-micro); color: var(--text-faint); margin-top: 6px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+</style>
+</head>
+<body>
+<div class="app" id="appRoot">
+<div class="ambient-glow"></div>
+<div class="cursor-glow" id="cursorGlow"></div>
+<div class="toast-container" id="toastContainer"></div>
+<a class="floating-support" id="floatingSupportLink" href="https://ko-fi.com/devdock" target="_blank" rel="noopener noreferrer" data-i18n-title="rail.support" title="Support this project">
+  <span class="spark"></span><span class="spark"></span><span class="spark"></span>
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20.5s-7.5-4.6-9.8-9.2C.7 8 2.2 4.6 5.6 3.9c2-.4 3.9.5 5 2.1a1 1 0 0 0 1.6 0c1.1-1.6 3-2.5 5-2.1 3.4.7 4.9 4.1 3.4 7.4-2.3 4.6-9.8 9.2-9.8 9.2Z"/></svg>
+  <span data-i18n="support.label">Support</span>
+</a>
+<div class="rail">
+  <div class="rail-mark">CU</div>
+  <div class="rail-nav">
+    <div class="rail-item active" data-view="overview" data-i18n-title="nav.overview" title="Overview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="7" height="7" rx="1.2"/><rect x="13" y="4" width="7" height="7" rx="1.2"/><rect x="4" y="13" width="7" height="7" rx="1.2"/><rect x="13" y="13" width="7" height="7" rx="1.2"/></svg>
+      <span class="rail-item-label" data-i18n="nav.overview">Overview</span>
+    </div>
+    <div class="rail-item" data-view="profiles" data-i18n-title="nav.profiles" title="Profiles">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><path d="M3.5 20c0-3.3 2.5-5.5 5.5-5.5s5.5 2.2 5.5 5.5"/><circle cx="17" cy="8" r="2.4"/><path d="M15.2 14.8c2.5.3 4.3 2.3 4.3 5.2"/></svg>
+      <span class="rail-item-label" data-i18n="nav.profiles">Profiles</span>
+    </div>
+    <div class="rail-item" data-view="activity" data-i18n-title="nav.activity" title="Activity">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-7L13 19l2-7h6"/></svg>
+      <span class="rail-item-label" data-i18n="nav.activity">Activity</span>
+    </div>
+    <div class="rail-item" data-view="settings" data-i18n-title="nav.settings" title="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 13.5a7.6 7.6 0 0 0 0-3l2-1.5-2-3.5-2.4.7a7.6 7.6 0 0 0-2.6-1.5L14 2h-4l-.4 2.7a7.6 7.6 0 0 0-2.6 1.5l-2.4-.7-2 3.5 2 1.5a7.6 7.6 0 0 0 0 3l-2 1.5 2 3.5 2.4-.7a7.6 7.6 0 0 0 2.6 1.5L10 22h4l.4-2.7a7.6 7.6 0 0 0 2.6-1.5l2.4.7 2-3.5-2-1.5Z"/></svg>
+      <span class="rail-item-label" data-i18n="nav.settings">Settings</span>
+    </div>
+    <div class="rail-item" data-view="help" data-i18n-title="nav.help" title="Help">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 4.9.8c0 1.7-2.4 2-2.4 3.5"/><path d="M12 17.2h.01"/></svg>
+      <span class="rail-item-label" data-i18n="nav.help">Help</span>
+    </div>
+  </div>
+  <div class="rail-spacer"></div>
+  <div class="rail-lang" id="railLangSelect" data-value="en"><span class="select-value">EN</span></div>
+  <div class="rail-dot" title="daemon running"></div>
+</div>
+<div class="main">
+<div class="main-inner">
+<div class="banner" id="connectionBanner" style="display:none">
+  <span class="banner-dot"></span>
+  <span class="banner-text" data-i18n="banner.connection_lost">Can't reach the daemon</span>
+  <span class="banner-sub" id="connectionBannerSub"></span>
+  <div class="banner-spacer"></div>
+  <div class="banner-btn" id="connectionBannerRetry" data-i18n="banner.retry">Retry</div>
+</div>
+
+  <div class="view" data-view-panel="overview">
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="brand">Claude Unlimited</span>
+        <div class="host-chip"><span class="mono" id="hostChip">claude.unlimited:4317</span></div>
+        <span class="uptime" id="uptimeChip"></span>
+        <div class="host-chip">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--good)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+          <span class="mono" id="versionChip">…</span>
+        </div>
+      </div>
+      <div class="topbar-actions" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div class="toggle-group">
+          <div class="seg2">
+            <div class="seg2-item" data-theme-choice="dark" data-i18n-title="topbar.theme_dark" title="Dark">🌙</div>
+            <div class="seg2-item" data-theme-choice="light" data-i18n-title="topbar.theme_light" title="Light">☀️</div>
+          </div>
+        </div>
+        <div class="btn" id="refreshBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+          <span data-i18n="topbar.refresh">Refresh</span>
+        </div>
+        <div class="btn primary add-profile-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          <span data-i18n="topbar.add_profile">Add profile</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="content" style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;">
+      <div class="col-profiles" style="flex:1 1 620px;min-width:0;">
+        <div class="stat-strip" id="statStrip"></div>
+
+        <div class="panel-title">
+          <span data-i18n="panel.profiles">Profiles</span>
+          <div class="mini-chart-toggle" id="profilesViewToggle">
+            <div class="mini-chart-opt" data-profiles-view="list" data-i18n-title="panel.profiles_view_list" title="List">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+            </div>
+            <div class="mini-chart-opt" data-profiles-view="cells" data-i18n-title="panel.profiles_view_cells" title="Cells">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3.5" y="4.5" width="7.5" height="6" rx="1.2"/><rect x="13" y="4.5" width="7.5" height="6" rx="1.2"/><rect x="3.5" y="13.5" width="7.5" height="6" rx="1.2"/><rect x="13" y="13.5" width="7.5" height="6" rx="1.2"/></svg>
+            </div>
+          </div>
+        </div>
+        <div class="profiles" id="profiles"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+
+
+        <div class="panel-title">
+          <span data-i18n="panel.usage_by_project">Usage by project</span>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <div class="mini-metric-toggle" data-metric-target="project">
+              <div class="mini-metric-opt" data-metric-choice="percent" title="Percent">%</div>
+              <div class="mini-metric-opt" data-metric-choice="tokens" title="Tokens">#</div>
+            </div>
+            <span class="exp-badge" data-i18n="panel.best_effort">Best-effort</span>
+          </div>
+        </div>
+        <div class="side-card">
+          <div class="chart-sub" data-i18n="panel.usage_by_project_caveat">Best-effort — attributed by matching Claude Code's session id against its own local session files.</div>
+          <div class="model-list" id="projectUsageList"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+        </div>
+
+        <div class="panel-title" data-i18n="panel.cost.title">Cost &amp; plan</div>
+        <div class="cost-row" id="costRow"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+      </div>
+
+      <div class="col-activity" style="flex:1 1 320px;min-width:280px;">
+        <div class="panel-title" data-i18n="panel.activity_log">Activity log</div>
+        <div class="activity-panel" id="activityPreview"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+
+        <div class="panel-title">
+          <span data-i18n="panel.usage_by_account">Usage by account</span>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <div class="mini-metric-toggle" data-metric-target="account">
+              <div class="mini-metric-opt" data-metric-choice="percent" title="Percent">%</div>
+              <div class="mini-metric-opt" data-metric-choice="tokens" title="Tokens">#</div>
+            </div>
+            <div class="mini-chart-toggle" data-chart-target="account">
+              <div class="mini-chart-opt" data-chart-choice="bars" title="Bars">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 19V13M12 19V8M19 19v-5"/></svg>
+              </div>
+              <div class="mini-chart-opt" data-chart-choice="round" title="Round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9h-9V3Z"/></svg>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="chart-card account-usage-card">
+          <div id="accountUsageBars">
+            <div class="stack-bars-row" id="accountUsageBarsRow"></div>
+          </div>
+          <div id="accountUsageRound" style="display:none">
+            <div class="rings-row" id="accountUsageRingsRow"></div>
+          </div>
+          <div class="chart-sub" style="margin-top:10px;" data-i18n="panel.usage_by_account_sub">Last 7 days · tokens per day, split by account</div>
+          <div class="stack-legend" id="accountUsageLegend"></div>
+        </div>
+
+        <div class="panel-title">
+          <span data-i18n="panel.usage.title">Usage</span>
+          <div class="select-input select-input-compact" id="usageRangeSelect" data-value="1w">
+            <span class="select-value"></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+        </div>
+        <div class="usage-grid">
+          <div class="chart-card">
+            <div class="chart-head">
+              <!-- No static title: this card's granularity changes with the
+                   selected range (hourly/daily/weekly/monthly), so a fixed
+                   label would be wrong for most ranges. tokensSubCaption
+                   below states the range in words. -->
+              <div style="display:flex;align-items:center;gap:8px;margin-left:auto;">
+                <div class="mini-chart-toggle" data-chart-target="tokens">
+                  <div class="mini-chart-opt" data-chart-choice="bars" title="Bars">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 19V13M12 19V8M19 19v-5"/></svg>
+                  </div>
+                  <div class="mini-chart-opt" data-chart-choice="round" title="Round">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9h-9V3Z"/></svg>
+                  </div>
+                </div>
+                <div class="chart-total"><span class="mono-num" id="tokensTotalChip">—</span></div>
+              </div>
+            </div>
+            <div id="tokensChartBars">
+              <div class="bars-row" id="tokensBarsRow"></div>
+            </div>
+            <div id="tokensChartRings" style="display:none">
+              <div class="rings-row" id="tokensRingsRow"></div>
+            </div>
+            <div class="chart-sub" style="margin-top:10px;" id="tokensSubCaption">Last 7 days · all profiles combined</div>
+          </div>
+          <div class="side-card">
+            <div class="chart-head">
+              <div class="chart-title"><span data-i18n="panel.usage.model_split">Model split</span> <span class="chart-title-note" data-i18n="panel.usage.model_split_sub">(by token usage)</span></div>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <div class="mini-metric-toggle" data-metric-target="model">
+                  <div class="mini-metric-opt" data-metric-choice="percent" title="Percent">%</div>
+                  <div class="mini-metric-opt" data-metric-choice="tokens" title="Tokens">#</div>
+                </div>
+                <div class="mini-chart-toggle" data-chart-target="model">
+                  <div class="mini-chart-opt" data-chart-choice="bars" title="Bars">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 19V13M12 19V8M19 19v-5"/></svg>
+                  </div>
+                  <div class="mini-chart-opt" data-chart-choice="round" title="Round">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9h-9V3Z"/></svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div id="modelSplitBars" style="margin-top:10px;">
+              <div class="model-list" id="modelSplitList"></div>
+            </div>
+            <div id="modelSplitDonut" style="display:none">
+              <div class="donut-wrap" id="modelSplitDonutWrap"></div>
+            </div>
+            <div class="chart-title" style="margin-top:16px;" data-i18n="panel.usage.busiest_hours">Busiest hours</div>
+            <div class="heat-grid" id="heatGrid"></div>
+            <div class="heat-labels"><span>12a</span><span>6a</span><span>12p</span><span>6p</span><span>12a</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="view" data-view-panel="profiles" style="display:none">
+    <div class="topbar">
+      <div>
+        <div class="page-title" data-i18n="nav.profiles">Profiles</div>
+        <div class="page-sub" id="profilesSub"></div>
+      </div>
+      <div class="btn primary add-profile-btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        <span data-i18n="topbar.add_profile">Add profile</span>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="search-box">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input type="text" id="profileSearchInput" data-i18n-placeholder="profiles.search_placeholder" placeholder="Search profiles…">
+      </div>
+      <div class="filter-chips" id="profileStatusFilters">
+        <div class="filter-chip on" data-status-filter="all" data-i18n="profiles.filter_all">All</div>
+        <div class="filter-chip" data-status-filter="enabled" data-i18n="profiles.filter_enabled">Enabled</div>
+        <div class="filter-chip" data-status-filter="disabled" data-i18n="profiles.filter_disabled">Disabled</div>
+      </div>
+      <div class="select-input" id="profileSortSelect" data-value="priority">
+        <span class="select-value" data-i18n="profiles.sort_priority">Priority</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+      </div>
+    </div>
+
+    <div class="table">
+      <div class="table-head">
+        <span></span>
+        <span data-i18n="profiles.col_profile">Profile</span>
+        <span data-i18n="profiles.col_usage_1">5h / Tokens</span>
+        <span data-i18n="profiles.col_usage_2">7d / Cost</span>
+        <span data-i18n="modal.add_profile.threshold_label">Threshold</span>
+        <span data-i18n="modal.add_profile.priority_label">Priority</span>
+        <span></span>
+      </div>
+      <div id="profilesTableBody"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+    </div>
+  </div>
+
+  <div class="view" data-view-panel="activity" style="display:none">
+    <div class="topbar">
+      <div>
+        <div class="page-title" data-i18n="nav.activity">Activity</div>
+        <div class="page-sub" data-i18n="activity.subtitle">Every rotation, session, and config change across all profiles</div>
+      </div>
+      <div class="btn" id="activityExportBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3m0 12-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        <span data-i18n="activity.export_log">Export log</span>
+      </div>
+    </div>
+    <div class="toolbar">
+      <div class="filter-chips" id="activityFilters" style="flex:1;"></div>
+      <div class="date-range">
+        <input type="datetime-local" id="activitySince">
+        <span class="date-range-sep">–</span>
+        <input type="datetime-local" id="activityUntil">
+        <div class="btn" id="activityDateClearBtn" data-i18n="activity.clear_dates">Clear</div>
+      </div>
+    </div>
+    <div class="activity-panel" id="activityList"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+  </div>
+
+  <div class="view" data-view-panel="settings" style="display:none">
+    <div class="topbar">
+      <div>
+        <div class="page-title" data-i18n="nav.settings">Settings</div>
+        <div class="page-sub" data-i18n="settings.subtitle">Daemon, updates, and network configuration</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.updates.title">Updates</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.updates.mode_label">Update behavior</div>
+            <div class="field-sub" data-i18n="settings.updates.mode_desc">What happens when a new release is found</div>
+          </div>
+          <div class="select-input" id="updateModeSelect" data-value="auto_download">
+            <span class="select-value"></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.language.title">Language</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.language.label">Dashboard language</div>
+            <div class="field-sub" data-i18n="settings.language.desc">Changes the text shown in this Dashboard</div>
+          </div>
+          <div class="select-input" id="languageSelect" data-value="en">
+            <span class="select-value"></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.daemon.title">Daemon</div>
+        <div class="section-sub" data-i18n="settings.daemon.sub">The background process that runs the proxy and this dashboard</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.daemon.status_label">Status</div>
+            <div class="field-sub" id="daemonStatusSub"></div>
+          </div>
+          <div class="status-pill"><span class="dot"></span><span data-i18n="settings.daemon.running">Running</span></div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.daemon.autostart_label">Start automatically on login</div>
+            <div class="field-sub" data-i18n="settings.daemon.autostart_sub">Registers a launchd agent (macOS)</div>
+          </div>
+          <div class="toggle" id="autostartToggle"><div class="toggle-knob"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.process.title">Process</div>
+        <div class="section-sub" data-i18n="settings.process.sub">Live resource usage and manual control for the daemon process itself</div>
+      </div>
+      <div class="section-body">
+        <div class="stat-strip">
+          <div class="stat-chip">
+            <div class="stat-chip-label" data-i18n="settings.process.pid_label">PID</div>
+            <div class="stat-chip-value mono-num" id="processPidValue">—</div>
+          </div>
+          <div class="stat-chip">
+            <div class="stat-chip-label" data-i18n="settings.process.memory_label">Memory</div>
+            <div class="stat-chip-value mono-num" id="processMemoryValue">—</div>
+          </div>
+          <div class="stat-chip">
+            <div class="stat-chip-label" data-i18n="settings.process.uptime_label">Uptime</div>
+            <div class="stat-chip-value mono-num" id="processUptimeValue">—</div>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.process.restart_label">Restart daemon</div>
+            <div class="field-sub" id="processRestartSub" data-i18n="settings.process.restart_sub">Stops and starts the background service (launchd)</div>
+          </div>
+          <div class="btn" id="restartProcessBtn" data-i18n="settings.process.restart_btn">Restart</div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" style="color:var(--bad)" data-i18n="settings.process.kill_label">Kill daemon</div>
+            <div class="field-sub" data-i18n="settings.process.kill_sub">Stops the process immediately — the proxy and this dashboard go offline until it's started again</div>
+          </div>
+          <div class="btn danger" id="killProcessBtn" data-i18n="settings.process.kill_btn">Kill</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.network.title">Network</div>
+        <div class="section-sub" data-i18n="settings.network.sub">Manual one-time setup — never edited automatically</div>
+      </div>
+      <div class="section-body">
+        <div>
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.network.hosts_label">/etc/hosts alias</div>
+            <div class="field-sub" data-i18n="settings.network.hosts_sub">Add this line so <span class="mono">claude.unlimited</span> resolves locally</div>
+          </div>
+          <div class="code-row">
+            <code id="hostsLine">127.0.0.1  claude.unlimited</code>
+            <div class="copy-btn" data-copy-target="hostsLine">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.network.shell_label">Shell environment</div>
+            <div class="field-sub" data-i18n="settings.network.shell_sub">Add to your shell profile so any terminal's <span class="mono">claude</span> routes through the daemon</div>
+          </div>
+          <div class="code-row">
+            <code id="shellLine" class="mono">export ANTHROPIC_BASE_URL="http://127.0.0.1:4317"</code>
+            <div class="copy-btn" data-copy-target="shellLine">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.network.token_label">Placeholder token</div>
+            <div class="field-sub" data-i18n="settings.network.token_sub">Local-only credential <span class="mono">claude</span> authenticates with — never sent to Anthropic</div>
+          </div>
+          <div class="btn" id="regenTokenBtn" data-i18n="settings.network.regenerate">Regenerate</div>
+        </div>
+        <div class="code-row">
+          <code id="placeholderTokenLine" class="mono">…</code>
+          <div class="copy-btn" data-copy-target="placeholderTokenLine">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+            <span data-i18n="settings.network.copy">Copy</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.notifications.title">Notifications</div>
+        <div class="section-sub" data-i18n="settings.notifications.sub">Desktop notifications via macOS Notification Center</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.notifications.test_label">Send a test notification</div>
+            <div class="field-sub" data-i18n="settings.notifications.test_sub">Confirms macOS notifications work, and triggers the permission prompt if needed</div>
+          </div>
+          <div class="btn" id="testNotificationBtn" data-i18n="settings.notifications.test_btn">Send test</div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row" style="margin-bottom:-4px;">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.notifications.enable_label">Enable desktop notifications</div>
+          </div>
+          <div class="toggle" id="notifMasterToggle" data-field="notifications_enabled"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="divider"></div>
+        <div class="notif-list" id="notifList"></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.export_import.title">Export &amp; import</div>
+        <div class="section-sub" data-i18n="settings.data_portability.sub">Move your setup to another machine, or snapshot your configuration</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.export_import.export_label">Export a bundle</div>
+            <div class="field-sub" data-i18n="settings.export_import.export_desc">Profiles (credentials) are always passphrase-encrypted. Settings-only exports are plain JSON.</div>
+          </div>
+          <div class="btn" id="exportOpenBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3m0 12-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+            <span data-i18n="settings.export_import.export_btn">Export…</span>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.export_import.import_label">Import a bundle</div>
+            <div class="field-sub" data-i18n="settings.export_import.import_desc">Preview what's inside before anything is written.</div>
+          </div>
+          <div class="btn" id="importOpenBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v13m0 0-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+            <span data-i18n="settings.export_import.import_btn">Import…</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.storage.title">Storage</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text"><div class="field-title" data-i18n="settings.storage.shared_claude">Shared Claude config</div></div>
+          <code class="mono" style="font-size:var(--fs-body);color:var(--text-dim);">~/.claude</code>
+        </div>
+        <div class="field-row">
+          <div class="field-text"><div class="field-title" data-i18n="settings.storage.own_config">Claude Unlimited config</div></div>
+          <code class="mono" style="font-size:var(--fs-body);color:var(--text-dim);">~/.claude-unlimited</code>
+        </div>
+        <div class="field-row">
+          <div class="field-text"><div class="field-title" data-i18n="settings.storage.secrets">Secrets</div></div>
+          <code class="mono" style="font-size:var(--fs-body);color:var(--text-dim);">macOS Keychain</code>
+        </div>
+      </div>
+    </div>
+
+    <div class="section danger">
+      <div class="section-head">
+        <div class="section-title" style="color:var(--bad)" data-i18n="settings.danger.title">Danger zone</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.danger.reset_label">Remove all profiles</div>
+            <div class="field-sub" data-i18n="settings.danger.reset_desc">Deletes every stored credential from Keychain. ~/.claude is untouched.</div>
+          </div>
+          <div class="btn danger" id="resetBtn" data-i18n="settings.danger.reset_btn">Reset</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="view" data-view-panel="help" style="display:none">
+    <div class="topbar">
+      <div>
+        <div class="page-title" data-i18n="nav.help">Help</div>
+        <div class="page-sub" data-i18n="help.subtitle">Every command claude-unlimited supports, run from a terminal</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.getting_started.title">Getting started</div>
+      </div>
+      <div class="section-body">
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-doctor">claude-unlimited doctor</code>
+            <div class="copy-btn" data-copy-target="cmd-doctor">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.doctor">Checks your install, Keychain access, and configuration — run this first, and any time something seems off.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-add-account">claude-unlimited add-account</code>
+            <span class="cmd-optional">(alias: ac)</span>
+            <div class="copy-btn" data-copy-target="cmd-add-account">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.add_account">Opens your browser, logs into a Claude account through an isolated Claude Code session, and adds it as a Profile — the account UUID is always resolved automatically. Never affects any account already signed into `claude` on this machine, so it's safe to run again for each additional account.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-add-codex-account">claude-unlimited add-codex-account</code>
+            <div class="copy-btn" data-copy-target="cmd-add-codex-account">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.add_codex_account">Opens your browser, logs into a ChatGPT/Codex account through an isolated session, and adds it as a Profile routed through GPT models — mirrors add-account exactly. Never affects any account already signed into `codex` on this machine, so it's safe to run again for each additional account.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-reauth">claude-unlimited reauth</code>
+            <div class="copy-btn" data-copy-target="cmd-reauth">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.reauth">Re-authenticates a Profile that needs it — defaults to whichever ones the daemon reports as "needs re-auth", and lets you pick if there's more than one. Logs back into the exact same account, never a new one.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-start">claude-unlimited start</code>
+            <span class="cmd-optional">[--port PORT]</span>
+            <div class="copy-btn" data-copy-target="cmd-start">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.start">Runs the daemon in this terminal (Ctrl-C to stop) — good for a first look before installing it as a background service. Default port 4317.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.everyday.title">Everyday use</div>
+      </div>
+      <div class="section-body">
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-code">claude-unlimited code</code>
+            <span class="cmd-optional">[--profile &lt;name&gt;] [-- claude args]</span>
+            <div class="copy-btn" data-copy-target="cmd-code">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. Any extra arguments pass straight through to claude.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-status">claude-unlimited status</code>
+            <div class="copy-btn" data-copy-target="cmd-status">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.status">Reports whether the daemon is installed as a background service and currently running, and its pid.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.service.title">Background service</div>
+        <div class="section-sub" data-i18n="help.service.sub">Auto-starting the daemon on login — the same thing Settings → Daemon controls</div>
+      </div>
+      <div class="section-body">
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-install">claude-unlimited install</code>
+            <span class="cmd-optional">[--port PORT]</span>
+            <div class="copy-btn" data-copy-target="cmd-install">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.install">Registers the daemon to start automatically on login (launchd on macOS, systemd --user on Linux, Task Scheduler on Windows) and starts it now.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-uninstall">claude-unlimited uninstall</code>
+            <div class="copy-btn" data-copy-target="cmd-uninstall">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.uninstall">Stops the daemon from starting automatically on login.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-service-start">claude-unlimited service-start</code>
+            <div class="copy-btn" data-copy-target="cmd-service-start">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.service_start">Starts the already-installed background daemon right now.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-service-stop">claude-unlimited service-stop</code>
+            <div class="copy-btn" data-copy-target="cmd-service-stop">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.service_stop">Stops the installed background daemon.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.more.title">Where everything else happens</div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="help.more.body">Adding and removing Profiles, thresholds, priority, budget caps, Export/Import, and notifications are all managed right here in the Dashboard — not on the command line. The commands above are only for the daemon's own lifecycle.</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="modal-scrim" id="scrim">
+  <div class="modal wide">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" data-i18n="modal.add_profile.title">Add profile</div>
+        <div class="modal-sub" data-i18n="modal.add_profile.storage_note">Stored locally: metadata in config.json, credential in macOS Keychain.</div>
+      </div>
+      <div class="close-btn" id="cancelBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </div>
+    </div>
+
+    <div class="modal-body">
+      <div class="field-group">
+        <div class="field-label" data-i18n="modal.add_profile.connection_type">Connection type</div>
+        <div class="type-grid">
+          <div class="type-card sel" data-type-card="oauth">
+            <div class="type-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg></div>
+            <div class="type-name" data-i18n="modal.add_profile.kind_oauth">Claude subscription</div>
+            <div class="type-desc" data-i18n="modal.add_profile.type_oauth_desc">Use Import below, or claude-unlimited add-account from the terminal</div>
+          </div>
+          <div class="type-card" data-type-card="import">
+            <div class="type-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v13m0 0-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></div>
+            <div class="type-name" data-i18n="modal.add_profile.type_import_name">Import current login</div>
+            <div class="type-desc" data-i18n="modal.add_profile.type_import_desc">Reuse the account already logged into <span class="mono">claude</span> on this Mac — no re-auth</div>
+          </div>
+          <div class="type-card" data-type-card="api">
+            <div class="type-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="3.2"/><path d="M10.3 12.7 18 5m0 0h-3.4M18 5v3.4"/></svg></div>
+            <div class="type-name" data-i18n="modal.add_profile.kind_api">API endpoint</div>
+            <div class="type-desc" data-i18n="modal.add_profile.type_api_desc">Anthropic API, or any Anthropic-compatible gateway</div>
+          </div>
+          <div class="type-card" data-type-card="codex">
+            <div class="type-icon"><svg viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" clip-rule="evenodd"><path d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"/></svg></div>
+            <div class="type-name" data-i18n="modal.add_profile.kind_codex">Codex (ChatGPT / OpenAI)</div>
+            <div class="type-desc" data-i18n="modal.add_profile.type_codex_desc">Route through GPT models via a ChatGPT/Codex subscription, or a raw OpenAI API key</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="field-group" id="f_codex_authmode_wrap" style="display:none;">
+        <div class="field-label" data-i18n="modal.add_profile.codex_auth_mode_label">How do you want to connect?</div>
+        <div class="seg-row">
+          <div class="seg-btn on" data-codex-auth-mode="chatgpt_subscription" data-i18n="modal.add_profile.codex_auth_chatgpt">ChatGPT subscription</div>
+          <div class="seg-btn" data-codex-auth-mode="api_key" data-i18n="modal.add_profile.codex_auth_api_key">API key</div>
+        </div>
+      </div>
+
+      <div id="importPane" style="display:none;">
+        <div class="check-row" style="cursor:default;">
+          <div class="field-text" style="flex:1;">
+            <span class="check-title" data-i18n="modal.add_profile.import_prompt_title">Already logged into Claude Code on this Mac?</span>
+            <span class="check-sub" data-i18n="modal.add_profile.import_prompt_desc">Imports its token and resolves your account automatically — no copy/paste, no UUID hunting.</span>
+          </div>
+          <div class="btn primary" id="importBtn" data-i18n="modal.add_profile.import_btn">Import current login</div>
+        </div>
+        <div class="import-status" id="importStatus" style="display:none;margin-top:10px;"></div>
+      </div>
+
+      <div id="oauthAddAccountPane" style="display:none;">
+        <div class="field-group">
+          <div class="field-label" data-i18n="modal.add_profile.oauth_pane_label">Add a Claude subscription account</div>
+          <div class="cmd-row">
+            <div class="code-row">
+              <code id="cmd-add-account-modal">claude-unlimited add-account</code>
+              <span class="cmd-optional">(alias: ac)</span>
+              <div class="copy-btn" data-copy-target="cmd-add-account-modal">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                <span data-i18n="settings.network.copy">Copy</span>
+              </div>
+            </div>
+            <div class="field-sub" data-i18n="modal.add_profile.oauth_pane_desc">Run this in a terminal — it opens your browser, logs into a Claude account through an isolated session, and adds it as a Profile here automatically. The account UUID is resolved for you; never affects any account already signed into `claude` on this machine, so it's safe to run again for each additional account. Already logged in and just want to reuse that session instead? Use Import above.</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="codexAddAccountPane" style="display:none;">
+        <div class="field-group">
+          <div class="field-label" data-i18n="modal.add_profile.codex_pane_label">Add a ChatGPT subscription account</div>
+          <div class="cmd-row">
+            <div class="code-row">
+              <code id="cmd-add-codex-account-modal">claude-unlimited add-codex-account</code>
+              <div class="copy-btn" data-copy-target="cmd-add-codex-account-modal">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                <span data-i18n="settings.network.copy">Copy</span>
+              </div>
+            </div>
+            <div class="field-sub" data-i18n="modal.add_profile.codex_pane_desc">Run this in a terminal — it opens your browser, logs into a ChatGPT/Codex account through an isolated session, and adds it as a Profile here automatically. Never affects any account already signed into `codex` on this machine, so it's safe to run again for each additional account.</div>
+            <div class="field-sub" data-i18n="modal.add_profile.codex_pane_note">Priority, switch threshold, and the model/reasoning-effort overrides can be tuned afterward from this profile's Edit menu.</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="manualPane">
+        <div class="input-row">
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.name_label">Name</div>
+            <input class="text-input" id="f_name" data-i18n-placeholder="modal.add_profile.name_placeholder" placeholder="Personal Max">
+          </div>
+          <div class="field-group" id="f_authmode_wrap" style="display:none;">
+            <div class="field-label" data-i18n="modal.add_profile.auth_mode_label">Auth mode</div>
+            <div class="seg-row">
+              <div class="seg-btn on" data-auth-mode="api_key">API Key</div>
+              <div class="seg-btn" data-auth-mode="bearer" data-i18n="modal.add_profile.auth_mode_bearer">Bearer token</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="field-group" id="f_base_url_wrap" style="display:none;">
+          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com)</div>
+          <input class="text-input mono" id="f_base_url" data-i18n-placeholder="modal.add_profile.base_url_placeholder" placeholder="https://api.anthropic.com">
+        </div>
+
+        <div class="field-group" id="f_codex_base_url_wrap" style="display:none;">
+          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com)</div>
+          <input class="text-input mono" id="f_codex_base_url" data-i18n-placeholder="modal.add_profile.codex_base_url_placeholder" placeholder="https://api.openai.com/v1">
+        </div>
+
+        <div class="field-group" id="f_credential_wrap">
+          <div class="field-label" data-i18n="modal.add_profile.credential_label">API key</div>
+          <div class="credential-input">
+            <input class="text-input" id="f_credential" type="password" data-i18n-placeholder="modal.add_profile.credential_placeholder" placeholder="sk-ant-...">
+            <button type="button" class="eye-btn" id="credentialEyeBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="field-group" id="f_codex_credential_wrap" style="display:none;">
+          <div class="field-label" data-i18n="modal.add_profile.codex_credential_label">OpenAI API key</div>
+          <div class="credential-input">
+            <input class="text-input" id="f_codex_credential" type="password" data-i18n-placeholder="modal.add_profile.codex_credential_placeholder" placeholder="sk-...">
+            <button type="button" class="eye-btn" id="codexCredentialEyeBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="field-group" id="f_default_model_wrap" style="display:none;">
+          <div class="field-label" data-i18n="modal.add_profile.default_model_label">Default model (optional)</div>
+          <input class="text-input mono" id="f_default_model" data-i18n-placeholder="modal.add_profile.default_model_placeholder" placeholder="claude-sonnet-4-5">
+          <div class="field-help" data-i18n="modal.add_profile.default_model_help">Pin a model only if this endpoint needs an explicit mapping</div>
+        </div>
+
+        <div class="input-row" id="f_codex_model_wrap" style="display:none;">
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.codex_model_label">Model override</div>
+            <div class="select-input" id="f_codex_model" data-value="">
+              <span class="select-value"></span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </div>
+            <div class="field-help" id="f_codex_model_help"></div>
+          </div>
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.codex_reasoning_label">Reasoning effort override</div>
+            <div class="select-input" id="f_codex_reasoning" data-value="">
+              <span class="select-value"></span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </div>
+            <div class="field-help" data-i18n="modal.add_profile.codex_reasoning_help">Leave on Automatic to use the mapping's own default per model</div>
+          </div>
+        </div>
+
+        <div id="f_codex_mapping_wrap" style="display:none;">
+          <div class="field-label" data-i18n="modal.add_profile.codex_mapping_title">Automatic mapping</div>
+          <table class="model-map-table">
+            <thead><tr>
+              <th data-i18n="modal.add_profile.codex_mapping_col_claude">Claude model</th>
+              <th data-i18n="modal.add_profile.codex_mapping_col_openai">OpenAI/Codex model</th>
+              <th data-i18n="modal.add_profile.codex_mapping_col_effort">Reasoning effort</th>
+            </tr></thead>
+            <tbody>
+              <tr><td>Claude Fable 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">max</td></tr>
+              <tr><td>Claude Opus 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">high</td></tr>
+              <tr><td>Claude Sonnet 5</td><td class="mono">gpt-5.6-terra</td><td class="mono">medium</td></tr>
+              <tr><td>Claude Haiku 4.5</td><td class="mono">gpt-5.6-luna</td><td class="mono">low</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div>
+          <div class="advanced-toggle open" id="advancedToggle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            <span data-i18n="modal.add_profile.advanced">Advanced settings</span>
+          </div>
+          <div class="advanced-body open" id="advancedBody">
+            <div class="adv-row">
+              <div class="field-group" id="f_threshold_wrap">
+                <div class="field-label" data-i18n="modal.add_profile.threshold_label">Switch threshold</div>
+                <div class="stepper">
+                  <div class="stepper-btn" data-step="f_threshold" data-delta="-1">–</div>
+                  <div class="stepper-val"><span id="f_threshold_val">98</span>%</div>
+                  <div class="stepper-btn" data-step="f_threshold" data-delta="1">+</div>
+                </div>
+              </div>
+              <div class="field-group" id="f_token_threshold_wrap" style="display:none;">
+                <div class="field-label" data-i18n="modal.detail.token_threshold_label">Token budget</div>
+                <input class="text-input mono" id="f_token_threshold" type="number" min="0" step="1000" data-i18n-placeholder="modal.detail.token_threshold_placeholder" placeholder="No limit">
+              </div>
+              <div class="field-group">
+                <div class="field-label" data-i18n="modal.add_profile.priority_label">Priority</div>
+                <div class="stepper">
+                  <div class="stepper-btn" data-step="f_priority" data-delta="-1">–</div>
+                  <div class="stepper-val"><span id="f_priority_val">1</span></div>
+                  <div class="stepper-btn" data-step="f_priority" data-delta="1">+</div>
+                </div>
+              </div>
+              <div class="field-group" id="f_budget_wrap" style="display:none;">
+                <div class="field-label" data-i18n="modal.add_profile.budget_label">Monthly budget cap</div>
+                <input class="text-input mono" id="f_budget" placeholder="$50.00">
+              </div>
+            </div>
+            <div class="toggle-row">
+              <div class="toggle-row-text">
+                <div class="toggle-row-title" data-i18n="modal.add_profile.automatic_label">Eligible for automatic rotation</div>
+                <div class="toggle-row-sub" data-i18n="modal.add_profile.automatic_sub">Off = only reachable by a manual switch, never picked automatically</div>
+              </div>
+              <div class="toggle" id="f_automatic_toggle"><div class="toggle-knob"></div></div>
+            </div>
+            <div class="field-group">
+              <div class="field-label" data-i18n="modal.add_profile.tag_color_label">Tag color</div>
+              <div class="tag-row" id="f_tag_row"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="error-text" id="f_error" style="display:none"></div>
+    </div>
+    <div class="modal-foot">
+      <div class="btn" id="cancelBtn2" data-i18n="modal.cancel">Cancel</div>
+      <div class="btn primary" id="saveBtn" data-i18n="modal.add_profile.save_btn">Save profile</div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-scrim" id="exportScrim">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" data-i18n="modal.export.title">Export a bundle</div>
+        <div class="modal-sub" data-i18n="modal.export.desc">Choose what to include. A bundle containing Profiles always requires a passphrase — credentials never leave in the clear.</div>
+      </div>
+      <div class="close-btn" id="exportCancelBtn2">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="check-row" id="exp_profiles_row">
+        <div class="checkbox" id="exp_profiles_box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <div class="check-text">
+          <div class="check-title-row">
+            <span class="check-title" data-i18n="modal.export.profiles_label">Profiles (credentials)</span>
+            <span class="lock-tag">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+              <span data-i18n="modal.export.always_encrypted">Always encrypted</span>
+            </span>
+          </div>
+        </div>
+      </div>
+      <div class="passphrase-block" id="exp_passphrase_wrap">
+        <div class="passphrase-warn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+          <span data-i18n="modal.export.passphrase_warn">Anyone with this file AND this passphrase can use your accounts. Store the passphrase somewhere other than next to the file.</span>
+        </div>
+        <div class="field-group">
+          <div class="field-label" data-i18n="modal.export.passphrase_label">Passphrase</div>
+          <input class="text-input mono" id="exp_passphrase" type="password" data-i18n-placeholder="modal.export.passphrase_placeholder" placeholder="Required — Profiles export is always encrypted">
+        </div>
+      </div>
+      <div class="check-row" id="exp_settings_row">
+        <div class="checkbox on" id="exp_settings_box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <div class="check-text"><span class="check-title" data-i18n="modal.export.settings_label">Settings</span></div>
+      </div>
+      <div class="check-row" id="exp_activity_row">
+        <div class="checkbox" id="exp_activity_box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <div class="check-text"><span class="check-title" data-i18n="modal.export.activity_label">Activity log</span></div>
+      </div>
+      <div class="error-text" id="exp_error" style="display:none"></div>
+    </div>
+    <div class="modal-foot">
+      <div class="btn" id="exportCancelBtn" data-i18n="modal.cancel">Cancel</div>
+      <div class="btn primary" id="exportSaveBtn" data-i18n="modal.export.save_btn">Download bundle</div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-scrim" id="importScrim">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" data-i18n="modal.import.title">Import a bundle</div>
+        <div class="modal-sub" data-i18n="modal.import.desc">Nothing is written until you preview it and choose to apply.</div>
+      </div>
+      <div class="close-btn" id="importCancelBtn2">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <div class="field-label" data-i18n="modal.import.file_label">Bundle file</div>
+        <input type="file" id="imp_file" accept="application/json,.json" style="display:none">
+        <div class="dropzone" id="imp_dropzone">
+          <div class="dropzone-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3m0 12-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          </div>
+          <div class="dropzone-title" data-i18n="modal.import.dropzone_title">Click to upload, or drag and drop an export here</div>
+          <div class="dropzone-sub" data-i18n="modal.import.dropzone_sub">.json bundle exported from Claude Unlimited</div>
+        </div>
+        <div class="file-row" id="imp_file_row" style="display:none">
+          <div class="file-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>
+          </div>
+          <div style="min-width:0;">
+            <div class="file-name" id="imp_file_name"></div>
+            <div class="file-meta" id="imp_file_meta"></div>
+          </div>
+          <div class="file-change" id="imp_file_change" data-i18n="modal.import.change_file">Change file</div>
+        </div>
+      </div>
+      <div class="field-group" id="imp_passphrase_wrap" style="display:none">
+        <div class="field-label" data-i18n="modal.import.passphrase_label">Passphrase</div>
+        <input class="text-input mono" id="imp_passphrase" type="password" data-i18n-placeholder="modal.import.passphrase_placeholder" placeholder="Required if the bundle is encrypted">
+      </div>
+      <div class="error-text" id="imp_error" style="display:none"></div>
+
+      <div id="imp_preview" style="display:none;">
+        <div class="divider-row"><div class="divider-line"></div><span data-i18n="modal.import.found_in_bundle">found in bundle</span><div class="divider-line"></div></div>
+        <div id="imp_preview_body" style="font-size:var(--fs-body);color:var(--text-dim);"></div>
+
+        <div class="check-row" id="imp_profiles_wrap">
+          <div class="checkbox on" id="imp_apply_profiles_box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+          <div class="check-text"><span class="check-title" data-i18n="modal.import.apply_profiles_label">Import profiles</span></div>
+        </div>
+        <div class="field-group" id="imp_conflict_wrap">
+          <div class="field-label" data-i18n="modal.import.conflict_label">If a profile already exists (same account)</div>
+          <div class="seg-row" id="imp_conflict">
+            <div class="seg-btn on" data-conflict-value="keep_existing" data-i18n="modal.import.conflict_keep_existing">Keep existing</div>
+            <div class="seg-btn" data-conflict-value="use_imported" data-i18n="modal.import.conflict_use_imported">Use imported</div>
+          </div>
+        </div>
+        <div class="check-row" id="imp_settings_wrap">
+          <div class="checkbox" id="imp_apply_settings_box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+          <div class="check-text"><span class="check-title" data-i18n="modal.import.apply_settings_label">Import settings</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="btn" id="importCancelBtn" data-i18n="modal.cancel">Cancel</div>
+      <div class="btn primary" id="importPreviewBtn" data-i18n="modal.import.preview_btn">Preview</div>
+      <div class="btn primary" id="importApplyBtn" data-i18n="modal.import.apply_btn" style="display:none">Apply import</div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-scrim" id="profileDetailScrim">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="p-icon-lg" id="pd_icon"></div>
+      <div>
+        <div class="modal-title" id="pd_name">—<span class="warn-tag" id="pd_status_tag" style="display:none"></span></div>
+        <div class="modal-sub" id="pd_sub"></div>
+      </div>
+      <div class="close-btn" id="profileDetailCloseBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <div class="field-label" data-i18n="modal.add_profile.name_label">Name</div>
+        <input class="text-input" id="pd_name_input" type="text" maxlength="80" data-i18n-placeholder="modal.add_profile.name_placeholder" placeholder="Personal Max">
+      </div>
+      <div id="pd_api_fields" style="display:none">
+        <div class="field-group">
+          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL</div>
+          <input class="text-input" id="pd_base_url_input" type="text" data-i18n-placeholder="modal.add_profile.base_url_placeholder" placeholder="https://api.anthropic.com">
+        </div>
+        <div class="field-group">
+          <div class="field-label" data-i18n="modal.detail.api_key_label">API key</div>
+          <input class="text-input" id="pd_credential_input" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="modal.detail.api_key_placeholder" placeholder="Leave blank to keep the current key">
+        </div>
+        <div class="field-group">
+          <div class="field-label" data-i18n="modal.add_profile.budget_label">Monthly budget cap</div>
+          <input class="text-input mono" id="pd_budget_input" placeholder="$50.00">
+        </div>
+      </div>
+      <div id="pd_codex_fields" style="display:none">
+        <div class="field-group" id="pd_codex_base_url_wrap">
+          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com)</div>
+          <input class="text-input" id="pd_codex_base_url_input" type="text" data-i18n-placeholder="modal.add_profile.codex_base_url_placeholder" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="field-group" id="pd_codex_credential_wrap">
+          <div class="field-label" data-i18n="modal.detail.codex_api_key_label">OpenAI API key</div>
+          <input class="text-input" id="pd_codex_credential_input" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="modal.detail.codex_api_key_placeholder" placeholder="Leave blank to keep the current key">
+        </div>
+        <div class="field-row" id="pd_codex_home_row" style="padding:0;border:none;">
+          <div class="field-text">
+            <div class="field-title" data-i18n="modal.detail.codex_home_label">Isolated auth directory</div>
+            <div class="field-sub" data-i18n="modal.detail.codex_home_sub">Set the first time this account authenticated via add-codex-account — not editable here</div>
+          </div>
+          <code class="mono" id="pd_codex_home_display" style="font-size:var(--fs-body);color:var(--text-dim);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></code>
+        </div>
+        <div class="input-row">
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.codex_model_label">Model override</div>
+            <div class="select-input" id="pd_codex_model" data-value="">
+              <span class="select-value"></span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </div>
+            <div class="field-help" id="pd_codex_model_help"></div>
+          </div>
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.codex_reasoning_label">Reasoning effort override</div>
+            <div class="select-input" id="pd_codex_reasoning" data-value="">
+              <span class="select-value"></span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </div>
+            <div class="field-help" data-i18n="modal.add_profile.codex_reasoning_help">Leave on Automatic to use the mapping's own default per model</div>
+          </div>
+        </div>
+        <div class="mapping-block">
+          <div class="advanced-toggle" id="pdCodexMappingToggle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            <span data-i18n="modal.add_profile.codex_mapping_title">Automatic mapping</span>
+          </div>
+          <div class="advanced-body" id="pdCodexMappingBody">
+            <table class="model-map-table">
+              <thead><tr>
+                <th data-i18n="modal.add_profile.codex_mapping_col_claude">Claude model</th>
+                <th data-i18n="modal.add_profile.codex_mapping_col_openai">OpenAI/Codex model</th>
+                <th data-i18n="modal.add_profile.codex_mapping_col_effort">Reasoning effort</th>
+              </tr></thead>
+              <tbody>
+                <tr><td>Claude Fable 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">max</td></tr>
+                <tr><td>Claude Opus 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">high</td></tr>
+                <tr><td>Claude Sonnet 5</td><td class="mono">gpt-5.6-terra</td><td class="mono">medium</td></tr>
+                <tr><td>Claude Haiku 4.5</td><td class="mono">gpt-5.6-luna</td><td class="mono">low</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="bars-block" id="pd_bars"></div>
+      <div id="pd_api_usage" class="bars-block" style="display:none"></div>
+      <div class="field-row" id="pd_threshold_row_oauth">
+        <div class="field-text">
+          <div class="field-title" data-i18n="modal.add_profile.threshold_label">Switch threshold</div>
+          <div class="field-sub" data-i18n="modal.detail.threshold_sub">Rotate away from this profile at this usage %</div>
+        </div>
+        <div class="stepper">
+          <div class="stepper-btn" data-pd-step="threshold" data-delta="-1">–</div>
+          <div class="stepper-val"><span id="pd_threshold_val">98</span>%</div>
+          <div class="stepper-btn" data-pd-step="threshold" data-delta="1">+</div>
+        </div>
+      </div>
+      <div class="field-row" id="pd_threshold_row_api" style="display:none">
+        <div class="field-text">
+          <div class="field-title" data-i18n="modal.detail.token_threshold_label">Token budget</div>
+          <div class="field-sub" data-i18n="modal.detail.token_threshold_sub">Rotate away once lifetime usage reaches this many tokens — leave blank for no limit</div>
+        </div>
+        <input class="text-input" id="pd_token_threshold_input" type="number" min="0" step="1000" style="max-width:140px;text-align:right;" data-i18n-placeholder="modal.detail.token_threshold_placeholder" placeholder="No limit">
+      </div>
+      <div class="field-row">
+        <div class="field-text">
+          <div class="field-title" data-i18n="modal.add_profile.priority_label">Priority</div>
+          <div class="field-sub" data-i18n="modal.detail.priority_sub">Lower number is preferred when multiple profiles are eligible</div>
+        </div>
+        <div class="stepper">
+          <div class="stepper-btn" data-pd-step="priority" data-delta="-1">–</div>
+          <div class="stepper-val"><span id="pd_priority_val">1</span></div>
+          <div class="stepper-btn" data-pd-step="priority" data-delta="1">+</div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field-text">
+          <div class="field-title" data-i18n="modal.add_profile.automatic_label">Eligible for automatic rotation</div>
+          <div class="field-sub" id="pd_automatic_sub"></div>
+        </div>
+        <div class="toggle" id="pd_automatic_toggle"><div class="toggle-knob"></div></div>
+      </div>
+      <div class="field-group">
+        <div class="field-label" data-i18n="modal.add_profile.tag_color_label">Tag color</div>
+        <div class="tag-row" id="pd_tag_row"></div>
+      </div>
+      <div class="divider"></div>
+      <div class="danger-row">
+        <span class="danger-text" data-i18n="modal.detail.remove_label">Remove this profile</span>
+        <div class="btn danger" id="pd_remove_btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m-9 0 1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></svg>
+          <span data-i18n="profile.remove">Remove</span>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="btn" id="profileDetailCancelBtn" data-i18n="modal.cancel">Cancel</div>
+      <div class="btn primary" id="pd_save_btn" data-i18n="modal.detail.save">Save changes</div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-scrim" id="confirmScrim">
+  <div class="modal confirm-modal">
+    <div class="icon-wrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m-9 0 1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></svg>
+    </div>
+    <div class="modal-title" id="confirm_title">—</div>
+    <div class="modal-body-text" id="confirm_body"></div>
+    <input class="confirm-input" id="confirm_input" autocomplete="off" spellcheck="false">
+    <div class="confirm-hint" data-i18n="modal.confirm.hint">Type the profile name to confirm</div>
+    <div class="modal-actions">
+      <div class="btn" id="confirmCancelBtn" data-i18n="modal.cancel">Cancel</div>
+      <div class="btn danger" id="confirmActionBtn"></div>
+    </div>
+  </div>
+</div>
+
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
