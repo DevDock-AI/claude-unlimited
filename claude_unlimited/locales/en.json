@@ -392,5 +392,6 @@
   "modal.update.installing": "Downloading and installing…",
   "modal.update.installing_sub": "Verifying the release, then restarting",
   "modal.update.installed": "Update installed",
-  "modal.update.installed_sub": "The daemon is restarting to finish"
+  "modal.update.installed_sub": "The daemon is restarting to finish",
+  "help.cmd.purge": "Removes Claude Unlimited and everything it created — stored credentials, config, usage history, the app and its virtualenv, and the service registration. Asks for confirmation. Your own ~/.claude setup is never touched."
 }

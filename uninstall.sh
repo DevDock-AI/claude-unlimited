@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# If it was registered to auto-start on login (launchd), deregister it first —
-# otherwise deleting the app directory below leaves a LaunchAgent plist
-# pointing at a now-missing script, which fails silently on every future login.
+# `claude-unlimited purge` is the thorough path: it also removes each Profile's
+# credential from the OS keystore, which needs the config that names those
+# Profiles to still exist. This script only handles the case where the CLI is
+# already gone or broken.
 if command -v claude-unlimited >/dev/null 2>&1; then
-  claude-unlimited uninstall || true
+  exec claude-unlimited purge "$@"
 fi
+
+echo "The claude-unlimited command isn't available — removing files directly."
+echo "NOTE: stored credentials cannot be removed this way, because the config"
+echo "that names them is about to go. Remove entries with the service prefix"
+echo "'claude-unlimited.oauth.' from your OS keystore by hand if you want them gone."
+echo
 
 rm -f "$HOME/.local/bin/claude-unlimited"
 rm -rf "$HOME/.local/share/claude-unlimited" "$HOME/.claude-unlimited"
-echo "Claude Unlimited removed. ~/.claude was left untouched."
-echo "Profile credentials in macOS Keychain (service prefix claude-unlimited.oauth.*) were NOT removed automatically — remove them from Keychain Access if you want them gone too."
+echo "Removed. ~/.claude was left untouched."

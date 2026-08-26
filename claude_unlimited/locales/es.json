@@ -392,5 +392,6 @@
   "modal.update.installing": "Descargando e instalando…",
   "modal.update.installing_sub": "Verificando la versión y reiniciando",
   "modal.update.installed": "Actualización instalada",
-  "modal.update.installed_sub": "El daemon se está reiniciando para finalizar"
+  "modal.update.installed_sub": "El daemon se está reiniciando para finalizar",
+  "help.cmd.purge": "Elimina Claude Unlimited y todo lo que creó: credenciales guardadas, configuración, historial de uso, la aplicación y su entorno virtual, y el registro del servicio. Pide confirmación. Tu propia configuración ~/.claude nunca se toca."
 }

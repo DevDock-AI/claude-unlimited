@@ -392,5 +392,6 @@
   "modal.update.installing": "Se descarcă și se instalează…",
   "modal.update.installing_sub": "Se verifică versiunea, apoi se repornește",
   "modal.update.installed": "Actualizare instalată",
-  "modal.update.installed_sub": "Daemonul repornește pentru finalizare"
+  "modal.update.installed_sub": "Daemonul repornește pentru finalizare",
+  "help.cmd.purge": "Elimină Claude Unlimited și tot ce a creat — credențiale salvate, configurație, istoric de utilizare, aplicația și mediul ei virtual și înregistrarea serviciului. Cere confirmare. Configurația ta ~/.claude nu este atinsă niciodată."
 }

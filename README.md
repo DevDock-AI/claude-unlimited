@@ -433,6 +433,20 @@ Auto-start on login — the same thing **Settings → Daemon** controls.
 
 </details>
 
+<details>
+<summary><b>Removing it</b></summary>
+
+<br>
+
+| Command | What it's for |
+|---|---|
+| `claude-unlimited purge` | Removes everything: stored credentials, config, usage history, the app and its virtualenv, the CLI symlink, and the service registration. Asks for confirmation first. `~/.claude` is never touched. |
+
+Credentials are deleted from your OS keystore *before* the config goes, since
+the config is the only record of which Profiles exist.
+
+</details>
+
 ---
 
 ## Troubleshooting

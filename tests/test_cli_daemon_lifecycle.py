@@ -205,3 +205,62 @@ def test_service_stop_failure(monkeypatch, capsys):
 
     monkeypatch.setattr(daemon_installer, "stop", boom)
     assert cli.main(["service-stop"]) == 1
+
+
+def test_purge_refuses_without_confirmation_when_not_interactive(monkeypatch, capsys):
+    """Deleting credentials and config is irreversible, so a piped invocation
+    must not proceed silently."""
+    from claude_unlimited import cli
+
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    assert cli.purge(assume_yes=False) == 1
+    assert "Refusing to purge" in capsys.readouterr().err
+
+
+def test_purge_deletes_credentials_before_removing_the_config(monkeypatch, tmp_path):
+    """The config is the only record of which Profiles exist. Removing it
+    first would strand their credentials in the keystore with no way left to
+    enumerate them."""
+    from claude_unlimited import cli
+    from claude_unlimited.config import Pool, Profile
+
+    order = []
+    deleted = []
+
+    monkeypatch.setattr(cli, "load_pool", lambda: Pool(profiles=[
+        Profile(id="p1", name="A", kind="oauth", priority=1, automatic=True, enabled=True, account_uuid="u"),
+        Profile(id="p2", name="B", kind="api", priority=2, automatic=True, enabled=True),
+    ]))
+    import claude_unlimited.secret_store as store
+    monkeypatch.setattr(store, "delete_token", lambda pid: (order.append("delete_token"), deleted.append(pid)))
+
+    real_rmtree = cli.shutil.rmtree
+    monkeypatch.setattr(cli.shutil, "rmtree",
+                        lambda p, **k: order.append("rmtree"))
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".claude-unlimited").mkdir()
+    monkeypatch.setattr(cli.daemon_installer, "stop", lambda: None)
+    monkeypatch.setattr(cli.daemon_installer, "uninstall", lambda: None)
+
+    assert cli.purge(assume_yes=True) == 0
+    assert deleted == ["p1", "p2"]
+    assert order.index("delete_token") < order.index("rmtree")
+
+
+def test_purge_never_touches_the_users_claude_directory(monkeypatch, tmp_path):
+    from claude_unlimited import cli
+    from claude_unlimited.config import Pool
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "CLAUDE.md").write_text("mine")
+    (tmp_path / ".claude-unlimited").mkdir()
+
+    monkeypatch.setattr(cli, "load_pool", lambda: Pool(profiles=[]))
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(cli.daemon_installer, "stop", lambda: None)
+    monkeypatch.setattr(cli.daemon_installer, "uninstall", lambda: None)
+
+    assert cli.purge(assume_yes=True) == 0
+    assert (claude_dir / "CLAUDE.md").read_text() == "mine"
+    assert not (tmp_path / ".claude-unlimited").exists()

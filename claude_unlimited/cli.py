@@ -321,6 +321,83 @@ def _status_line_args(port: int, claude_args: list[str]) -> list[str]:
     })]
 
 
+def purge(assume_yes: bool = False) -> int:
+    """Removes everything this project created, including credentials.
+
+    Deliberately more thorough than the uninstall script: it deletes each
+    Profile's entry from the OS keystore first, while the config that names
+    those Profiles still exists. Once the config directory is gone there is
+    nothing left to enumerate them from, and the credentials would linger with
+    no way to find them again except by hand.
+
+    Never touches ~/.claude — the user's own Claude Code setup is not ours to
+    delete."""
+    from . import secret_store
+
+    app_dir = Path.home() / ".claude-unlimited"
+    install_root = Path.home() / ".local" / "share" / "claude-unlimited"
+    cli_link = Path.home() / ".local" / "bin" / "claude-unlimited"
+
+    _banner()
+    print("This removes Claude Unlimited and everything it created:")
+    print(f"  - stored credentials for every Profile (from your OS keystore)")
+    print(f"  - {app_dir}  (config, usage history, activity log, isolated account sessions)")
+    print(f"  - {install_root}  (the app and its virtualenv)")
+    print(f"  - {cli_link}")
+    print("  - the background service registration, if installed")
+    print()
+    print("Your own Claude Code setup (~/.claude) is NOT touched.")
+    print()
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print("Refusing to purge without confirmation. Re-run with --yes.", file=sys.stderr)
+            return 1
+        try:
+            answer = input("Type 'purge' to confirm: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            return 1
+        if answer != "purge":
+            print("Cancelled.")
+            return 1
+
+    try:
+        daemon_installer.stop()
+    except Exception:
+        pass
+    try:
+        daemon_installer.uninstall()
+        print("Background service: deregistered")
+    except Exception:
+        print("Background service: nothing to deregister")
+
+    # Before the config goes: it is the only record of which Profiles exist.
+    removed = 0
+    try:
+        for profile in load_pool().profiles:
+            try:
+                secret_store.delete_token(profile.id)
+                removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    print(f"Credentials removed from the keystore: {removed}")
+
+    for path in (app_dir, install_root):
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"Removed: {path}")
+    if cli_link.exists() or cli_link.is_symlink():
+        cli_link.unlink(missing_ok=True)
+        print(f"Removed: {cli_link}")
+
+    print()
+    print("Claude Unlimited is gone. ~/.claude was left untouched.")
+    return 0
+
+
 def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -> int:
     _banner()
     if not shutil.which("claude"):
@@ -729,6 +806,11 @@ def main(argv=None) -> int:
     sub.add_parser("uninstall", help="stop the daemon from starting automatically on login")
     sub.add_parser("service-start", help="start the installed background daemon now")
     sub.add_parser("service-stop", help="stop the installed background daemon")
+    purge_parser = sub.add_parser(
+        "purge",
+        help="remove Claude Unlimited and everything it created, including stored credentials")
+    purge_parser.add_argument("--yes", action="store_true",
+                               help="skip the confirmation prompt")
 
     args, unknown = parser.parse_known_args(argv)
     if args.cmd == "start":
@@ -753,6 +835,8 @@ def main(argv=None) -> int:
         return service_start()
     if args.cmd == "service-stop":
         return service_stop()
+    if args.cmd == "purge":
+        return purge(assume_yes=args.yes)
 
     parser.print_help()
     return 0

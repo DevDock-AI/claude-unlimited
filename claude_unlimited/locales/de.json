@@ -392,5 +392,6 @@
   "modal.update.installing": "Wird heruntergeladen und installiert…",
   "modal.update.installing_sub": "Version wird geprüft, dann Neustart",
   "modal.update.installed": "Update installiert",
-  "modal.update.installed_sub": "Der Daemon startet neu, um abzuschließen"
+  "modal.update.installed_sub": "Der Daemon startet neu, um abzuschließen",
+  "help.cmd.purge": "Entfernt Claude Unlimited und alles, was es angelegt hat — gespeicherte Zugangsdaten, Konfiguration, Nutzungsverlauf, die Anwendung samt virtueller Umgebung und die Dienstregistrierung. Fragt nach einer Bestätigung. Dein eigenes ~/.claude bleibt unberührt."
 }

@@ -74,8 +74,52 @@ case ":$PATH:" in
     ;;
 esac
 
+CLI="$BIN_DIR/claude-unlimited"
+
+echo
+echo "Checking the install…"
+echo
+if ! "$CLI" doctor; then
+  echo
+  echo "Install finished, but the check above found something. Fix it, then run:"
+  echo "  claude-unlimited doctor"
+  exit 1
+fi
+
+# The dashboard is where accounts are actually added, so it is worth being one
+# click away rather than a command the reader has to find. Started detached:
+# this makes it usable right now, while `claude-unlimited install` is what
+# makes it come back on login.
+PORT="${CLAUDE_UNLIMITED_PORT:-4317}"
+URL="http://127.0.0.1:${PORT}/"
+if ! curl -fsS --max-time 2 "${URL}health" >/dev/null 2>&1; then
+  echo
+  echo "Starting the daemon…"
+  nohup "$CLI" start --port "$PORT" >/dev/null 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -fsS --max-time 1 "${URL}health" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+fi
+
+echo
+if curl -fsS --max-time 2 "${URL}health" >/dev/null 2>&1; then
+  echo "Dashboard: $URL"
+  case "$(uname -s)" in
+    Darwin) open "$URL" >/dev/null 2>&1 || true ;;
+    Linux)  command -v xdg-open >/dev/null 2>&1 && (xdg-open "$URL" >/dev/null 2>&1 || true) ;;
+  esac
+else
+  echo "The daemon did not come up. Start it yourself with:"
+  echo "  claude-unlimited start"
+fi
+
 echo
 echo "Next steps:"
-echo "  claude-unlimited doctor         # check the install"
-echo "  claude-unlimited add-account    # add a Claude subscription"
-echo "  claude-unlimited install        # run in the background on login"
+echo "  Add an API key from the dashboard, or add a subscription:"
+echo "    claude-unlimited add-account         # a Claude subscription"
+echo "    claude-unlimited add-codex-account   # a ChatGPT/Codex subscription"
+echo "  claude-unlimited install               # keep it running, starting on login"
+echo
+echo "To remove everything later:"
+echo "  claude-unlimited purge"
