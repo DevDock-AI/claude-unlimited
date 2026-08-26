@@ -3,6 +3,13 @@
 Pure, no I/O. The tiering is best-effort, matched by price/role parity
 between the Codex model catalog and Anthropic's published pricing; neither
 vendor documents an equivalence. Revisit when either lineup changes.
+
+The tiers are deliberately conservative, because Codex quota is spent on
+reasoning output weighted by model tier — not on the size of the request
+(docs/adr/0007). `gpt-5.6-sol` is the expensive one and is reserved for the
+top Claude tier; everything below it runs on a cheaper model, so an ordinary
+session does not sit on the most expensive target by default. Raising a row
+here raises what a session costs, so treat it as a spending decision.
 """
 
 from __future__ import annotations
@@ -21,8 +28,8 @@ class OpenAIModelTarget:
 
 # Ordered most-capable-first — used only for the substring-match fallback below.
 _MODEL_MAP: dict[str, OpenAIModelTarget] = {
-    "claude-fable-5": OpenAIModelTarget("gpt-5.6-sol", "max"),
-    "claude-opus-5": OpenAIModelTarget("gpt-5.6-sol", "high"),
+    "claude-fable-5": OpenAIModelTarget("gpt-5.6-sol", "high"),
+    "claude-opus-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
     "claude-sonnet-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
     "claude-haiku-4-5-20251001": OpenAIModelTarget("gpt-5.6-luna", "low"),
 }
@@ -36,8 +43,8 @@ _DEFAULT_TARGET = OpenAIModelTarget("gpt-5.6-terra", "medium")
 # been updated for). Checked in order, first match wins, before
 # _DEFAULT_TARGET.
 _FAMILY_FALLBACKS: list[tuple[str, OpenAIModelTarget]] = [
-    ("claude-fable", OpenAIModelTarget("gpt-5.6-sol", "max")),
-    ("claude-opus", OpenAIModelTarget("gpt-5.6-sol", "high")),
+    ("claude-fable", OpenAIModelTarget("gpt-5.6-sol", "high")),
+    ("claude-opus", OpenAIModelTarget("gpt-5.6-terra", "medium")),
     ("claude-sonnet", OpenAIModelTarget("gpt-5.6-terra", "medium")),
     ("claude-haiku", OpenAIModelTarget("gpt-5.6-luna", "low")),
 ]

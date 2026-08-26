@@ -120,7 +120,7 @@ def test_a_rejected_model_falls_back_to_the_next_one(monkeypatch):
         _model_error("The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."),
         _ok(),
     ])
-    body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+    body = json.dumps({"model": "claude-fable-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
     result = run(_subscription_profile(), _cred(), body)
     list(result.body_chunks)
@@ -134,7 +134,7 @@ def test_a_working_substitution_is_reused_on_the_next_request(monkeypatch):
     conns = _install_fake_connections(monkeypatch, [
         _model_error("The model `gpt-5.6-sol` does not exist."), _ok(), _ok(),
     ])
-    body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+    body = json.dumps({"model": "claude-fable-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
     list(run(_subscription_profile(), _cred(), body).body_chunks)
     list(run(_subscription_profile(), _cred(), body).body_chunks)
