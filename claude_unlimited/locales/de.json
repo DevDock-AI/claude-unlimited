@@ -345,9 +345,9 @@
   "profiles.kind_codex_api_key_badge": "API-Schlüssel",
   "profiles.kind_codex_chatgpt": "ChatGPT-Abo",
   "profiles.kind_codex_api": "OpenAI-API",
-  "profiles.window_5h": "5 Std.",
+  "profiles.window_5h": "5h-Sitzung",
   "profiles.window_daily": "Täglich",
-  "profiles.window_weekly": "Wöchentlich",
+  "profiles.window_weekly": "7d wöchentlich",
   "profiles.window_monthly": "Monatlich",
   "profiles.window_annual": "Jährlich",
   "profiles.window_usage": "Nutzung",
@@ -395,5 +395,11 @@
   "modal.update.installed_sub": "Neustart zum Abschließen — diese Seite wird neu geladen",
   "help.cmd.purge": "Entfernt Claude Unlimited und alles, was es angelegt hat — gespeicherte Zugangsdaten, Konfiguration, Nutzungsverlauf, die Anwendung samt virtueller Umgebung und die Dienstregistrierung. Fragt nach einer Bestätigung. Dein eigenes ~/.claude bleibt unberührt.",
   "rail.repo": "Quellcode auf GitHub ansehen",
-  "help.cmd.restart": "Stoppt und startet den Daemon, unabhängig davon, ob er als Hintergrunddienst installiert ist. Nach einem Update nötig, da der laufende Prozess weiterhin die Version bedient, mit der er gestartet ist."
+  "help.cmd.restart": "Stoppt und startet den Daemon, unabhängig davon, ob er als Hintergrunddienst installiert ist. Nach einem Update nötig, da der laufende Prozess weiterhin die Version bedient, mit der er gestartet ist.",
+  "status.healthy": "in Ordnung",
+  "status.almost_exhausted": "fast erschöpft",
+  "status.exhausted": "erschöpft",
+  "status.cooldown": "Abkühlphase",
+  "status.needs_reauth": "Neuanmeldung nötig",
+  "status.disabled": "deaktiviert"
 }

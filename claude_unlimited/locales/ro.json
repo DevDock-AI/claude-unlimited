@@ -345,9 +345,9 @@
   "profiles.kind_codex_api_key_badge": "Cheie API",
   "profiles.kind_codex_chatgpt": "Abonament ChatGPT",
   "profiles.kind_codex_api": "API OpenAI",
-  "profiles.window_5h": "5h",
+  "profiles.window_5h": "sesiune 5h",
   "profiles.window_daily": "Zilnic",
-  "profiles.window_weekly": "Săptămânal",
+  "profiles.window_weekly": "7d săptămânal",
   "profiles.window_monthly": "Lunar",
   "profiles.window_annual": "Anual",
   "profiles.window_usage": "Utilizare",
@@ -395,5 +395,11 @@
   "modal.update.installed_sub": "Se repornește pentru finalizare — pagina se va reîncărca",
   "help.cmd.purge": "Elimină Claude Unlimited și tot ce a creat — credențiale salvate, configurație, istoric de utilizare, aplicația și mediul ei virtual și înregistrarea serviciului. Cere confirmare. Configurația ta ~/.claude nu este atinsă niciodată.",
   "rail.repo": "Vezi sursa pe GitHub",
-  "help.cmd.restart": "Oprește și pornește daemonul, indiferent dacă este instalat ca serviciu de fundal. Necesar după o actualizare care înlocuiește codul de pe disc, deoarece procesul care rulează servește în continuare versiunea cu care a pornit."
+  "help.cmd.restart": "Oprește și pornește daemonul, indiferent dacă este instalat ca serviciu de fundal. Necesar după o actualizare care înlocuiește codul de pe disc, deoarece procesul care rulează servește în continuare versiunea cu care a pornit.",
+  "status.healthy": "în regulă",
+  "status.almost_exhausted": "aproape epuizat",
+  "status.exhausted": "epuizat",
+  "status.cooldown": "în așteptare",
+  "status.needs_reauth": "necesită reautentificare",
+  "status.disabled": "dezactivat"
 }

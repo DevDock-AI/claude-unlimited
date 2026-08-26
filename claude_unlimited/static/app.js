@@ -611,13 +611,31 @@ function planBadge(p) {
   return `<span class="plan-badge api" title="${esc(t('profiles.kind_oauth_unknown'))}">${OAUTH_ICON}<span>${esc(t('profiles.plan_badge_unknown'))}</span></span>`;
 }
 
+// Red, not amber: a Profile in this state has already crossed its threshold
+// and is out of rotation. Amber made it look less serious than the bar did a
+// percent earlier, when it was still merely approaching.
 const STATUS_COLORS = {
   healthy: { color: 'var(--good)', bg: 'var(--good-soft)' },
-  'near threshold': { color: 'var(--warn)', bg: 'var(--warn-soft)' },
+  'almost exhausted': { color: 'var(--bad)', bg: 'var(--bad-soft)' },
   exhausted: { color: 'var(--bad)', bg: 'var(--bad-soft)' },
   cooldown: { color: 'var(--warn)', bg: 'var(--warn-soft)' },
   'needs re-auth': { color: 'var(--bad)', bg: 'var(--bad-soft)' },
 };
+
+// The daemon reports these in English; the Dashboard speaks four languages.
+const STATUS_LABEL_KEYS = {
+  healthy: 'status.healthy',
+  'almost exhausted': 'status.almost_exhausted',
+  exhausted: 'status.exhausted',
+  cooldown: 'status.cooldown',
+  'needs re-auth': 'status.needs_reauth',
+  disabled: 'status.disabled',
+};
+
+function statusLabel(statusWord) {
+  const key = STATUS_LABEL_KEYS[statusWord];
+  return key ? t(key) : statusWord;
+}
 
 // Percentage points below switch_threshold at which a still-healthy bar
 // starts warning, ahead of the rotation/exhaustion states that already have
@@ -814,7 +832,7 @@ function renderProfileCard(p) {
           <span class="mono-num">${p.priority}</span>
         </span>
         ${p.enabled
-          ? `<span class="p-status-word" style="color:${statusColors.color};background:${statusColors.bg}">${esc(p.status_word)}</span>`
+          ? `<span class="p-status-word" style="color:${statusColors.color};background:${statusColors.bg}">${esc(statusLabel(p.status_word))}</span>`
           : `<span class="p-disabled-badge">${esc(t('profile.disabled'))}</span>`}
       </div>
       <div class="p-bars">${usageBlock}</div>
@@ -1263,7 +1281,7 @@ function openProfileDetailModal(profileId) {
   document.getElementById('pd_name_input').value = p.name;
   const statusTag = document.getElementById('pd_status_tag');
   if (p.enabled && p.status_word !== 'healthy') {
-    statusTag.textContent = p.status_word;
+    statusTag.textContent = statusLabel(p.status_word);
     statusTag.style.display = '';
   } else {
     statusTag.style.display = 'none';

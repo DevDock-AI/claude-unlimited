@@ -345,9 +345,9 @@
   "profiles.kind_codex_api_key_badge": "Clave de API",
   "profiles.kind_codex_chatgpt": "Suscripción a ChatGPT",
   "profiles.kind_codex_api": "API de OpenAI",
-  "profiles.window_5h": "5h",
+  "profiles.window_5h": "sesión de 5h",
   "profiles.window_daily": "Diario",
-  "profiles.window_weekly": "Semanal",
+  "profiles.window_weekly": "7d semanal",
   "profiles.window_monthly": "Mensual",
   "profiles.window_annual": "Anual",
   "profiles.window_usage": "Uso",
@@ -395,5 +395,11 @@
   "modal.update.installed_sub": "Reiniciando para finalizar: esta página se recargará",
   "help.cmd.purge": "Elimina Claude Unlimited y todo lo que creó: credenciales guardadas, configuración, historial de uso, la aplicación y su entorno virtual, y el registro del servicio. Pide confirmación. Tu propia configuración ~/.claude nunca se toca.",
   "rail.repo": "Ver el código en GitHub",
-  "help.cmd.restart": "Detiene e inicia el daemon, esté o no instalado como servicio en segundo plano. Necesario tras una actualización que reemplaza el código en disco, ya que el proceso en ejecución sigue sirviendo la versión con la que arrancó."
+  "help.cmd.restart": "Detiene e inicia el daemon, esté o no instalado como servicio en segundo plano. Necesario tras una actualización que reemplaza el código en disco, ya que el proceso en ejecución sigue sirviendo la versión con la que arrancó.",
+  "status.healthy": "correcto",
+  "status.almost_exhausted": "casi agotado",
+  "status.exhausted": "agotado",
+  "status.cooldown": "en espera",
+  "status.needs_reauth": "requiere reautenticación",
+  "status.disabled": "desactivado"
 }

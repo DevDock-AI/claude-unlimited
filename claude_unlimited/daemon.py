@@ -106,7 +106,7 @@ def _security_headers() -> dict:
 # Router state -> the word the Dashboard shows.
 _STATUS_WORDS = {
     "eligible": "healthy",
-    "draining": "near threshold",
+    "draining": "almost exhausted",
     "exhausted": "exhausted",
     "cooldown": "cooldown",
     "auth_invalid": "needs re-auth",
