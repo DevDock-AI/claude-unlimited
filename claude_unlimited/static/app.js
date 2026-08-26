@@ -2006,9 +2006,12 @@ function renderUpdateState(state) {
   const sub = document.getElementById('updateLatestSub');
   if (!installed || !latest || !sub) return;
 
-  installed.textContent = state.current_version || '—';
+  // Only overwrite what the payload actually carries: a response missing a
+  // field must leave the displayed value alone rather than blanking it.
+  if (state.current_version) installed.textContent = state.current_version;
   const available = state.available;
-  latest.textContent = available ? available.version : (state.checked_at ? state.current_version : '—');
+  if (available) latest.textContent = available.version;
+  else if (state.checked_at && state.current_version) latest.textContent = state.current_version;
 
   let key = 'settings.updates.never_checked';
   if (state.error) key = null;
@@ -2018,6 +2021,15 @@ function renderUpdateState(state) {
   sub.textContent = key ? t(key) : state.error;
   sub.style.color = state.error ? 'var(--bad)' : '';
   latest.style.color = available ? 'var(--warn)' : '';
+
+  // Grey out only once a check has actually proven there is nothing newer.
+  // Before any check the button is still useful: it checks and installs in
+  // one go, so disabling it then would remove the only way to act.
+  const installBtn = document.getElementById('updateInstallBtn');
+  if (installBtn) {
+    const knownUpToDate = Boolean(state.checked_at) && !available && !state.error;
+    installBtn.classList.toggle('btn-disabled', knownUpToDate);
+  }
 }
 
 async function refreshUpdateState() {

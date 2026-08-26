@@ -335,11 +335,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/update":
-            with _update_lock:
-                state = dict(_update_state)
-            state["current_version"] = __version__
-            state["update_mode"] = load_pool().settings.update_mode
-            self._send_json(200, state)
+            self._send_json(200, _public_update_state())
             return
 
         if path == "/api/status":
@@ -1024,6 +1020,18 @@ def _record_update_outcome(outcome, settings) -> None:
                                       f"Version {release.version} is available.", settings)
 
 
+def _public_update_state(settings=None) -> dict:
+    """The wire shape for update state. Shared by every endpoint that returns
+    it, so a check response can never come back missing fields the Dashboard
+    is already displaying."""
+    settings = settings or load_pool().settings
+    with _update_lock:
+        state = dict(_update_state)
+    state["current_version"] = __version__
+    state["update_mode"] = settings.update_mode
+    return state
+
+
 def _run_update_check(settings=None, *, respect_idle: bool = True) -> dict:
     """One check-and-act pass honoring the configured update_mode.
 
@@ -1047,7 +1055,7 @@ def _run_update_check(settings=None, *, respect_idle: bool = True) -> dict:
     _record_update_outcome(outcome, settings)
     with _update_lock:
         _update_state["install_deferred_until_idle"] = bool(deferred and outcome.action == "downloaded")
-        return dict(_update_state)
+    return _public_update_state(settings)
 
 
 def _install_deferred_update_if_idle() -> None:

@@ -356,3 +356,25 @@ def test_install_proceeds_when_idle(monkeypatch, tmp_path):
 def _settings_with_mode(mode):
     from claude_unlimited.config import Settings
     return Settings(update_mode=mode)
+
+
+def test_check_response_carries_the_version_fields_the_ui_shows(monkeypatch, tmp_path):
+    """The check response and the GET must be the same shape. When it wasn't,
+    the Dashboard blanked the installed and latest versions after a check."""
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr("claude_unlimited.activity.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.activity.ACTIVITY_FILE", tmp_path / "activity.jsonl")
+    monkeypatch.setattr(daemon_mod._gateway, "is_idle", lambda _s: True)
+    monkeypatch.setattr(daemon_mod.updater, "run_update_cycle",
+                        lambda *a, **k: updater.UpdateOutcome(release=None, action="none"))
+
+    checked = daemon_mod._run_update_check(_settings_with_mode("manual"))
+    served = daemon_mod._public_update_state(_settings_with_mode("manual"))
+
+    for field in ("current_version", "update_mode", "available", "action", "checked_at"):
+        assert field in checked, f"check response missing {field}"
+    assert set(checked) == set(served), "check and GET must return the same keys"
+    assert checked["current_version"] == daemon_mod.__version__
