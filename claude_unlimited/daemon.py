@@ -775,10 +775,40 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"token": token})
             return
 
+        if path.startswith("/api/profiles/") and path.endswith("/refresh"):
+            profile_id = path.removeprefix("/api/profiles/").removesuffix("/refresh")
+            profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+            if profile is None:
+                self._send_json(404, {"error": "not_found", "message": "No such profile."})
+                return
+            try:
+                # Synchronous, unlike the one on profile creation: this one was
+                # asked for, so the caller waits and gets the refreshed Profile
+                # back rather than having to guess when it landed.
+                result = connection_test.test_connection(
+                    profile_id, credential=_resolved_credential(profile))
+                _record_ping(profile, result)
+                activity.record("session", f"Fetched info for {profile.name}",
+                                 meta=f"status={result.get('status')}")
+            except connection_test.ConnectionTestThrottled as exc:
+                self._send_json(429, {"error": "throttled", "message": str(exc),
+                                       "retry_after_seconds": exc.retry_after_seconds})
+                return
+            except connection_test.ConnectionTestError as exc:
+                self._send_json(502, {"error": "unreachable", "message": str(exc)})
+                return
+            fresh = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+            runtime = _gateway.runtime_snapshot().get(profile_id)
+            self._send_json(200, {"profile": _profile_to_public_dict(fresh or profile, runtime)})
+            return
+
         if path.startswith("/api/profiles/") and path.endswith("/test"):
             profile_id = path.removeprefix("/api/profiles/").removesuffix("/test")
             try:
-                result = connection_test.test_connection(profile_id)
+                _probe_profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+                result = connection_test.test_connection(
+                    profile_id,
+                    credential=_resolved_credential(_probe_profile) if _probe_profile else None)
                 # A test is a live request like any other: let it refresh the
                 # Profile's usage instead of throwing the headers away.
                 profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
@@ -943,8 +973,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             profile_id = path.removeprefix("/api/profiles/")
             try:
                 body = self._read_json_body()
+                before = next((x for x in profile_repo.list_profiles() if x.id == profile_id), None)
                 p = profile_repo.update_profile(profile_id, **body)
                 self._send_json(200, {"profile": _profile_to_public_dict(p)})
+                # Turning a Profile into a rotation candidate is the moment its
+                # usage starts mattering, and a Profile that has never served a
+                # request has none recorded. Only on the transition, so
+                # re-saving an already-automatic Profile costs nothing.
+                if _should_prime_after_update(before, p):
+                    _prime_profile_async(p.id)
             except profile_repo.ValidationError as exc:
                 self._send_json(400, {"error": "validation", "message": str(exc)})
             except profile_repo.ProfileRepositoryError as exc:
@@ -1048,6 +1085,33 @@ def _record_update_outcome(outcome, settings) -> None:
                                       f"Version {release.version} is available.", settings)
 
 
+def _resolved_credential(profile):
+    """The bare access token to use for an out-of-band probe.
+
+    Routed through the Gateway on purpose: it owns the single per-Profile
+    refresh backoff clock, so refreshing here rather than in connection_test
+    avoids a second, competing refresh path."""
+    if profile is None or profile.kind != "oauth":
+        return None  # connection_test resolves these itself
+    try:
+        from . import secret_store
+        return _gateway._maybe_refresh_credential(profile, secret_store.get_token(profile.id))
+    except Exception:  # noqa: BLE001 - connection_test falls back to decoding what is stored
+        return None
+
+
+def _should_prime_after_update(before, after) -> bool:
+    """Whether a Profile edit is one that should refresh its usage.
+
+    Only the transition into auto-rotation: that is the point where the
+    Profile becomes a rotation candidate and its usage starts deciding
+    routing, and a Profile that has never served a request has none recorded.
+    Re-saving an already-automatic Profile must not spend a request."""
+    if after is None or not getattr(after, "automatic", False):
+        return False
+    return before is None or not getattr(before, "automatic", False)
+
+
 def _record_ping(profile, result: dict) -> None:
     """Feeds a one-off ping's response into the same usage pipeline a real
     request goes through, so the Dashboard reflects it immediately.
@@ -1057,6 +1121,8 @@ def _record_ping(profile, result: dict) -> None:
     from .observation import classify as classify_anthropic
     from .gateway import _filter_openai_headers
     from .proxy import filter_response_headers
+
+    from .observation import UsageSnapshot
 
     headers = result.get("headers") or {}
     status = result.get("status")
@@ -1074,6 +1140,15 @@ def _record_ping(profile, result: dict) -> None:
                 profile_repo.update_profile(profile.id, plan=plan)
         else:
             observation = classify_anthropic(status, filter_response_headers(headers), now)
+
+        # A probe may only IMPROVE what is known about a Profile, never
+        # condemn it. Anything other than a usage reading — a 401, a 429, an
+        # unclassifiable response — is discarded here, because a probe that
+        # can mark a Profile AUTH_INVALID turns any bug in the probe itself
+        # (a mis-resolved credential, a transient failure) into a healthy
+        # account being taken out of rotation. Real traffic decides that.
+        if not isinstance(observation, UsageSnapshot):
+            return
 
         with _gateway._lock:
             _gateway._observe(profile.id, observation, now)
@@ -1098,7 +1173,8 @@ def _prime_profile(profile_id: str) -> None:
         profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
         if profile is None or not profile.enabled:
             return
-        result = connection_test.test_connection(profile_id)
+        result = connection_test.test_connection(
+            profile_id, credential=_resolved_credential(profile))
     except Exception:  # noqa: BLE001 - priming is best-effort by design
         return
 

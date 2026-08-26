@@ -1226,6 +1226,7 @@ function openProfileKebabMenu(anchorBtn, profileId) {
     { icon: '<path d="M4 20l4.2-.7L19 8.5a2 2 0 0 0 0-2.8l-.7-.7a2 2 0 0 0-2.8 0L4.7 15.8 4 20Z"/>', label: t('profiles.menu_edit'), action: 'edit' },
     { icon: '<path d="M3 12h4l2.5-7L13 19l2-7h6"/>', label: t('profiles.menu_view_activity'), action: 'activity' },
     { icon: '<path d="M12 20a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z"/><path d="M9 12l2 2 4-4"/>', label: t('profiles.menu_test_connection'), action: 'test' },
+    { icon: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>', label: t('profiles.menu_fetch_info'), action: 'fetch_info' },
     { divider: true },
     { icon: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/>', label: t('profiles.menu_take_over'), action: 'take_over', title: t('profiles.take_over_tooltip') },
     { divider: true },
@@ -1284,6 +1285,16 @@ function openProfileKebabMenu(anchorBtn, profileId) {
           showToast('error', t('toast.test_connection_failed'), err.message);
         }
         await loadActivity();
+      }
+      if (action === 'fetch_info') {
+        showToast('info', t('toast.fetch_info_running'), profile.name, { duration: 4000 });
+        try {
+          await api(`/api/profiles/${profileId}/refresh`, { method: 'POST', body: '{}' });
+          showToast('success', t('toast.fetch_info_ok'), profile.name);
+        } catch (err) {
+          showToast('error', t('toast.fetch_info_failed'), err.message);
+        }
+        await Promise.all([loadProfilesTable(), loadProfiles()]);
       }
       if (action === 'remove') openConfirmModal({
         title: `${t('modal.confirm.remove_title_prefix')} "${profile.name}"?`,

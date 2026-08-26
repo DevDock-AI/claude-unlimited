@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import Optional
 
-from . import proxy, secret_store, upstream
+from . import oauth_credential, proxy, secret_store, upstream
 from .config import load_pool
 
 TEST_MODEL = "claude-haiku-4-5-20251001"
@@ -51,7 +52,12 @@ class ConnectionTestThrottled(Exception):
         self.retry_after_seconds = retry_after_seconds
 
 
-def test_connection(profile_id: str) -> dict:
+def test_connection(profile_id: str, credential: Optional[str] = None) -> dict:
+    """`credential`, when given, is an already-resolved bare access token —
+    the caller refreshed it through the Gateway, which owns the one shared
+    per-Profile refresh backoff clock. Without it this falls back to decoding
+    whatever is stored, which is correct but cannot refresh an expired token.
+    """
     now = time.monotonic()
     last = _last_test_at.get(profile_id)
     if last is not None and now - last < MIN_TEST_INTERVAL_SECONDS:
@@ -64,12 +70,20 @@ def test_connection(profile_id: str) -> dict:
         raise ConnectionTestError(f"No profile with id {profile_id!r}.")
 
     try:
-        credential = secret_store.get_token(profile_id)
+        stored = secret_store.get_token(profile_id)
     except Exception as exc:  # noqa: BLE001 - surface any backend failure uniformly
         raise ConnectionTestError("Could not read the stored credential from Keychain.", str(exc)) from exc
 
     if profile.kind == "codex":
-        return _test_codex_connection(profile, credential)
+        # openai_bridge.run() decodes and refreshes its own credential shape.
+        return _test_codex_connection(profile, stored)
+
+    if credential is None:
+        # An oauth Profile with a refresh_token stores a JSON blob, not a bare
+        # token. Sending that verbatim as the Bearer credential is garbage to
+        # Anthropic, which answers 401 — indistinguishable from a genuinely
+        # dead account, and enough to condemn a perfectly healthy Profile.
+        credential = oauth_credential.decode(stored).access_token if profile.kind == "oauth" else stored
 
     body: dict = {
         "model": TEST_MODEL,

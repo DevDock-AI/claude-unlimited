@@ -99,3 +99,49 @@ def test_priming_skips_a_disabled_profile(monkeypatch):
                         lambda: [_oauth_profile(enabled=False)])
     daemon._prime_profile("p1")
     assert called == []  # never spend a request on an account that is switched off
+
+
+def test_turning_on_auto_rotation_triggers_a_refresh():
+    # Becoming a rotation candidate is the point where usage starts deciding
+    # routing, and the Profile may never have served a request.
+    assert daemon._should_prime_after_update(
+        _oauth_profile(automatic=False), _oauth_profile(automatic=True)) is True
+
+
+def test_resaving_an_already_automatic_profile_does_not_reping():
+    assert daemon._should_prime_after_update(
+        _oauth_profile(automatic=True), _oauth_profile(automatic=True)) is False
+
+
+def test_turning_auto_rotation_off_does_not_ping():
+    assert daemon._should_prime_after_update(
+        _oauth_profile(automatic=True), _oauth_profile(automatic=False)) is False
+
+
+def test_an_unrelated_edit_does_not_ping():
+    assert daemon._should_prime_after_update(
+        _oauth_profile(automatic=False, name="a"),
+        _oauth_profile(automatic=False, name="b")) is False
+
+
+def test_a_failed_probe_never_marks_a_profile_auth_invalid(monkeypatch):
+    # Pressing "Test connection" once marked a healthy account "needs re-auth":
+    # the probe sent a mis-resolved credential, got a 401, and the recording
+    # applied it. A probe may only improve what is known about a Profile.
+    observed = []
+    monkeypatch.setattr(daemon._gateway, "_observe",
+                        lambda pid, obs, now: observed.append(obs))
+    monkeypatch.setattr(daemon._gateway, "_persist", lambda: None)
+
+    daemon._record_ping(_oauth_profile(), {"ok": False, "status": 401, "headers": {}})
+    assert observed == []
+
+
+def test_a_rate_limited_probe_is_also_discarded(monkeypatch):
+    observed = []
+    monkeypatch.setattr(daemon._gateway, "_observe",
+                        lambda pid, obs, now: observed.append(obs))
+    monkeypatch.setattr(daemon._gateway, "_persist", lambda: None)
+
+    daemon._record_ping(_oauth_profile(), {"ok": False, "status": 429, "headers": {}})
+    assert observed == []
