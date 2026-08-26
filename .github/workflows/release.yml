@@ -50,12 +50,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Written to a file, never through an ${{ }} expression into a shell
+      # command. Release notes are commit subjects, which are attacker-supplied
+      # text: interpolating them means backticks and $( ) in a commit message
+      # execute in this job.
       - name: Build release notes
-        id: notes
         run: |
           PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
           {
-            echo "notes<<RELEASE_NOTES_EOF"
             if [ -n "$PREV" ]; then
               echo "### Changes since $PREV"
               echo
@@ -66,13 +68,12 @@ jobs:
             echo
             echo "---"
             echo
-            echo "Update in place with \`claude-unlimited\` (Settings → Updates), or install fresh:"
+            echo "Install or update:"
             echo
             echo '```bash'
             echo 'curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash'
             echo '```'
-            echo "RELEASE_NOTES_EOF"
-          } >> "$GITHUB_OUTPUT"
+          } > release-notes.md
 
       - name: Publish the release
         env:
@@ -80,5 +81,5 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --notes "${{ steps.notes.outputs.notes }}" \
+            --notes-file release-notes.md \
             --verify-tag
