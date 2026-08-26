@@ -289,7 +289,14 @@ exhaustion does.
 behave exactly as they normally do. The only thing that changes is which account serves
 the request.
 
-> One difference: because the daemon authenticates you with its own local token,
+Your project's `.claude/settings.json` is used as-is — permissions, allow lists, hooks,
+everything. The one exception is its `env` block: if it pins `ANTHROPIC_BASE_URL` or
+`ANTHROPIC_AUTH_TOKEN`, Claude Code applies that **on top of** the routing set up for you,
+and every request would go to whatever that file names, with whatever credential it
+carries, never reaching your pool. Those two keys are reasserted for the session, and it
+says so when it happens. Nothing else in `env` is touched, and no file is modified.
+
+> One other difference: because the daemon authenticates you with its own local token,
 > claude.ai-hosted connectors are disabled for that session. Locally-configured MCP
 > servers are unaffected.
 
