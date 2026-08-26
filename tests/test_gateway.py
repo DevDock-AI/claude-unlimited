@@ -1,10 +1,14 @@
 import time as real_time
+from datetime import datetime, timedelta, timezone
+
 
 import pytest
 
 import claude_unlimited.gateway as gateway_module
 from claude_unlimited.config import Pool, Profile, save_pool
 from claude_unlimited.gateway import Gateway
+from claude_unlimited.observation import AuthInvalid, UsageSnapshot
+from claude_unlimited.router import ProfileState
 from claude_unlimited.upstream import UpstreamResponse
 
 
@@ -1038,3 +1042,69 @@ def test_a_successful_refresh_clears_the_rate_limit_streak(pool_env, monkeypatch
                             access_token="new", refresh_token="r2", expires_at=None))
     assert gw._try_refresh("a", "refresh-tok").access_token == "new"
     assert "a" not in gw._refresh_rate_limited_streak
+
+
+def _runtime_file(tmp_path, monkeypatch):
+    import claude_unlimited.gateway as gw_mod
+    path = tmp_path / "runtime_state.json"
+    monkeypatch.setattr(gw_mod.runtime_state, "RUNTIME_STATE_FILE", path)
+    return path
+
+
+def test_needs_reauth_survives_a_restart(pool_env, monkeypatch):
+    """A rejected credential does not repair itself by restarting. Coming back
+    as 'healthy' would misreport it and fail on the next request anyway."""
+    import claude_unlimited.gateway as gw_mod
+    _runtime_file(pool_env, monkeypatch)
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+    gw.runtime_snapshot()
+    gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert gw.runtime_snapshot()["a"].state == ProfileState.AUTH_INVALID
+    gw._persist()
+
+    revived = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+    assert revived.runtime_snapshot()["a"].state == ProfileState.AUTH_INVALID
+
+
+def test_usage_numbers_survive_a_restart(pool_env, monkeypatch):
+    import claude_unlimited.gateway as gw_mod
+    _runtime_file(pool_env, monkeypatch)
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+    gw.runtime_snapshot()
+    future = datetime.now(timezone.utc) + timedelta(hours=4)
+    gw._observe("a", UsageSnapshot(percent=5.0, resets_at=future, confidence="measured"),
+                datetime.now(timezone.utc))
+    gw._persist()
+
+    revived = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+    assert revived.runtime_snapshot()["a"].last_usage_percent == 5.0
+
+
+def test_a_profile_disabled_while_down_comes_back_disabled(pool_env, monkeypatch):
+    """Configuration always wins over restored state."""
+    _runtime_file(pool_env, monkeypatch)
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+    gw.runtime_snapshot()
+    gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
+    gw._persist()
+
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=False, account_uuid="u")]))
+    revived = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+    assert revived.runtime_snapshot()["a"].state == ProfileState.DISABLED
+
+
+def test_is_idle_reflects_real_usage():
+    gw = Gateway(transport=lambda req: None)
+    assert gw.is_idle(600) is True          # nothing served yet
+    gw._last_active["a"] = real_time.monotonic()
+    assert gw.is_idle(600) is False         # just used
+    assert gw.seconds_since_last_activity() < 5
+    gw._in_flight.add("a")
+    assert gw.seconds_since_last_activity() == 0.0

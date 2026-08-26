@@ -681,6 +681,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"killed": True, "was_service": service["installed"]})
 
             def _do_kill() -> None:
+                # Same reason as restart: whatever starts this daemon next
+                # should come back showing what it showed before.
+                _gateway._persist()
                 if service["installed"]:
                     try:
                         daemon_installer.stop()
@@ -700,6 +703,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             # Installs whatever the last check found, regardless of mode: this
             # is an explicit click, not the background policy.
             settings = load_pool().settings
+            if not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS):
+                self._send_json(409, {
+                    "error": "sessions_active",
+                    "message": "A session used the pool recently. Installing now would "
+                               "require a restart and could interrupt it. Try again once "
+                               "things are idle, or stop the session first.",
+                })
+                return
             outcome = updater.run_update_cycle(__version__, "auto_install")
             _record_update_outcome(outcome, settings)
             if outcome.error:
@@ -724,6 +735,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"restarting": True})
 
             def _do_restart() -> None:
+                # Snapshot first: the replacement process reads this back, so
+                # usage percentages and states survive rather than the
+                # Dashboard coming back blank.
+                _gateway._persist()
                 try:
                     daemon_installer.start()  # atomic stop+start via the service manager
                 except daemon_installer.DaemonInstallerError:
@@ -968,6 +983,12 @@ PID_FILE = APP_DIR / "daemon.pid"
 _OAUTH_REFRESH_LOOP_INTERVAL_SECONDS = 60
 _UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 _UPDATE_CHECK_STARTUP_DELAY_SECONDS = 120
+# An update replaces the running code and needs a restart to take effect, so
+# it must never land in the middle of someone's session. Nothing installs
+# until the pool has served nothing for this long.
+_UPDATE_IDLE_REQUIRED_SECONDS = 15 * 60
+# How often to re-check whether a downloaded update can finally be applied.
+_UPDATE_IDLE_RECHECK_SECONDS = 5 * 60
 
 # Last known update state, shown by GET /api/update. In memory only: a
 # restart should re-check rather than trust a stale verdict from a previous
@@ -999,14 +1020,57 @@ def _record_update_outcome(outcome, settings) -> None:
                                       f"Version {release.version} is available.", settings)
 
 
-def _run_update_check(settings=None) -> dict:
-    """One check-and-act pass honoring the configured update_mode. Never
-    raises: it runs from a background thread and from a request handler."""
+def _run_update_check(settings=None, *, respect_idle: bool = True) -> dict:
+    """One check-and-act pass honoring the configured update_mode.
+
+    In auto_install mode the install is held back while the pool is in use:
+    installing swaps the code out from under a running daemon and needs a
+    restart to take effect, which would end a live session mid-turn. The
+    download still happens immediately, so applying it later is just a file
+    move and a restart.
+
+    Never raises: it runs from a background thread and from a request
+    handler."""
     settings = settings or load_pool().settings
-    outcome = updater.run_update_cycle(__version__, settings.update_mode)
+    mode = settings.update_mode
+    deferred = False
+    if (respect_idle and mode in updater.MODE_INSTALLS
+            and not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS)):
+        mode = "auto_download"  # fetch and verify now, install once idle
+        deferred = True
+
+    outcome = updater.run_update_cycle(__version__, mode)
     _record_update_outcome(outcome, settings)
     with _update_lock:
+        _update_state["install_deferred_until_idle"] = bool(deferred and outcome.action == "downloaded")
         return dict(_update_state)
+
+
+def _install_deferred_update_if_idle() -> None:
+    """Applies an update that was downloaded while the pool was busy, once it
+    has been quiet long enough, then restarts so the new code is actually
+    running."""
+    with _update_lock:
+        pending = _update_state.get("install_deferred_until_idle")
+    if not pending or not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS):
+        return
+    settings = load_pool().settings
+    if settings.update_mode not in updater.MODE_INSTALLS:
+        return
+
+    outcome = updater.run_update_cycle(__version__, "auto_install")
+    _record_update_outcome(outcome, settings)
+    with _update_lock:
+        _update_state["install_deferred_until_idle"] = outcome.action == "downloaded"
+    if outcome.action != "installed":
+        return
+    _gateway._persist()  # snapshot before the process goes away
+    if daemon_installer.status()["installed"]:
+        try:
+            daemon_installer.start()  # atomic stop+start; new code takes effect
+        except daemon_installer.DaemonInstallerError:
+            activity.record("error", "Update installed but the restart failed",
+                             meta="restart the daemon to finish")
 
 
 def _update_check_loop() -> None:
@@ -1016,12 +1080,20 @@ def _update_check_loop() -> None:
     background courtesy, not something worth hammering a public API for.
     Every pass is best-effort, so being offline is a no-op, not a crash."""
     time.sleep(_UPDATE_CHECK_STARTUP_DELAY_SECONDS)
+    since_last_check = _UPDATE_CHECK_INTERVAL_SECONDS
     while True:
         try:
-            _run_update_check()
+            if since_last_check >= _UPDATE_CHECK_INTERVAL_SECONDS:
+                _run_update_check()
+                since_last_check = 0
+            else:
+                # Between full checks, keep asking whether an already
+                # downloaded update can finally be applied.
+                _install_deferred_update_if_idle()
         except Exception:
             pass
-        time.sleep(_UPDATE_CHECK_INTERVAL_SECONDS)
+        time.sleep(_UPDATE_IDLE_RECHECK_SECONDS)
+        since_last_check += _UPDATE_IDLE_RECHECK_SECONDS
 
 
 def _oauth_refresh_loop() -> None:

@@ -111,6 +111,46 @@ def _client_wants_streaming(body: bytes) -> bool:
     return bool(parsed.get("stream"))
 
 
+def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
+    """State worth carrying across a restart, so the Dashboard looks the same
+    the moment the daemon comes back rather than claiming every Profile is
+    healthy until something proves otherwise.
+
+    Only states that are still true survive:
+
+      * AUTH_INVALID persists. A rejected credential does not repair itself by
+        restarting, and it clears the moment the credential is actually
+        replaced (see _sync_snapshot's credential_refreshed branch).
+      * COOLDOWN persists only while its own deadline is still in the future.
+      * Everything else is re-derived. ELIGIBLE/DRAINING follow from the usage
+        numbers that are restored alongside, EXHAUSTED from a token budget
+        that is recomputed anyway, and DISABLED from configuration.
+
+    Never raises: a malformed or missing entry means "nothing to restore",
+    exactly like a first run."""
+    if not persisted:
+        return {}
+    fields: dict = {}
+    for label_key in ("window_label", "window_label_7d"):
+        value = persisted.get(label_key)
+        if isinstance(value, str) and value:
+            fields[label_key] = value
+
+    state = persisted.get("state")
+    if state == ProfileState.AUTH_INVALID.value:
+        fields["state"] = ProfileState.AUTH_INVALID
+    elif state == ProfileState.COOLDOWN.value:
+        raw = persisted.get("cooldown_until")
+        try:
+            deadline = datetime.fromisoformat(raw) if isinstance(raw, str) else None
+        except ValueError:
+            deadline = None
+        if deadline is not None and deadline > now:
+            fields["state"] = ProfileState.COOLDOWN
+            fields["cooldown_until"] = deadline
+    return fields
+
+
 @dataclass(frozen=True)
 class GatewayResult:
     status: int
@@ -251,13 +291,26 @@ class Gateway:
                     # exactly this: "explicit hard quota".
                     state = ProfileState.EXHAUSTED
                     self._notify_token_budget_exhausted(p, tokens_by_profile, pool)
+                persisted = self._persisted_profiles.get(p.id)
+                now_utc = datetime.now(timezone.utc)
+                restored = {
+                    **_restorable_usage_fields(persisted, now=now_utc),
+                    **_restorable_state_fields(persisted, now=now_utc),
+                }
+                # Configuration always wins over a restored state: a Profile
+                # disabled while the daemon was down must come back disabled.
+                if state == ProfileState.DISABLED:
+                    restored.pop("state", None)
+                    restored.pop("cooldown_until", None)
+                restored_state = restored.pop("state", state)
                 self._runtime[p.id] = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
                     automatic=p.automatic,
-                    state=state,
+                    state=restored_state,
                     credential_seen=p.credential_updated_at,
-                    **_restorable_usage_fields(self._persisted_profiles.get(p.id), now=datetime.now(timezone.utc)),
+                    **restored,
                 )
+                state = restored_state
                 if state == ProfileState.ELIGIBLE:
                     # Covers a Profile that's ELIGIBLE but already near its
                     # real expiry the very first time this Gateway instance
@@ -1055,6 +1108,13 @@ class Gateway:
                     "resets_at": rt.resets_at.isoformat() if rt.resets_at else None,
                     "last_usage_percent_7d": rt.last_usage_percent_7d,
                     "resets_at_7d": rt.resets_at_7d.isoformat() if rt.resets_at_7d else None,
+                    "window_label": rt.window_label,
+                    "window_label_7d": rt.window_label_7d,
+                    # Restored so a restart doesn't silently present a Profile
+                    # as healthy when it is not. See _restorable_state_fields
+                    # for which states survive and which are re-derived.
+                    "state": rt.state.value if hasattr(rt.state, "value") else str(rt.state),
+                    "cooldown_until": rt.cooldown_until.isoformat() if rt.cooldown_until else None,
                 }
                 for pid, rt in self._runtime.items()
             }
@@ -1134,6 +1194,27 @@ class Gateway:
                     self._mark_profile_idle(profile_id)
 
         return generator()
+
+    def seconds_since_last_activity(self) -> Optional[float]:
+        """How long since any Profile last served a request, or None if this
+        process has served none yet. Counts a request that is in flight right
+        now as zero."""
+        with self._lock:
+            if self._in_flight:
+                return 0.0
+            if not self._last_active:
+                return None
+            latest = max(self._last_active.values())
+        return max(0.0, time.monotonic() - latest)
+
+    def is_idle(self, minimum_idle_seconds: float) -> bool:
+        """True when nothing has used the pool for at least that long.
+
+        Used to hold back anything disruptive — installing an update, then
+        restarting — until it cannot interrupt a live Claude Code session.
+        A daemon that has served nothing since starting counts as idle."""
+        idle_for = self.seconds_since_last_activity()
+        return idle_for is None or idle_for >= minimum_idle_seconds
 
     def in_flight_ids(self) -> set[str]:
         """Profile ids to show as "Used now" — either a request is

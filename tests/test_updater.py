@@ -303,3 +303,56 @@ def test_other_http_errors_are_still_reported(tmp_path):
 
     out = updater.run_update_cycle("0.1.0", "manual", opener=opener, staging_dir=tmp_path / "s")
     assert out.action == "none" and "HTTP 503" in out.error
+
+
+# ---- idle gating (daemon policy, not updater internals) ----
+
+def test_install_is_held_back_while_the_pool_is_in_use(monkeypatch, tmp_path):
+    """Installing swaps the running code and needs a restart, so it must never
+    land mid-session. The download still happens; only applying it waits."""
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr("claude_unlimited.activity.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.activity.ACTIVITY_FILE", tmp_path / "activity.jsonl")
+    monkeypatch.setattr(daemon_mod._gateway, "is_idle", lambda _s: False)
+
+    seen = {}
+
+    def fake_cycle(version, mode, **kw):
+        seen["mode"] = mode
+        return updater.UpdateOutcome(
+            release=Release(version="9.9.9", tag="v9.9.9", commit_sha="f" * 40, notes=""),
+            action="downloaded")
+
+    monkeypatch.setattr(daemon_mod.updater, "run_update_cycle", fake_cycle)
+    state = daemon_mod._run_update_check(_settings_with_mode("auto_install"))
+
+    assert seen["mode"] == "auto_download", "must not install while busy"
+    assert state["install_deferred_until_idle"] is True
+
+
+def test_install_proceeds_when_idle(monkeypatch, tmp_path):
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr("claude_unlimited.activity.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.activity.ACTIVITY_FILE", tmp_path / "activity.jsonl")
+    monkeypatch.setattr(daemon_mod._gateway, "is_idle", lambda _s: True)
+
+    seen = {}
+
+    def fake_cycle(version, mode, **kw):
+        seen["mode"] = mode
+        return updater.UpdateOutcome(release=None, action="none")
+
+    monkeypatch.setattr(daemon_mod.updater, "run_update_cycle", fake_cycle)
+    daemon_mod._run_update_check(_settings_with_mode("auto_install"))
+    assert seen["mode"] == "auto_install"
+
+
+def _settings_with_mode(mode):
+    from claude_unlimited.config import Settings
+    return Settings(update_mode=mode)

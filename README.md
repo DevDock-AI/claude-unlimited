@@ -57,6 +57,7 @@ Rotation happens **between requests**, in the background. No logout, no prompt, 
 | **[Notifications](#notifications)** | Know before you run out |
 | **[Updates](#updates)** | How new versions reach you |
 | **[Command reference](#command-reference)** | Every command |
+| **[AGENTS.md](AGENTS.md)** | Setting this up with a coding agent |
 | **[Troubleshooting](#troubleshooting)** · **[Security](#security)** · **[Contributing](#contributing)** | The rest |
 
 ---
@@ -174,6 +175,10 @@ Then check it:
 ```bash
 claude-unlimited doctor
 ```
+
+> **Using an AI agent to set this up?** Point it at
+> [`AGENTS.md`](AGENTS.md) — it spells out the install, what's safe, and the
+> one step an agent must hand back to you (the browser login).
 
 <details>
 <summary>What that command does, and how to install from a clone instead</summary>
