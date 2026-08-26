@@ -41,3 +41,9 @@ docs/adr/0004-user-accepted-risk-and-scope-decisions.md
 
 # No changelog until the first tagged release.
 CHANGELOG.md
+
+# Planning material — tickets, specs, design notes, working plans. Local
+# working documents, never published.
+docs/tickets/
+*.ticket.md
+*.plan.md
