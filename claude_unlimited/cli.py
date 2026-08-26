@@ -471,6 +471,42 @@ def restart(port: int) -> int:
     return 1
 
 
+def _pids_listening_on(port: int) -> list[int]:
+    """PIDs listening on the port, or [] if that can't be determined.
+
+    Best-effort and POSIX-only: Windows has its own service manager and is not
+    the platform where detached daemons pile up."""
+    if os.name == "nt":
+        return []
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in result.stdout.split():
+        try:
+            pids.append(int(line))
+        except ValueError:
+            pass
+    return pids
+
+
+def _is_our_daemon(pid: int) -> bool:
+    """Whether pid is one of ours, checked before signalling it.
+
+    Holding the port is not enough to justify killing a process — it could be
+    anything the user happens to be running."""
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "claude_unlimited" in result.stdout
+
+
 def _stop_running_daemon(port: int, timeout: float = 8.0) -> None:
     """Stops a daemon that the service manager does not own.
 
@@ -501,6 +537,30 @@ def _stop_running_daemon(port: int, timeout: float = 8.0) -> None:
                 time.sleep(0.25)
             if not _probe_health(LOOPBACK_HOST, port, timeout=0.5):
                 break
+
+    # The pid file names one daemon — the last to write it. A second detached
+    # daemon (a different interpreter, an older install, a leftover from
+    # before a service was registered) is invisible to it and keeps the port,
+    # which is how an upgrade ends up leaving the OLD version serving. Fall
+    # back to whoever actually holds the port, but only signal processes that
+    # are demonstrably ours.
+    if _probe_health(LOOPBACK_HOST, port, timeout=1.0):
+        for stray in _pids_listening_on(port):
+            if stray == os.getpid() or not _is_our_daemon(stray):
+                continue
+            print(f"Stopping a detached daemon still holding port {port} (pid {stray})…")
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(stray, sig)
+                except (ProcessLookupError, PermissionError, OSError):
+                    break
+                deadline = time.time() + timeout / 2
+                while time.time() < deadline:
+                    if not _probe_health(LOOPBACK_HOST, port, timeout=0.5):
+                        break
+                    time.sleep(0.25)
+                if not _probe_health(LOOPBACK_HOST, port, timeout=0.5):
+                    break
 
     if _probe_health(LOOPBACK_HOST, port, timeout=1.0):
         print(f"WARNING: something is still serving {LOOPBACK_HOST}:{port}. "

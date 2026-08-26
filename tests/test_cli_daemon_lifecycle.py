@@ -428,3 +428,50 @@ def test_install_reports_failure_when_nothing_comes_up(monkeypatch, capsys):
     _serving(monkeypatch, None)
     assert cli.main(["install"]) == 1
     assert "nothing is answering" in capsys.readouterr().err
+
+
+def test_stop_kills_a_stray_daemon_the_pid_file_does_not_know_about(monkeypatch, capsys):
+    # The real-world shape: a detached daemon under a different interpreter
+    # holds the port, and the pid file names a different (already dead) one.
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: cli.Path("/nonexistent")))
+    monkeypatch.setattr(cli, "_pids_listening_on", lambda port: [4242])
+    monkeypatch.setattr(cli, "_is_our_daemon", lambda pid: True)
+
+    killed = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    # Serving until the kill lands, then gone.
+    health = iter([True, True, False, False, False, False, False, False])
+    monkeypatch.setattr(cli, "_probe_health",
+                        lambda host, port, timeout=1.0: next(health, False))
+
+    cli._stop_running_daemon(4317)
+    assert killed and killed[0][0] == 4242
+    assert "pid 4242" in capsys.readouterr().out
+
+
+def test_stop_never_kills_a_process_that_is_not_ours(monkeypatch, capsys):
+    # Holding the port is not licence to kill it — that could be anything.
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: cli.Path("/nonexistent")))
+    monkeypatch.setattr(cli, "_pids_listening_on", lambda port: [4242])
+    monkeypatch.setattr(cli, "_is_our_daemon", lambda pid: False)
+
+    killed = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: True)
+
+    cli._stop_running_daemon(4317)
+    assert killed == []
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_is_our_daemon_matches_on_the_command_line(monkeypatch):
+    class R:
+        stdout = ("/opt/homebrew/Cellar/python@3.14/.../Python "
+                  "-m claude_unlimited start --port 4317")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: R())
+    assert cli._is_our_daemon(1) is True
+
+    class Other:
+        stdout = "/usr/bin/some-other-server --port 4317"
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: Other())
+    assert cli._is_our_daemon(1) is False
