@@ -566,6 +566,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
                 p = profile_repo.create_profile(credential=credential, **body)
                 self._send_json(201, {"profile": _profile_to_public_dict(p)})
+                # Populate usage now rather than leaving the card blank until
+                # this account happens to serve a request.
+                _prime_profile_async(p.id)
             except profile_repo.ValidationError as exc:
                 activity.record("error", "Add Profile failed — validation", meta=str(exc)[:200])
                 self._send_json(400, {"error": "validation", "message": str(exc)})
@@ -635,6 +638,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     plan=plan, refresh_token=imported.refresh_token, expires_at=imported.expires_at,
                 )
                 status = 200 if reused else 201
+                if not reused:
+                    _prime_profile_async(profile_out.id)
 
                 self._send_json(status, {"profile": _profile_to_public_dict(profile_out), "reused_existing": reused, "account": {
                     "email": account.email, "org_name": account.org_name,
@@ -774,6 +779,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             profile_id = path.removeprefix("/api/profiles/").removesuffix("/test")
             try:
                 result = connection_test.test_connection(profile_id)
+                # A test is a live request like any other: let it refresh the
+                # Profile's usage instead of throwing the headers away.
+                profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+                if profile is not None:
+                    _record_ping(profile, result)
+                result.pop("headers", None)  # upstream headers are not the browser's business
                 if result["ok"]:
                     activity.record("session", "Connection test succeeded", meta=f"profile={profile_id}, {result['elapsed_ms']}ms")
                 else:
@@ -1035,6 +1046,68 @@ def _record_update_outcome(outcome, settings) -> None:
     activity.record("config", f"Update available: {release.version}", meta=outcome.action)
     notifications.notify_if_enabled("update_available", "Claude Unlimited",
                                       f"Version {release.version} is available.", settings)
+
+
+def _record_ping(profile, result: dict) -> None:
+    """Feeds a one-off ping's response into the same usage pipeline a real
+    request goes through, so the Dashboard reflects it immediately.
+
+    Best-effort: a Profile that cannot be reached is still a Profile, and the
+    next real request will populate it."""
+    from .observation import classify as classify_anthropic
+    from .gateway import _filter_openai_headers
+    from .proxy import filter_response_headers
+
+    headers = result.get("headers") or {}
+    status = result.get("status")
+    if not status:
+        return
+
+    now = datetime.now(timezone.utc)
+    try:
+        if profile.kind == "codex":
+            observation = openai_observation.classify(status, _filter_openai_headers(headers), now)
+            # The plan a codex credential's JWT claims can disagree with what
+            # the backend reports; the header is the authority.
+            plan = {k.lower(): v for k, v in headers.items()}.get("x-codex-plan-type")
+            if plan and plan != profile.plan:
+                profile_repo.update_profile(profile.id, plan=plan)
+        else:
+            observation = classify_anthropic(status, filter_response_headers(headers), now)
+
+        with _gateway._lock:
+            _gateway._observe(profile.id, observation, now)
+        _gateway._persist()
+    except Exception:  # noqa: BLE001 - never let a ping break its caller
+        return
+
+
+def _prime_profile(profile_id: str) -> None:
+    """Records usage for a Profile that has never served a request.
+
+    Usage percentages and reset times come from response headers, so a freshly
+    added Profile has no runtime state at all and the Dashboard shows it blank
+    until the account happens to be used. That made the first thing a person
+    sees after connecting an account the least accurate.
+
+    One request, on the same minimal ping "Test connection" already uses, and
+    never repeated: this is not polling. A failure is not surfaced — the
+    Profile exists either way, and the next real request populates it.
+    """
+    try:
+        profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
+        if profile is None or not profile.enabled:
+            return
+        result = connection_test.test_connection(profile_id)
+    except Exception:  # noqa: BLE001 - priming is best-effort by design
+        return
+
+    _record_ping(profile, result)
+
+
+def _prime_profile_async(profile_id: str) -> None:
+    """Primes in the background so adding a Profile stays instant."""
+    threading.Thread(target=_prime_profile, args=(profile_id,), daemon=True).start()
 
 
 def _public_update_state(settings=None) -> dict:

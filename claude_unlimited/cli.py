@@ -868,6 +868,11 @@ def add_account() -> int:
         print(f"Logged in, but could not save the profile: {exc}", file=sys.stderr)
         return 1
 
+    if not reused:
+        # So the Dashboard shows real usage for it straight away, rather than
+        # a blank card until this account first serves a request.
+        _prime_via_daemon(profile.id)
+
     print(f"\n{'Refreshed existing profile' if reused else 'Added profile'}: {profile.name}")
     if account.org_name:
         print(f"  Organization: {account.org_name}")
@@ -940,11 +945,37 @@ def add_codex_account() -> int:
         print(f"Logged in, but could not save the profile: {exc}", file=sys.stderr)
         return 1
 
+    if not reused:
+        _prime_via_daemon(profile.id)
+
     print(f"\n{'Refreshed existing profile' if reused else 'Added profile'}: {profile.name}")
     if plan:
         print(f"  Plan: {plan}")
     print("\nManage priority, threshold, and everything else for it from the Dashboard.")
     return 0
+
+
+def _prime_via_daemon(profile_id: str, port: int = DEFAULT_PORT, timeout: float = 25.0) -> None:
+    """Asks a running daemon to record usage for a just-added Profile.
+
+    Usage comes from response headers, so a Profile created here shows blank
+    in the Dashboard until the account happens to serve a request. The daemon
+    owns that state and this process does not, so the work has to go through
+    it. Silent and best-effort: no daemon running, or an unreachable account,
+    just means the Dashboard fills in on first real use."""
+    try:
+        with urllib.request.urlopen(f"http://{LOOPBACK_HOST}:{port}/api/status", timeout=2.0) as resp:
+            token = json.loads(resp.read()).get("csrf_token")
+        if not token:
+            return
+        req = urllib.request.Request(
+            f"http://{LOOPBACK_HOST}:{port}/api/profiles/{profile_id}/test",
+            data=b"{}", method="POST",
+            headers={"Content-Type": "application/json", "X-CSRF-Token": token},
+        )
+        urllib.request.urlopen(req, timeout=timeout).read()
+    except Exception:  # noqa: BLE001 - priming never blocks adding an account
+        return
 
 
 def _fetch_live_profiles(host: str, port: int, timeout: float = 2.0) -> Optional[list]:

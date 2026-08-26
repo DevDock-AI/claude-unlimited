@@ -107,6 +107,7 @@ def test_connection(profile_id: str) -> dict:
         return {
             "ok": True, "status": resp.status, "elapsed_ms": elapsed_ms,
             "model": parsed_ok.get("model", TEST_MODEL),
+            "headers": dict(resp.headers),
         }
 
     message = None
@@ -115,7 +116,8 @@ def test_connection(profile_id: str) -> dict:
         message = (parsed_err.get("error") or {}).get("message")
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
         pass
-    return {"ok": False, "status": resp.status, "elapsed_ms": elapsed_ms, "message": message}
+    return {"ok": False, "status": resp.status, "elapsed_ms": elapsed_ms, "message": message,
+            "headers": dict(resp.headers)}
 
 
 def _test_codex_connection(profile, credential: str) -> dict:
@@ -139,7 +141,8 @@ def _test_codex_connection(profile, credential: str) -> dict:
     elapsed_ms = round((time.monotonic() - started) * 1000)
 
     if result.status == 200:
-        return {"ok": True, "status": result.status, "elapsed_ms": elapsed_ms, "model": TEST_MODEL}
+        return {"ok": True, "status": result.status, "elapsed_ms": elapsed_ms, "model": TEST_MODEL,
+                "headers": dict(result.headers)}
 
     message = None
     try:
@@ -147,4 +150,5 @@ def _test_codex_connection(profile, credential: str) -> dict:
         message = (parsed_err.get("error") or {}).get("message")
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
         pass
-    return {"ok": False, "status": result.status, "elapsed_ms": elapsed_ms, "message": message}
+    return {"ok": False, "status": result.status, "elapsed_ms": elapsed_ms, "message": message,
+            "headers": dict(result.headers)}
