@@ -29,7 +29,7 @@ Rotation happens **between requests**, in the background. No logout, no prompt, 
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Backend dependencies](https://img.shields.io/badge/backend%20dependencies-1-brightgreen)
-![Tests](https://img.shields.io/badge/tests-600%2B-brightgreen)
+![Tests](https://img.shields.io/badge/tests-647-brightgreen)
 ![100% local](https://img.shields.io/badge/100%25-local-8A63D2)
 [![Support](https://img.shields.io/badge/support-ko--fi-ff5e5b)](https://ko-fi.com/devdock)
 

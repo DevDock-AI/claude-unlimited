@@ -703,7 +703,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             # Installs whatever the last check found, regardless of mode: this
             # is an explicit click, not the background policy.
             settings = load_pool().settings
-            if not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS):
+            # An explicit click may override the idle guard: the person
+            # pressing it can see their own sessions, and is choosing to
+            # accept the restart.
+            force = bool((self._read_json_body() or {}).get("force"))
+            if not force and not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS):
                 self._send_json(409, {
                     "error": "sessions_active",
                     "message": "A session used the pool recently. Installing now would "

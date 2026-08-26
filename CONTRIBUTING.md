@@ -93,8 +93,8 @@ chore(release): 0.2.0
 
 ## Pull requests
 
-Until `v1.0.0` we push straight to `main`. After that, `main` is protected and
-everything lands through a PR.
+`main` is protected. Everything lands through a pull request, reviewed and
+merged by the maintainer.
 
 A PR description says:
 

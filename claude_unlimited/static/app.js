@@ -1995,6 +1995,78 @@ function setupUpdateModeSelect() {
   });
 }
 
+// ---- updates (Settings) ----
+
+// Renders GET /api/update. Purely a read: the endpoint reports the last known
+// state and never reaches the network itself, so this is safe to call on
+// every Settings load.
+function renderUpdateState(state) {
+  const installed = document.getElementById('updateInstalledVersion');
+  const latest = document.getElementById('updateLatestVersion');
+  const sub = document.getElementById('updateLatestSub');
+  if (!installed || !latest || !sub) return;
+
+  installed.textContent = state.current_version || '—';
+  const available = state.available;
+  latest.textContent = available ? available.version : (state.checked_at ? state.current_version : '—');
+
+  let key = 'settings.updates.never_checked';
+  if (state.error) key = null;
+  else if (available && state.action === 'downloaded') key = 'settings.updates.downloaded';
+  else if (available) key = 'settings.updates.available';
+  else if (state.checked_at) key = 'settings.updates.up_to_date';
+  sub.textContent = key ? t(key) : state.error;
+  sub.style.color = state.error ? 'var(--bad)' : '';
+  latest.style.color = available ? 'var(--warn)' : '';
+}
+
+async function refreshUpdateState() {
+  try {
+    renderUpdateState(await api('/api/update'));
+  } catch (e) { /* leave whatever is shown */ }
+}
+
+function wireUpdateButtons() {
+  const checkBtn = document.getElementById('updateCheckBtn');
+  const installBtn = document.getElementById('updateInstallBtn');
+  if (!checkBtn || !installBtn) return;
+
+  checkBtn.addEventListener('click', async () => {
+    if (checkBtn.classList.contains('btn-disabled')) return;
+    checkBtn.classList.add('btn-disabled');
+    try {
+      renderUpdateState(await api('/api/update/check', { method: 'POST' }));
+      showToast('ok', t('toast.update_checked'));
+    } catch (e) {
+      showToast('err', t('toast.update_failed'), String(e.message || e));
+    } finally {
+      checkBtn.classList.remove('btn-disabled');
+    }
+  });
+
+  installBtn.addEventListener('click', async () => {
+    if (installBtn.classList.contains('btn-disabled')) return;
+    installBtn.classList.add('btn-disabled');
+    try {
+      // force: this is an explicit click, so it overrides the idle guard that
+      // holds back automatic installs during an active session.
+      const res = await api('/api/update/install', {
+        method: 'POST', body: JSON.stringify({ force: true }),
+      });
+      if (res.installed) {
+        showToast('ok', t('toast.update_installed'), t('toast.update_installed_sub'));
+      } else {
+        showToast('ok', t('toast.update_none'));
+      }
+      await refreshUpdateState();
+    } catch (e) {
+      showToast('err', t('toast.update_failed'), String(e.message || e));
+    } finally {
+      installBtn.classList.remove('btn-disabled');
+    }
+  });
+}
+
 async function loadSettings() {
   try {
     const { settings } = await api('/api/settings');
@@ -2003,6 +2075,7 @@ async function loadSettings() {
     document.getElementById('updateModeSelect')._cuRenderValue();
     setToggleState(document.getElementById('notifMasterToggle'), settings.notifications_enabled);
     renderNotifList(settings);
+    refreshUpdateState();
   } catch (e) {
     // leave defaults if this fails
   }
@@ -2943,6 +3016,7 @@ applyMetricMode('model', currentMetricMode('model'));
 applyMetricMode('project', currentMetricMode('project'));
 applyMetricMode('account', currentMetricMode('account'));
 wireProfilesViewToggle();
+wireUpdateButtons();
 wireCursorGlow();
 wireDataTooltips();
 loadLocales().then(() => {

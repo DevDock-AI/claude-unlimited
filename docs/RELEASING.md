@@ -47,8 +47,8 @@ points at.
 | **MINOR** — `0.1.0 → 0.2.0` | New features, new settings, anything additive |
 | **MAJOR** — `0.9.0 → 1.0.0` | Breaking changes: a removed CLI command, an incompatible config or export format |
 
-Pre-1.0, breaking changes go in a MINOR bump — but say so plainly in the
-commit subject so it reaches the notes.
+Since 1.0.0 the contract is real: a breaking change needs a MAJOR bump, and
+says so plainly in the commit subject so it reaches the notes.
 
 Tags are always `v`-prefixed (`v0.2.0`); `__version__` never is (`0.2.0`).
 
