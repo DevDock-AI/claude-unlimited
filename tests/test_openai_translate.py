@@ -182,6 +182,23 @@ def test_tool_call_turn_sets_tool_use_stop_reason():
     assert '"stop_reason": "tool_use"' in text
 
 
+def test_tool_call_without_an_id_still_gets_one():
+    # An empty id breaks the client's pairing of tool_result to tool_use, and
+    # Claude Code renders a tool_use block arriving without one as an error.
+    translator = ResponseTranslator()
+    events = [
+        {"type": "response.created", "response": {"model": "gpt-5.6-terra"}},
+        {"type": "response.output_item.added", "item": {"type": "function_call", "name": "Bash"}},
+    ]
+    out = b""
+    for event in events:
+        out += _sse_bytes(translator.feed(event))
+    block = json.loads(out.decode().split("data: ")[-1].strip())["content_block"]
+
+    assert block["type"] == "tool_use"
+    assert block["id"].startswith("toolu_")
+
+
 def test_response_failed_sets_error_stop_reason():
     translator = ResponseTranslator()
     list(translator.feed({"type": "response.created", "response": {}}))

@@ -8,6 +8,7 @@ event parsing.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
@@ -264,7 +265,14 @@ class ResponseTranslator:
             self._current_block_type = "tool_use"
             self._current_block_index += 1
             self._current_block_open = True
-            self._pending_tool_call_id = item.get("call_id", item.get("id", ""))
+            # Never an empty id: the client matches the tool_result it sends
+            # back against this value, and an empty one silently breaks that
+            # pairing. Claude Code 2.1.246 also fixed a render error on a
+            # tool_use block arriving without an id from a third-party
+            # ANTHROPIC_BASE_URL, which is exactly what this proxy is.
+            self._pending_tool_call_id = (
+                item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex}"
+            )
             self._pending_tool_name = item.get("name", "")
             yield self._sse("content_block_start", {
                 "type": "content_block_start", "index": self._current_block_index,
