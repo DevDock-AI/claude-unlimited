@@ -378,3 +378,47 @@ def test_check_response_carries_the_version_fields_the_ui_shows(monkeypatch, tmp
         assert field in checked, f"check response missing {field}"
     assert set(checked) == set(served), "check and GET must return the same keys"
     assert checked["current_version"] == daemon_mod.__version__
+
+
+def test_check_now_never_downloads_or_installs(monkeypatch, tmp_path):
+    """A button that says it is checking must not install software. The check
+    endpoint pins the mode to manual regardless of the configured policy."""
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr("claude_unlimited.activity.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.activity.ACTIVITY_FILE", tmp_path / "activity.jsonl")
+    monkeypatch.setattr(daemon_mod._gateway, "is_idle", lambda _s: True)
+
+    modes = []
+
+    def fake_cycle(version, mode, **kw):
+        modes.append(mode)
+        return updater.UpdateOutcome(release=None, action="none")
+
+    monkeypatch.setattr(daemon_mod.updater, "run_update_cycle", fake_cycle)
+
+    # Even with the most aggressive policy configured.
+    daemon_mod._run_update_check(_settings_with_mode("auto_install"), mode_override="manual")
+    assert modes == ["manual"], modes
+    assert "auto_install" not in modes and "auto_download" not in modes
+
+
+def test_background_policy_still_honours_the_configured_mode(monkeypatch, tmp_path):
+    """The override is only for the explicit button — the background loop must
+    still do what the user configured."""
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr("claude_unlimited.activity.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.activity.ACTIVITY_FILE", tmp_path / "activity.jsonl")
+    monkeypatch.setattr(daemon_mod._gateway, "is_idle", lambda _s: True)
+
+    modes = []
+    monkeypatch.setattr(daemon_mod.updater, "run_update_cycle",
+                        lambda v, mode, **k: (modes.append(mode),
+                                              updater.UpdateOutcome(release=None, action="none"))[1])
+    daemon_mod._run_update_check(_settings_with_mode("auto_install"))
+    assert modes == ["auto_install"], modes

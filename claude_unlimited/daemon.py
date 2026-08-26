@@ -692,7 +692,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/update/check":
-            self._send_json(200, _run_update_check())
+            # Look only. Downloading or installing is the other endpoint, or
+            # the background policy.
+            self._send_json(200, _run_update_check(mode_override="manual"))
             return
 
         if path == "/api/update/install":
@@ -1032,7 +1034,8 @@ def _public_update_state(settings=None) -> dict:
     return state
 
 
-def _run_update_check(settings=None, *, respect_idle: bool = True) -> dict:
+def _run_update_check(settings=None, *, respect_idle: bool = True,
+                      mode_override: Optional[str] = None) -> dict:
     """One check-and-act pass honoring the configured update_mode.
 
     In auto_install mode the install is held back while the pool is in use:
@@ -1044,7 +1047,11 @@ def _run_update_check(settings=None, *, respect_idle: bool = True) -> dict:
     Never raises: it runs from a background thread and from a request
     handler."""
     settings = settings or load_pool().settings
-    mode = settings.update_mode
+    # mode_override exists so "Check now" can mean only that. Without it the
+    # button honoured the configured mode and, on auto_install, downloaded and
+    # installed a release — software installing itself from a button that
+    # says it is looking.
+    mode = mode_override or settings.update_mode
     deferred = False
     if (respect_idle and mode in updater.MODE_INSTALLS
             and not _gateway.is_idle(_UPDATE_IDLE_REQUIRED_SECONDS)):

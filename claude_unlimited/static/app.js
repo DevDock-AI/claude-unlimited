@@ -2043,25 +2043,37 @@ function wireUpdateButtons() {
   const installBtn = document.getElementById('updateInstallBtn');
   if (!checkBtn || !installBtn) return;
 
-  checkBtn.addEventListener('click', async () => {
-    if (checkBtn.classList.contains('btn-disabled')) return;
-    checkBtn.classList.add('btn-disabled');
+  // Both buttons hit the network, so they say what they are doing. Without
+  // this the button simply sat there and the whole thing read as broken.
+  function withProgress(btn, labelKey, work) {
+    return async () => {
+      if (btn.classList.contains('btn-disabled')) return;
+      const label = btn.querySelector('span');
+      const original = label ? label.textContent : '';
+      if (label) label.textContent = t(labelKey);
+      btn.classList.add('btn-disabled');
+      try {
+        await work();
+      } finally {
+        btn.classList.remove('btn-disabled');
+        if (label) label.textContent = original;
+      }
+    };
+  }
+
+  checkBtn.addEventListener('click', withProgress(checkBtn, 'settings.updates.checking', async () => {
     try {
       renderUpdateState(await api('/api/update/check', { method: 'POST' }));
       showToast('ok', t('toast.update_checked'));
     } catch (e) {
       showToast('err', t('toast.update_failed'), String(e.message || e));
-    } finally {
-      checkBtn.classList.remove('btn-disabled');
     }
-  });
+  }));
 
-  installBtn.addEventListener('click', async () => {
-    if (installBtn.classList.contains('btn-disabled')) return;
-    installBtn.classList.add('btn-disabled');
+  installBtn.addEventListener('click', withProgress(installBtn, 'settings.updates.installing', async () => {
     try {
-      // force: this is an explicit click, so it overrides the idle guard that
-      // holds back automatic installs during an active session.
+      // force: an explicit click overrides the idle guard that holds back
+      // automatic installs during an active session.
       const res = await api('/api/update/install', {
         method: 'POST', body: JSON.stringify({ force: true }),
       });
@@ -2073,10 +2085,8 @@ function wireUpdateButtons() {
       await refreshUpdateState();
     } catch (e) {
       showToast('err', t('toast.update_failed'), String(e.message || e));
-    } finally {
-      installBtn.classList.remove('btn-disabled');
     }
-  });
+  }));
 }
 
 async function loadSettings() {
