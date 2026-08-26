@@ -8,8 +8,10 @@ on:
   push:
     tags: ["v*"]
 
+# Only the job that publishes needs write. The verify job below runs the
+# suite and needs nothing beyond reading the checkout.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
@@ -45,6 +47,8 @@ jobs:
   release:
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # creating the release is the only write this repo does
     steps:
       - uses: actions/checkout@v4
         with:

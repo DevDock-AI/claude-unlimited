@@ -106,6 +106,23 @@ A PR description says:
 The title follows the same convention as a commit subject, because a squashed
 merge becomes one. `.github/PULL_REQUEST_TEMPLATE.md` carries the checklist.
 
+## Never let untrusted text reach a shell
+
+This bit us once and is worth stating outright.
+
+- **In workflows, never interpolate `${{ ... }}` into a `run:` block.** Commit
+  subjects, branch names, PR titles and issue bodies are attacker-supplied.
+  Interpolating them means backticks and `$( )` in a commit message execute in
+  CI. Write the value to a file, or pass it through `env:` and reference it as
+  a shell variable.
+- **In Python, always pass an argv list to `subprocess`.** No `shell=True`, no
+  `os.system`, no f-string commands. Every call in this codebase does this
+  already.
+- **In shell, quote every expansion**, and validate anything that came from
+  the environment before it reaches a command line.
+- **Give a workflow the narrowest `permissions:` it can do its job with**, and
+  scope any write to the single job that needs it.
+
 ## Scope and hygiene
 
 - Keep changes scoped to what was asked. A bug fix doesn't carry a drive-by refactor.

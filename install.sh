@@ -91,6 +91,12 @@ fi
 # this makes it usable right now, while `claude-unlimited install` is what
 # makes it come back on login.
 PORT="${CLAUDE_UNLIMITED_PORT:-4317}"
+# Digits only. It reaches a URL and a command line, and every expansion here is
+# quoted, but validating the shape is cheaper than reasoning about whether
+# every future use stays quoted.
+case "$PORT" in
+  ''|*[!0-9]*) echo "CLAUDE_UNLIMITED_PORT must be a number, got: $PORT" >&2; exit 1 ;;
+esac
 URL="http://127.0.0.1:${PORT}/"
 if ! curl -fsS --max-time 2 "${URL}health" >/dev/null 2>&1; then
   echo

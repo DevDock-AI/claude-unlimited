@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Explicit rather than inherited: this workflow only ever reads the code, and
+# it runs on pull requests, including from forks.
+permissions:
+  contents: read
+
 jobs:
   test:
     # The install and service backends are only verified on macOS today (see
