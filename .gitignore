@@ -36,7 +36,6 @@ graphify-out/
 docs/archive/
 CONTEXT.md
 PRODUCT.md
-docs/RELEASING.md
 docs/adr/0003-consumer-oauth-pooling-and-export-crypto-on-hold.md
 docs/adr/0004-user-accepted-risk-and-scope-decisions.md
 

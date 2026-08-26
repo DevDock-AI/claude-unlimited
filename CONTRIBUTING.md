@@ -41,8 +41,80 @@ Every user-facing string lives in `claude_unlimited/locales/*.json` as a flat `k
 
 Adding a whole new language is one file: copy `en.json` to `<code>.json` and translate it. No registration step — the available set is derived from the files present.
 
-## Commit / PR expectations
+## Commit messages
+
+[Conventional Commits](https://www.conventionalcommits.org). The subject line
+is not bookkeeping here — release notes are generated from these subjects, so
+each one is the changelog entry a user will read.
+
+```
+<type>(<scope>): <subject>
+```
+
+| Type | For |
+|---|---|
+| `feat` | A new capability a user can notice |
+| `fix` | A bug fix |
+| `docs` | Documentation only |
+| `refactor` | Behaviour unchanged, structure changed |
+| `test` | Tests only |
+| `chore` | Tooling, CI, dependencies, release bumps |
+| `perf` | A performance change |
+
+Scope is optional and names the area: `rotation`, `codex`, `dashboard`,
+`updater`, `cli`, `security`, `i18n`.
+
+Rules that matter:
+
+- **Subject in the imperative, lowercase, no trailing period** — "add a
+  weekly quota window", not "Added weekly quota windows."
+- **Say what changed, from the user's side**, not which function you edited.
+  `fix(codex): honor stream:false so auto mode can classify tools` beats
+  `fix: update gateway.py`.
+- **The body explains why**, wrapped at 72 columns. The diff already shows
+  what.
+- **Breaking changes** get a `!` and a footer:
+
+  ```
+  feat(config)!: drop the legacy single-profile format
+
+  BREAKING CHANGE: configs written before 0.1 are no longer read.
+  Export from the old version and import into the new one.
+  ```
+
+Examples:
+
+```
+feat(updater): check, download and install releases per the configured mode
+fix(rotation): keep the backoff streak across snapshot rebuilds
+docs(readme): show the rotation flow in the header
+chore(release): 0.2.0
+```
+
+## Pull requests
+
+Until `v1.0.0` we push straight to `main`. After that, `main` is protected and
+everything lands through a PR.
+
+A PR description says:
+
+1. **What changes** — one or two sentences, from the user's side.
+2. **Why** — the problem, linked to an issue if there is one.
+3. **How it was verified** — tests added or updated, and which OS you
+   actually ran it on.
+
+The title follows the same convention as a commit subject, because a squashed
+merge becomes one. `.github/PULL_REQUEST_TEMPLATE.md` carries the checklist.
+
+## Scope and hygiene
 
 - Keep changes scoped to what was asked. A bug fix doesn't carry a drive-by refactor.
 - If a change touches config schema or an architectural decision, the corresponding doc/ADR update is part of the same change, not a follow-up task.
 - Never commit credentials, tokens, or personal data — including in tests, comments, and screenshots.
+
+## Releases
+
+See [`docs/RELEASING.md`](docs/RELEASING.md). Short version: bump
+`__version__`, tag `vX.Y.Z`, push. CI verifies the tag matches the package
+version, runs the suite, and only then publishes the GitHub Release the
+in-app updater installs from.

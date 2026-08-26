@@ -55,6 +55,7 @@ Rotation happens **between requests**, in the background. No logout, no prompt, 
 | **[Usage](#usage)** | Daily driving |
 | **[The dashboard](#the-dashboard)** | What you can see and control |
 | **[Notifications](#notifications)** | Know before you run out |
+| **[Updates](#updates)** | How new versions reach you |
 | **[Command reference](#command-reference)** | Every command |
 | **[Troubleshooting](#troubleshooting)** · **[Security](#security)** · **[Contributing](#contributing)** | The rest |
 
@@ -335,7 +336,7 @@ Desktop notifications tell you what's happening without watching the dashboard:
 | **Rotated** | Which account just took over |
 | **Quota reset** | An account is available again |
 | **Needs attention** | Something needs you: re-auth, or no eligible account left |
-| **Update available** | A new version has been released |
+| **Update available** | A new version has been released, downloaded, or installed |
 
 Turn them on per category in **Settings → Notifications**, and use **Send test
 notification** there to confirm they reach you.
@@ -347,6 +348,35 @@ notification** there to confirm they reach you.
 > delivered silently and you never see them.
 
 ---
+
+## Updates
+
+Claude Unlimited checks for new releases on its own and does exactly what you
+tell it to in **Settings → Updates**:
+
+| Mode | What happens when a release is found |
+|---|---|
+| **Fully manual** | You're told. Nothing is downloaded. |
+| **Auto-download only** | Downloaded and verified, then waits for you to click install. |
+| **Auto-download + install** | Downloaded, verified, and installed. Restart to finish. |
+
+How a download is trusted, since this installs code on your machine:
+
+1. The release source is **hardcoded** — nothing in your config can point the
+   updater at a different repository.
+2. Every request is HTTPS with certificate verification; a non-HTTPS redirect
+   is refused.
+3. The GitHub API names the commit a release's tag points at. The updater
+   clones that tag and **refuses to install unless the commit it actually got
+   is that same commit**. Git objects are content-addressed, so altered
+   contents cannot produce the expected hash.
+4. Your previous installation is kept. If the new version can't even be
+   imported, it's **rolled back automatically** — a bad release leaves you on
+   the version that worked.
+
+This proves the code came from this repository's history as GitHub reports it.
+It is not a signature check: it can't prove GitHub itself, or an account with
+push access, is honest. That's a deliberate, documented limit.
 
 ## Command reference
 
@@ -509,8 +539,9 @@ Adding a language is one file: copy `claude_unlimited/locales/en.json` and trans
 
 ## Roadmap
 
-- **Automatic updates** — not built yet, pending a signing/trust-root decision. Update
-  notification is the shipped subset.
+- **Signed releases** — the updater verifies that a downloaded release matches the commit
+  GitHub names for its tag, which proves the code came from this repository's history. A
+  detached signature would additionally prove authorship; not implemented yet.
 - **Real-hardware verification on Linux and Windows** — the code exists and is unit-tested,
   but needs someone running it for real. [`CONTRIBUTING.md`](CONTRIBUTING.md#os-support-status)
   has what to check.

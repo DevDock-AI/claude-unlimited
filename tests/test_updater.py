@@ -1,0 +1,305 @@
+import io
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from claude_unlimited import updater
+from claude_unlimited.updater import Release, UpdateError
+
+
+def _response(payload):
+    class _Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(payload).encode()
+
+        def geturl(self):
+            return "https://api.github.com/whatever"
+
+    return _Ctx()
+
+
+def _opener_for(pages):
+    """Serves canned JSON per URL. Fails loudly on an unexpected URL, so a
+    test can never accidentally reach the network."""
+    def opener(request, timeout=None):
+        url = request.full_url if hasattr(request, "full_url") else str(request)
+        for fragment, payload in pages.items():
+            if fragment in url:
+                return _response(payload)
+        raise AssertionError(f"unexpected URL: {url}")
+    return opener
+
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+# ---- version comparison ----
+
+@pytest.mark.parametrize("candidate,current,expected", [
+    ("0.2.0", "0.1.0", True),
+    ("v0.2.0", "0.1.0", True),
+    ("0.1.0", "0.1.0", False),
+    ("0.1.0", "0.2.0", False),
+    ("1.0.0", "0.9.9", True),
+    ("0.10.0", "0.9.0", True),      # numeric, not lexical
+])
+def test_is_newer(candidate, current, expected):
+    assert updater.is_newer(candidate, current) is expected
+
+
+def test_parse_version_stops_at_the_first_non_numeric_part():
+    assert updater.parse_version("v1.2.3-rc1") == (1, 2, 3)
+
+
+# ---- checking ----
+
+def test_check_returns_none_when_already_current():
+    opener = _opener_for({"releases/latest": {"tag_name": "v0.1.0"}})
+    assert updater.check_for_update("0.1.0", opener=opener) is None
+
+
+def test_check_resolves_the_tag_to_a_commit_sha():
+    sha = "a" * 40
+    opener = _opener_for({
+        "releases/latest": {"tag_name": "v0.2.0", "body": "notes here"},
+        "commits/v0.2.0": {"sha": sha},
+    })
+    release = updater.check_for_update("0.1.0", opener=opener)
+    assert release == Release(version="0.2.0", tag="v0.2.0", commit_sha=sha, notes="notes here")
+
+
+def test_check_rejects_an_unusable_sha():
+    opener = _opener_for({
+        "releases/latest": {"tag_name": "v0.2.0"},
+        "commits/v0.2.0": {"sha": "not-a-sha"},
+    })
+    with pytest.raises(UpdateError, match="unusable commit SHA"):
+        updater.check_for_update("0.1.0", opener=opener)
+
+
+def test_check_surfaces_a_network_failure_rather_than_pretending_it_is_current():
+    def opener(request, timeout=None):
+        raise OSError("no route to host")
+    with pytest.raises(UpdateError, match="Could not reach GitHub"):
+        updater.check_for_update("0.1.0", opener=opener)
+
+
+# ---- staging: the content verification ----
+
+def test_stage_refuses_when_the_downloaded_commit_is_not_the_one_announced(tmp_path):
+    """The whole point of the check: a tree whose contents were altered cannot
+    produce the SHA the release named."""
+    release = Release(version="0.2.0", tag="v0.2.0", commit_sha="a" * 40, notes="")
+    dest = tmp_path / "staged"
+
+    def runner(cmd, **kw):
+        if cmd[1] == "clone":
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return _completed()
+        return _completed(stdout="b" * 40)  # a different commit than announced
+
+    with pytest.raises(UpdateError, match="does not match"):
+        updater.stage_release(release, dest, runner=runner)
+    assert not dest.exists()  # nothing half-downloaded is left behind
+
+
+def test_stage_accepts_a_matching_commit(tmp_path):
+    sha = "c" * 40
+    release = Release(version="0.2.0", tag="v0.2.0", commit_sha=sha, notes="")
+    dest = tmp_path / "staged"
+
+    def runner(cmd, **kw):
+        if cmd[1] == "clone":
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return _completed()
+        return _completed(stdout=sha + "\n")
+
+    assert updater.stage_release(release, dest, runner=runner) == dest
+
+
+def test_stage_reports_a_failed_clone(tmp_path):
+    release = Release(version="0.2.0", tag="v0.2.0", commit_sha="d" * 40, notes="")
+
+    def runner(cmd, **kw):
+        return _completed(returncode=128, stderr="fatal: not found")
+
+    with pytest.raises(UpdateError, match="Could not download"):
+        updater.stage_release(release, tmp_path / "staged", runner=runner)
+
+
+# ---- installing: rollback safety ----
+
+def _prepare(tmp_path):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "pyproject.toml").write_text("")
+    (staged / "marker.txt").write_text("new")
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "marker.txt").write_text("old")
+    venv = tmp_path / "venv" / "bin" / "python"
+    venv.parent.mkdir(parents=True)
+    venv.write_text("")
+    return staged, app, tmp_path / "app.previous", venv
+
+
+def test_install_replaces_the_app_and_keeps_the_previous_copy(tmp_path):
+    staged, app, previous, venv = _prepare(tmp_path)
+    updater.install_staged(staged, runner=lambda *a, **k: _completed(),
+                            app_dir=app, previous_dir=previous, venv_python=venv)
+    assert (app / "marker.txt").read_text() == "new"
+    assert (previous / "marker.txt").read_text() == "old"
+
+
+def test_install_rolls_back_when_the_new_version_cannot_be_imported(tmp_path):
+    staged, app, previous, venv = _prepare(tmp_path)
+
+    def runner(cmd, **kw):
+        if cmd[1:3] == ["-c", "import claude_unlimited"]:
+            return _completed(returncode=1, stderr="ImportError: boom")
+        return _completed()
+
+    with pytest.raises(UpdateError, match="could not be imported, rolled back"):
+        updater.install_staged(staged, runner=runner, app_dir=app,
+                                previous_dir=previous, venv_python=venv)
+    assert (app / "marker.txt").read_text() == "old"  # the working version is back
+
+
+def test_install_rolls_back_when_pip_fails(tmp_path):
+    staged, app, previous, venv = _prepare(tmp_path)
+    calls = []
+
+    def runner(cmd, **kw):
+        calls.append(cmd)
+        if "install" in cmd and str(app) in cmd and len(calls) == 1:
+            return _completed(returncode=1, stderr="pip exploded")
+        return _completed()
+
+    with pytest.raises(UpdateError, match="rolled back"):
+        updater.install_staged(staged, runner=runner, app_dir=app,
+                                previous_dir=previous, venv_python=venv)
+    assert (app / "marker.txt").read_text() == "old"
+
+
+def test_install_refuses_a_tree_that_is_not_this_project(tmp_path):
+    staged, app, previous, venv = _prepare(tmp_path)
+    (staged / "pyproject.toml").unlink()
+    with pytest.raises(UpdateError, match="does not look like this project"):
+        updater.install_staged(staged, runner=lambda *a, **k: _completed(),
+                                app_dir=app, previous_dir=previous, venv_python=venv)
+    assert (app / "marker.txt").read_text() == "old"
+
+
+def test_install_refuses_without_a_virtualenv(tmp_path):
+    staged, app, previous, venv = _prepare(tmp_path)
+    venv.unlink()
+    with pytest.raises(UpdateError, match="No virtual environment"):
+        updater.install_staged(staged, runner=lambda *a, **k: _completed(),
+                                app_dir=app, previous_dir=previous, venv_python=venv)
+
+
+# ---- the source cannot be redirected ----
+
+def test_update_source_is_hardcoded_not_configurable():
+    """A compromised config file must not be able to point the updater at a
+    different repository."""
+    assert updater.CLONE_URL == "https://github.com/DevDock-AI/claude-unlimited.git"
+    assert updater.RELEASES_LATEST_URL.startswith("https://api.github.com/repos/DevDock-AI/claude-unlimited/")
+    source = Path(updater.__file__).read_text()
+    assert "load_pool" not in source and "update_settings" not in source
+
+
+# ---- mode policy ----
+
+def _cycle_env(tmp_path, sha="e" * 40):
+    pages = {"releases/latest": {"tag_name": "v0.2.0", "body": "n"}, "commits/v0.2.0": {"sha": sha}}
+    staged = tmp_path / "staged"
+
+    def runner(cmd, **kw):
+        if cmd[1] == "clone":
+            d = Path(cmd[-1]); d.mkdir(parents=True, exist_ok=True)
+            (d / "pyproject.toml").write_text("")
+            return _completed()
+        if cmd[1] == "-C":
+            return _completed(stdout=sha)
+        return _completed()
+    return _opener_for(pages), runner, staged
+
+
+def test_manual_mode_reports_but_downloads_nothing(tmp_path):
+    opener, runner, staged = _cycle_env(tmp_path)
+    out = updater.run_update_cycle("0.1.0", "manual", opener=opener, runner=runner, staging_dir=staged)
+    assert out.action == "available" and out.release.version == "0.2.0"
+    assert not staged.exists()
+    assert out.needs_restart is False
+
+
+def test_auto_download_mode_stages_but_does_not_install(tmp_path, monkeypatch):
+    opener, runner, staged = _cycle_env(tmp_path)
+    monkeypatch.setattr(updater, "install_staged",
+                        lambda *a, **k: pytest.fail("must not install in auto_download mode"))
+    out = updater.run_update_cycle("0.1.0", "auto_download", opener=opener, runner=runner, staging_dir=staged)
+    assert out.action == "downloaded"
+    assert staged.exists()
+
+
+def test_auto_install_mode_installs(tmp_path, monkeypatch):
+    opener, runner, staged = _cycle_env(tmp_path)
+    installed = []
+    monkeypatch.setattr(updater, "install_staged", lambda s, **k: installed.append(s))
+    out = updater.run_update_cycle("0.1.0", "auto_install", opener=opener, runner=runner, staging_dir=staged)
+    assert out.action == "installed" and out.needs_restart is True
+    assert installed
+
+
+def test_cycle_never_raises_on_a_network_failure(tmp_path):
+    def opener(request, timeout=None):
+        raise OSError("offline")
+    out = updater.run_update_cycle("0.1.0", "auto_install", opener=opener, staging_dir=tmp_path / "s")
+    assert out.action == "none" and "Could not reach GitHub" in out.error
+
+
+def test_a_failed_install_reports_downloaded_not_installed(tmp_path, monkeypatch):
+    opener, runner, staged = _cycle_env(tmp_path)
+    def boom(*a, **k): raise UpdateError("install blew up")
+    monkeypatch.setattr(updater, "install_staged", boom)
+    out = updater.run_update_cycle("0.1.0", "auto_install", opener=opener, runner=runner, staging_dir=staged)
+    assert out.action == "downloaded" and "install blew up" in out.error
+    assert out.needs_restart is False
+
+
+def test_no_update_available_is_not_an_error(tmp_path):
+    opener = _opener_for({"releases/latest": {"tag_name": "v0.1.0"}})
+    out = updater.run_update_cycle("0.1.0", "auto_install", opener=opener, staging_dir=tmp_path / "s")
+    assert out.action == "none" and out.error is None and out.release is None
+
+
+def test_a_repo_with_no_releases_is_not_an_error(tmp_path):
+    """`releases/latest` 404s until the first release exists. That is a normal
+    state, not something to report as a failure."""
+    import urllib.error
+
+    def opener(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    out = updater.run_update_cycle("0.1.0", "auto_install", opener=opener, staging_dir=tmp_path / "s")
+    assert out.action == "none" and out.error is None
+
+
+def test_other_http_errors_are_still_reported(tmp_path):
+    import urllib.error
+
+    def opener(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", {}, None)
+
+    out = updater.run_update_cycle("0.1.0", "manual", opener=opener, staging_dir=tmp_path / "s")
+    assert out.action == "none" and "HTTP 503" in out.error

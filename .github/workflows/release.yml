@@ -1,0 +1,84 @@
+name: Release
+
+# Tag-driven. Pushing a v* tag runs the suite, and only if it passes does a
+# GitHub Release get created — the updater resolves that release's tag to a
+# commit SHA and refuses to install anything whose contents disagree, so a
+# release must never be published from code that was not tested.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Tag must match the package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(python -c 'import claude_unlimited; print(claude_unlimited.__version__)')"
+          echo "tag=$TAG package=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ ($PKG). Bump one or the other."
+            exit 1
+          fi
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
+
+      - name: Check JS syntax
+        run: node --check claude_unlimited/static/app.js
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build release notes
+        id: notes
+        run: |
+          PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          {
+            echo "notes<<RELEASE_NOTES_EOF"
+            if [ -n "$PREV" ]; then
+              echo "### Changes since $PREV"
+              echo
+              git log --no-merges --pretty='- %s' "$PREV..${GITHUB_REF_NAME}"
+            else
+              echo "First release."
+            fi
+            echo
+            echo "---"
+            echo
+            echo "Update in place with \`claude-unlimited\` (Settings → Updates), or install fresh:"
+            echo
+            echo '```bash'
+            echo 'curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash'
+            echo '```'
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "${{ steps.notes.outputs.notes }}" \
+            --verify-tag

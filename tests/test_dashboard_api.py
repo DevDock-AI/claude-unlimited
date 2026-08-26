@@ -185,3 +185,21 @@ def test_responses_never_cached(running_server):
     req = urllib.request.Request(f"{base}/api/status")
     with urllib.request.urlopen(req, timeout=2) as resp:
         assert resp.headers.get("Cache-Control") == "no-store"
+
+
+def test_update_endpoint_reports_state_without_touching_the_network(running_server, monkeypatch):
+    """GET /api/update is a cheap read of the last known state: dashboard
+    polling must never trigger an outbound request."""
+    from claude_unlimited import updater
+
+    called = []
+    monkeypatch.setattr(updater, "run_update_cycle", lambda *a, **k: called.append(1))
+
+    base, _ = running_server
+    status, body = _request(f"{base}/api/update")
+
+    assert status == 200
+    assert body["current_version"] == daemon.__version__
+    assert "update_mode" in body and "available" in body
+    assert not called, "GET /api/update must not run a check"
+

@@ -53,6 +53,7 @@ from . import profiles as profile_repo
 from . import project_attribution
 from . import project_usage
 from . import session_tokens
+from . import updater
 from . import usage_history
 from .config import APP_DIR, DEFAULT_SWITCH_THRESHOLD, UPDATE_MODES, ensure_app_dir, load_pool, update_settings
 from .gateway import Gateway
@@ -331,6 +332,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if path == "/api/update":
+            with _update_lock:
+                state = dict(_update_state)
+            state["current_version"] = __version__
+            state["update_mode"] = load_pool().settings.update_mode
+            self._send_json(200, state)
             return
 
         if path == "/api/status":
@@ -683,6 +692,26 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             threading.Thread(target=_do_kill, daemon=True).start()
             return
 
+        if path == "/api/update/check":
+            self._send_json(200, _run_update_check())
+            return
+
+        if path == "/api/update/install":
+            # Installs whatever the last check found, regardless of mode: this
+            # is an explicit click, not the background policy.
+            settings = load_pool().settings
+            outcome = updater.run_update_cycle(__version__, "auto_install")
+            _record_update_outcome(outcome, settings)
+            if outcome.error:
+                self._send_json(502, {"error": "update_failed", "message": outcome.error})
+                return
+            if outcome.action != "installed":
+                self._send_json(200, {"installed": False, "message": "Already up to date."})
+                return
+            self._send_json(200, {"installed": True, "version": outcome.release.version,
+                                   "restart_required": True})
+            return
+
         if path == "/api/process/restart":
             service = daemon_installer.status()
             if not service["installed"]:
@@ -937,6 +966,62 @@ PID_FILE = APP_DIR / "daemon.pid"
 
 
 _OAUTH_REFRESH_LOOP_INTERVAL_SECONDS = 60
+_UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+_UPDATE_CHECK_STARTUP_DELAY_SECONDS = 120
+
+# Last known update state, shown by GET /api/update. In memory only: a
+# restart should re-check rather than trust a stale verdict from a previous
+# process, and a check is cheap.
+_update_state: dict = {"checked_at": None, "available": None, "action": "none", "error": None}
+_update_lock = threading.Lock()
+
+
+def _record_update_outcome(outcome, settings) -> None:
+    release = outcome.release
+    with _update_lock:
+        _update_state.update({
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "available": None if release is None else {
+                "version": release.version, "tag": release.tag, "notes": release.notes[:4000],
+            },
+            "action": outcome.action,
+            "error": outcome.error,
+        })
+    if outcome.action == "none":
+        return
+    if outcome.action == "installed":
+        activity.record("config", f"Updated to {release.version}", meta="restart to finish")
+        notifications.notify_if_enabled("update_available", "Claude Unlimited",
+                                          f"Updated to {release.version} — restart to finish.", settings)
+        return
+    activity.record("config", f"Update available: {release.version}", meta=outcome.action)
+    notifications.notify_if_enabled("update_available", "Claude Unlimited",
+                                      f"Version {release.version} is available.", settings)
+
+
+def _run_update_check(settings=None) -> dict:
+    """One check-and-act pass honoring the configured update_mode. Never
+    raises: it runs from a background thread and from a request handler."""
+    settings = settings or load_pool().settings
+    outcome = updater.run_update_cycle(__version__, settings.update_mode)
+    _record_update_outcome(outcome, settings)
+    with _update_lock:
+        return dict(_update_state)
+
+
+def _update_check_loop() -> None:
+    """Polls for a new release on a slow timer.
+
+    Deliberately unhurried and jittered by the startup delay: this is a
+    background courtesy, not something worth hammering a public API for.
+    Every pass is best-effort, so being offline is a no-op, not a crash."""
+    time.sleep(_UPDATE_CHECK_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            _run_update_check()
+        except Exception:
+            pass
+        time.sleep(_UPDATE_CHECK_INTERVAL_SECONDS)
 
 
 def _oauth_refresh_loop() -> None:
@@ -961,6 +1046,7 @@ def _oauth_refresh_loop() -> None:
 def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
     server = make_server(host, port)
     threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
+    threading.Thread(target=_update_check_loop, daemon=True).start()
     print(f"CSRF token for this run (Dashboard needs it, never logged again): {_CSRF_TOKEN}")
     # Written on every start on every OS. Harmless where the installer
     # backend gets a pid another way (launchctl, systemctl), and the only
