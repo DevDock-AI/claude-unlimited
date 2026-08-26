@@ -49,6 +49,7 @@ from . import daemon_installer
 from . import export_import
 from . import i18n
 from . import notifications
+from . import openai_models
 from . import openai_observation
 from . import placeholder_token
 from . import pricing
@@ -364,6 +365,13 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             items = [_profile_to_public_dict(p, runtime_map.get(p.id), usage_map.get(p.id), p.id in in_flight)
                      for p in profile_repo.list_profiles()]
             self._send_json(200, {"profiles": items})
+            return
+
+        if path == "/api/codex/model-map":
+            # Served rather than restated in the page: the Dashboard used to
+            # carry its own copy of this table, which went stale the first
+            # time the mapping changed.
+            self._send_json(200, {"mapping": openai_models.automatic_mapping()})
             return
 
         if path == "/api/settings":

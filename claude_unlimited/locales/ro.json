@@ -205,6 +205,8 @@
   "settings.notifications.test_sub": "Confirmă că notificările macOS funcționează și declanșează cererea de permisiune dacă e nevoie",
   "settings.notifications.test_btn": "Trimite test",
   "banner.connection_lost": "Nu se poate accesa daemonul",
+  "banner.restarting": "Repornire…",
+  "banner.restarting_sub": "Se aplică actualizarea — se reconectează singur.",
   "banner.retry": "Reîncearcă",
   "modal.detail.threshold_sub": "Rotește departe de acest profil la acest procent de utilizare",
   "modal.detail.priority_sub": "Un număr mai mic este preferat când mai multe profiluri sunt eligibile",

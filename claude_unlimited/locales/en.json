@@ -205,6 +205,8 @@
   "settings.notifications.test_sub": "Confirms macOS notifications work, and triggers the permission prompt if needed",
   "settings.notifications.test_btn": "Send test",
   "banner.connection_lost": "Can't reach the daemon",
+  "banner.restarting": "Restarting…",
+  "banner.restarting_sub": "Applying the update — this reconnects on its own.",
   "banner.retry": "Retry",
   "modal.detail.threshold_sub": "Rotate away from this profile at this usage %",
   "modal.detail.priority_sub": "Lower number is preferred when multiple profiles are eligible",

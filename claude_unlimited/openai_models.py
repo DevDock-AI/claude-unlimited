@@ -111,6 +111,33 @@ def fallback_models(model: str) -> list[str]:
     return list(_MODEL_LADDER[index + 1:]) + list(_MODEL_LADDER[:index])
 
 
+_CLAUDE_DISPLAY_NAMES: dict[str, str] = {
+    "claude-fable-5": "Claude Fable 5",
+    "claude-opus-5": "Claude Opus 5",
+    "claude-sonnet-5": "Claude Sonnet 5",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+}
+
+
+def automatic_mapping() -> list[dict[str, str]]:
+    """The mapping table the Dashboard shows when a codex Profile is left on
+    automatic.
+
+    Derived from _MODEL_MAP rather than restated in the page, because it was
+    restated there once and silently went stale the first time the mapping
+    changed — the modal kept advertising a model and effort the bridge had
+    stopped using."""
+    return [
+        {
+            "claude_model": claude_id,
+            "claude_label": _CLAUDE_DISPLAY_NAMES.get(claude_id, claude_id),
+            "openai_model": target.model,
+            "reasoning_effort": target.reasoning_effort,
+        }
+        for claude_id, target in _MODEL_MAP.items()
+    ]
+
+
 def advertised_models() -> list[tuple[str, str]]:
     """(model_id, display_name) pairs for the Anthropic-shaped /v1/models
     listing a codex Profile answers with, newest-capability-first.

@@ -205,6 +205,8 @@
   "settings.notifications.test_sub": "Confirma que las notificaciones de macOS funcionan y solicita el permiso si es necesario",
   "settings.notifications.test_btn": "Enviar prueba",
   "banner.connection_lost": "No se puede conectar con el demonio",
+  "banner.restarting": "Reiniciando…",
+  "banner.restarting_sub": "Aplicando la actualización: se reconectará solo.",
   "banner.retry": "Reintentar",
   "modal.detail.threshold_sub": "Rota fuera de este perfil en este % de uso",
   "modal.detail.priority_sub": "Un número más bajo se prefiere cuando varios perfiles son elegibles",

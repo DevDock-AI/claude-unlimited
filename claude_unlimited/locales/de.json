@@ -205,6 +205,8 @@
   "settings.notifications.test_sub": "Bestätigt, dass macOS-Benachrichtigungen funktionieren, und löst bei Bedarf die Berechtigungsabfrage aus",
   "settings.notifications.test_btn": "Test senden",
   "banner.connection_lost": "Daemon nicht erreichbar",
+  "banner.restarting": "Neustart…",
+  "banner.restarting_sub": "Update wird angewendet — die Verbindung stellt sich von selbst wieder her.",
   "banner.retry": "Erneut versuchen",
   "modal.detail.threshold_sub": "Wechselt bei diesem Nutzungsprozentsatz von diesem Profil weg",
   "modal.detail.priority_sub": "Eine niedrigere Zahl wird bevorzugt, wenn mehrere Profile infrage kommen",

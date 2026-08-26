@@ -2,6 +2,7 @@ from claude_unlimited.openai_models import (
     _MODEL_LADDER,
     _MODEL_MAP,
     OpenAIModelTarget,
+    automatic_mapping,
     fallback_models,
     map_model,
 )
@@ -74,3 +75,25 @@ def test_every_model_in_the_map_can_reach_every_other_one():
     for _, target in _MODEL_MAP.items():
         reachable = {target.model, *fallback_models(target.model)}
         assert reachable == set(_MODEL_LADDER)
+
+
+def test_automatic_mapping_matches_the_real_map():
+    rows = automatic_mapping()
+    assert [r["claude_model"] for r in rows] == list(_MODEL_MAP)
+    for row in rows:
+        target = _MODEL_MAP[row["claude_model"]]
+        assert row["openai_model"] == target.model
+        assert row["reasoning_effort"] == target.reasoning_effort
+        assert row["claude_label"]  # never blank, or the table renders empty cells
+
+
+def test_the_dashboard_does_not_restate_the_mapping():
+    # This table was hardcoded in index.html, in two places, and both silently
+    # went stale the first time the mapping changed. It is served from
+    # /api/codex/model-map now; a literal model id back in the page means the
+    # duplicate has returned.
+    from pathlib import Path
+    page = (Path(__file__).resolve().parent.parent
+            / "claude_unlimited" / "static" / "index.html").read_text(encoding="utf-8")
+    for target in {t.model for t in _MODEL_MAP.values()}:
+        assert target not in page, f"{target} is hardcoded in index.html again"

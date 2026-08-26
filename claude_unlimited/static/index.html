@@ -1697,11 +1697,7 @@
               <th data-i18n="modal.add_profile.codex_mapping_col_openai">OpenAI/Codex model</th>
               <th data-i18n="modal.add_profile.codex_mapping_col_effort">Reasoning effort</th>
             </tr></thead>
-            <tbody>
-              <tr><td>Claude Fable 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">max</td></tr>
-              <tr><td>Claude Opus 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">high</td></tr>
-              <tr><td>Claude Sonnet 5</td><td class="mono">gpt-5.6-terra</td><td class="mono">medium</td></tr>
-              <tr><td>Claude Haiku 4.5</td><td class="mono">gpt-5.6-luna</td><td class="mono">low</td></tr>
+            <tbody id="f_codex_mapping_rows">
             </tbody>
           </table>
         </div>
@@ -1994,22 +1990,18 @@
           </div>
         </div>
         <div class="mapping-block">
-          <div class="advanced-toggle" id="pdCodexMappingToggle">
+          <div class="advanced-toggle open" id="pdCodexMappingToggle">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
             <span data-i18n="modal.add_profile.codex_mapping_title">Automatic mapping</span>
           </div>
-          <div class="advanced-body" id="pdCodexMappingBody">
+          <div class="advanced-body open" id="pdCodexMappingBody">
             <table class="model-map-table">
               <thead><tr>
                 <th data-i18n="modal.add_profile.codex_mapping_col_claude">Claude model</th>
                 <th data-i18n="modal.add_profile.codex_mapping_col_openai">OpenAI/Codex model</th>
                 <th data-i18n="modal.add_profile.codex_mapping_col_effort">Reasoning effort</th>
               </tr></thead>
-              <tbody>
-                <tr><td>Claude Fable 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">max</td></tr>
-                <tr><td>Claude Opus 5</td><td class="mono">gpt-5.6-sol</td><td class="mono">high</td></tr>
-                <tr><td>Claude Sonnet 5</td><td class="mono">gpt-5.6-terra</td><td class="mono">medium</td></tr>
-                <tr><td>Claude Haiku 4.5</td><td class="mono">gpt-5.6-luna</td><td class="mono">low</td></tr>
+              <tbody id="pd_codex_mapping_rows">
               </tbody>
             </table>
           </div>

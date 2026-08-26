@@ -1,4 +1,4 @@
-const CSRF = document.querySelector('meta[name=csrf-token]').content;
+let CSRF = document.querySelector('meta[name=csrf-token]').content;
 
 // ---- live-update rendering ----
 // Every panel in the live-poll loop writes through setLiveHtml() instead of
@@ -454,20 +454,88 @@ function showToast(type, title, sub, { duration } = { duration: 5000 }) {
 // ---- connection-lost banner ----
 
 let _connectionOk = true;
+// Set while the daemon is expected to go away briefly (an update install or a
+// restart we asked for). Only changes what the banner says: a planned bounce
+// should not read like a failure.
+let _restartExpected = false;
+let _connectionTimer = null;
+
+const CONNECTION_POLL_OK_MS = 20000;
+const CONNECTION_POLL_DOWN_MS = 500;
+
+function expectRestart(on) {
+  _restartExpected = on;
+  if (on) scheduleConnectionCheck(CONNECTION_POLL_DOWN_MS);
+}
+
+function scheduleConnectionCheck(delay) {
+  clearTimeout(_connectionTimer);
+  _connectionTimer = setTimeout(checkConnection, delay);
+}
 
 async function checkConnection() {
   const banner = document.getElementById('connectionBanner');
   const sub = document.getElementById('connectionBannerSub');
+  const text = banner ? banner.querySelector('.banner-text') : null;
   try {
     const res = await fetch('/health', { cache: 'no-store' });
     if (!res.ok) throw new Error('unhealthy');
-    if (!_connectionOk) { _connectionOk = true; refreshCurrentView(); }
+    if (!_connectionOk) {
+      // Back up. The CSRF token was minted by the process that just died, so
+      // refresh it here rather than letting the next write fail and bounce
+      // the whole page.
+      _connectionOk = true;
+      _restartExpected = false;
+      try {
+        const s = await (await fetch('/api/status', { cache: 'no-store' })).json();
+        if (s && s.csrf_token) CSRF = s.csrf_token;
+      } catch (e) { /* next write falls back to the reload path */ }
+      refreshCurrentView();
+    }
     banner.style.display = 'none';
+    // Idle cadence while healthy; the fast one only exists to catch a bounce.
+    scheduleConnectionCheck(CONNECTION_POLL_OK_MS);
   } catch (e) {
     _connectionOk = false;
     banner.style.display = '';
-    if (sub) sub.textContent = `${window.location.host} isn't responding — showing the last known state`;
+    if (text) text.textContent = _restartExpected
+      ? t('banner.restarting') : t('banner.connection_lost');
+    if (sub) sub.textContent = _restartExpected
+      ? t('banner.restarting_sub')
+      : `${window.location.host} isn't responding — showing the last known state`;
+    // Poll hard while down: the daemon is typically back within a second, and
+    // waiting out the idle interval left the Dashboard looking dead for up to
+    // 20s after it had already recovered.
+    scheduleConnectionCheck(CONNECTION_POLL_DOWN_MS);
   }
+}
+
+async function _healthOk() {
+  try {
+    return (await fetch('/health', { cache: 'no-store' })).ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Reloads once the REPLACEMENT daemon is answering, rather than after a fixed
+// guess. A blind wait was both too slow (the new process is usually serving
+// again within a second) and unreliable — reloading on a timer can land while
+// the port is still dead, or before the outgoing process has even stopped.
+async function reloadWhenRestarted() {
+  expectRestart(true);
+  const started = Date.now();
+  // Wait for the outgoing process to go away first, so this doesn't reload
+  // into the version that is on its way out.
+  while (Date.now() - started < 20000) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (!(await _healthOk())) break;
+  }
+  while (Date.now() - started < 90000) {
+    if (await _healthOk()) break;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  window.location.reload();
 }
 
 function refreshCurrentView() {
@@ -1311,6 +1379,7 @@ function openProfileDetailModal(profileId) {
   document.getElementById('pd_budget_input').value = p.monthly_budget_cap != null ? p.monthly_budget_cap.toFixed(2) : '';
 
   document.getElementById('pd_codex_fields').style.display = isCodex ? '' : 'none';
+  if (isCodex) loadCodexMapping();
   document.getElementById('pd_codex_base_url_wrap').style.display = codexIsApiKey ? '' : 'none';
   document.getElementById('pd_codex_credential_wrap').style.display = codexIsApiKey ? '' : 'none';
   document.getElementById('pd_codex_home_row').style.display = (isCodex && p.auth_mode === 'chatgpt_subscription') ? '' : 'none';
@@ -2143,10 +2212,10 @@ async function runUpdateInstall() {
         title: t('modal.update.installed'), sub: t('modal.update.installed_sub'),
       });
       showToast('ok', t('toast.update_installed'), t('toast.update_installed_sub'));
-      // The daemon restarts itself now, so the page must wait for the new one
-      // to answer before reading a version — asking too early either fails or
-      // reports the version that is on its way out.
-      setTimeout(() => window.location.reload(), 6000);
+      // The daemon restarts itself now, so the page waits for the new one to
+      // answer before reloading — asking too early either fails or reports the
+      // version that is on its way out.
+      reloadWhenRestarted();
       return;
     } else {
       _updateModalPhase('result', {
@@ -2369,7 +2438,9 @@ function restartProcess() {
       try {
         await api('/api/process/restart', { method: 'POST', body: '{}' });
         showToast('success', t('toast.restart_done'), t('toast.restart_sub'));
-        setTimeout(loadProcessStats, 3000);
+        // Same planned-bounce handling as an update install: say so in the
+        // banner, and come back as soon as the replacement answers.
+        expectRestart(true);
       } catch (e) {
         showToast('error', t('toast.restart_failed'), e.message);
       }
@@ -2508,6 +2579,7 @@ function selectType(type) {
   // set afterward from the Edit menu.
   document.getElementById('f_codex_model_wrap').style.display = type === 'codex' ? '' : 'none';
   document.getElementById('f_codex_mapping_wrap').style.display = type === 'codex' ? '' : 'none';
+  if (type === 'codex') loadCodexMapping();
   // API keys have no session-% concept, so an absolute token budget takes
   // switch_threshold's slot — the same swap as the Profile Detail modal and
   // the Profiles table chip. codex uses switch_threshold like oauth.
@@ -3072,9 +3144,28 @@ document.getElementById('advancedToggle').addEventListener('click', () => {
   document.getElementById('advancedToggle').classList.toggle('open');
   document.getElementById('advancedBody').classList.toggle('open');
 });
-// Same disclosure pattern as advancedToggle/advancedBody above, collapsed by
-// default: the static mapping table is reference material, secondary to the
-// codex section's editable fields.
+
+// The mapping table is served, not written into the page: it was hardcoded in
+// two places and both went stale the first time the mapping changed, telling
+// people a model and effort the bridge had stopped using. Fetched once and
+// reused, since it only changes when the daemon itself does.
+let _codexMappingRows = null;
+async function loadCodexMapping() {
+  if (!_codexMappingRows) {
+    const data = await api('/api/codex/model-map');
+    _codexMappingRows = (data.mapping || []).map((m) =>
+      `<tr><td>${esc(m.claude_label)}</td>` +
+      `<td class="mono">${esc(m.openai_model)}</td>` +
+      `<td class="mono">${esc(m.reasoning_effort)}</td></tr>`).join('');
+  }
+  for (const id of ['f_codex_mapping_rows', 'pd_codex_mapping_rows']) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = _codexMappingRows;
+  }
+}
+// Same disclosure pattern as advancedToggle/advancedBody above, but open by
+// default: which model a codex Profile actually reaches is the first thing
+// worth knowing when reading one, not reference material to go hunting for.
 document.getElementById('pdCodexMappingToggle').addEventListener('click', () => {
   document.getElementById('pdCodexMappingToggle').classList.toggle('open');
   document.getElementById('pdCodexMappingBody').classList.toggle('open');
@@ -3156,4 +3247,6 @@ loadLocales().then(() => {
 });
 loadActivityPreview();
 checkConnection();
-setInterval(checkConnection, 20000);
+// Self-scheduling rather than a fixed interval: the cadence changes to a
+// fast retry while the daemon is down so recovery is near-instant.
+scheduleConnectionCheck(CONNECTION_POLL_OK_MS);
