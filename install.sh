@@ -98,15 +98,24 @@ case "$PORT" in
   ''|*[!0-9]*) echo "CLAUDE_UNLIMITED_PORT must be a number, got: $PORT" >&2; exit 1 ;;
 esac
 URL="http://127.0.0.1:${PORT}/"
-if ! curl -fsS --max-time 2 "${URL}health" >/dev/null 2>&1; then
-  echo
-  echo "Starting the daemon…"
+
+# Registered as a login service by default. The alternative is a detached
+# process that dies with the terminal or the next reboot, leaving a tool whose
+# whole job is to be there when Claude Code needs it silently absent. It can be
+# turned off in Settings, which is also where its state is visible.
+echo
+echo "Setting it to run in the background…"
+if "$CLI" install --port "$PORT" >/dev/null 2>&1; then
+  echo "Background service: installed (starts on login)"
+else
+  echo "Background service: could not be installed — starting it for this session only"
   nohup "$CLI" start --port "$PORT" >/dev/null 2>&1 &
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    curl -fsS --max-time 1 "${URL}health" >/dev/null 2>&1 && break
-    sleep 0.5
-  done
 fi
+
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  curl -fsS --max-time 1 "${URL}health" >/dev/null 2>&1 && break
+  sleep 0.5
+done
 
 echo
 if curl -fsS --max-time 2 "${URL}health" >/dev/null 2>&1; then
@@ -125,7 +134,7 @@ echo "Next steps:"
 echo "  Add an API key from the dashboard, or add a subscription:"
 echo "    claude-unlimited add-account         # a Claude subscription"
 echo "    claude-unlimited add-codex-account   # a ChatGPT/Codex subscription"
-echo "  claude-unlimited install               # keep it running, starting on login"
+echo "  claude-unlimited uninstall             # stop it starting on login"
 echo
 echo "To remove everything later:"
 echo "  claude-unlimited purge"

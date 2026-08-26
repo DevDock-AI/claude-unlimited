@@ -26,6 +26,9 @@ import os
 import platform
 import secrets
 import socket
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -721,8 +724,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if outcome.action != "installed":
                 self._send_json(200, {"installed": False, "message": "Already up to date."})
                 return
+            # Respond before restarting: the client must have the answer in
+            # hand before this process goes away.
             self._send_json(200, {"installed": True, "version": outcome.release.version,
-                                   "restart_required": True})
+                                   "restarting": True})
+            threading.Thread(target=_restart_for_update, args=(self.server.server_address[1],),
+                              daemon=True).start()
             return
 
         if path == "/api/process/restart":
@@ -1034,6 +1041,55 @@ def _public_update_state(settings=None) -> dict:
     return state
 
 
+def _restart_for_update(port: int) -> bool:
+    """Restarts this daemon so freshly installed code is actually running.
+
+    Installing only replaces files on disk; the running process keeps serving
+    the version it started with, so without this an update appears to do
+    nothing and the reported version never changes.
+
+    Two shapes of daemon exist. A service-managed one is the service manager's
+    to bounce. One started detached — which is what install.sh does, and
+    `claude-unlimited start` — is nobody's, so a replacement is launched that
+    waits for this process to release the port before binding it.
+
+    Returns True if a restart was actually arranged."""
+    _gateway._persist()  # so the replacement comes back showing what this one showed
+
+    if daemon_installer.status()["installed"]:
+        try:
+            daemon_installer.start()  # atomic stop+start
+            return True
+        except daemon_installer.DaemonInstallerError as exc:
+            activity.record("error", "Update installed but the restart failed",
+                             meta=f"restart the daemon to finish ({exc})")
+            return False
+
+    # Detached: hand off to a replacement that starts once the port is free.
+    handoff = (
+        "import socket, subprocess, sys, time\n"
+        f"port = {int(port)}\n"
+        "for _ in range(120):\n"
+        "    s = socket.socket()\n"
+        "    try:\n"
+        "        s.bind(('127.0.0.1', port)); s.close(); break\n"
+        "    except OSError:\n"
+        "        s.close(); time.sleep(0.5)\n"
+        f"subprocess.Popen([{sys.executable!r}, '-m', 'claude_unlimited', 'start', "
+        f"'--port', str(port)], start_new_session=True)\n"
+    )
+    try:
+        subprocess.Popen([sys.executable, "-c", handoff], start_new_session=True,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        activity.record("error", "Update installed but the restart failed",
+                         meta=f"restart the daemon to finish ({exc})")
+        return False
+
+    threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+    return True
+
+
 def _run_update_check(settings=None, *, respect_idle: bool = True,
                       mode_override: Optional[str] = None) -> dict:
     """One check-and-act pass honoring the configured update_mode.
@@ -1083,13 +1139,7 @@ def _install_deferred_update_if_idle() -> None:
         _update_state["install_deferred_until_idle"] = outcome.action == "downloaded"
     if outcome.action != "installed":
         return
-    _gateway._persist()  # snapshot before the process goes away
-    if daemon_installer.status()["installed"]:
-        try:
-            daemon_installer.start()  # atomic stop+start; new code takes effect
-        except daemon_installer.DaemonInstallerError:
-            activity.record("error", "Update installed but the restart failed",
-                             meta="restart the daemon to finish")
+    _restart_for_update(DEFAULT_PORT)
 
 
 def _update_check_loop() -> None:

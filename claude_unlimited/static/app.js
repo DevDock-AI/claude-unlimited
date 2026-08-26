@@ -2118,6 +2118,11 @@ async function runUpdateInstall() {
         title: t('modal.update.installed'), sub: t('modal.update.installed_sub'),
       });
       showToast('ok', t('toast.update_installed'), t('toast.update_installed_sub'));
+      // The daemon restarts itself now, so the page must wait for the new one
+      // to answer before reading a version — asking too early either fails or
+      // reports the version that is on its way out.
+      setTimeout(() => window.location.reload(), 6000);
+      return;
     } else {
       _updateModalPhase('result', {
         title: t('modal.update.up_to_date'), sub: t('modal.update.up_to_date_sub'),

@@ -48,13 +48,11 @@ If `claude-unlimited: command not found`, `~/.local/bin` is not on `PATH`:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Then start it in the background and open the dashboard:
+The installer registers it as a login service, starts it, and opens the
+dashboard at **http://127.0.0.1:4317/**. Nothing else is needed to get it
+running.
 
-```bash
-claude-unlimited install     # start on login, and start now
-```
-
-Dashboard: **http://127.0.0.1:4317/**
+To stop it starting on login: `claude-unlimited uninstall`.
 
 ## STOP — the part you cannot do
 

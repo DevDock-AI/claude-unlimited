@@ -400,6 +400,38 @@ def _remove_isolated_claude_logins(config_dirs: list) -> None:
           f"(your own `claude` login was not touched)")
 
 
+def restart(port: int) -> int:
+    """Stops and starts the daemon, whichever shape it is running in.
+
+    `service-start`/`service-stop` only apply to a daemon the service manager
+    owns. One started by install.sh or `claude-unlimited start` is detached and
+    belongs to nobody, so it needs stopping directly and starting again — which
+    is exactly what is needed after an update replaces the code on disk, since
+    the running process keeps serving whatever it started with."""
+    _banner()
+    service = daemon_installer.status()
+
+    if service["installed"]:
+        try:
+            daemon_installer.start()  # atomic stop+start
+        except daemon_installer.DaemonInstallerError as exc:
+            print(f"Could not restart the service: {exc}", file=sys.stderr)
+            return 1
+    else:
+        _stop_running_daemon(port)
+        _spawn_background_daemon(port)
+
+    for _ in range(20):
+        if _probe_health(LOOPBACK_HOST, port, timeout=0.5):
+            print(f"Restarted — http://{LOOPBACK_HOST}:{port}/")
+            return 0
+        time.sleep(0.5)
+
+    print(f"The daemon did not come back on {LOOPBACK_HOST}:{port}.", file=sys.stderr)
+    print("Start it yourself with `claude-unlimited start`.", file=sys.stderr)
+    return 1
+
+
 def _stop_running_daemon(port: int, timeout: float = 8.0) -> None:
     """Stops a daemon that the service manager does not own.
 
@@ -935,11 +967,14 @@ def main(argv=None) -> int:
     sub.add_parser("uninstall", help="stop the daemon from starting automatically on login")
     sub.add_parser("service-start", help="start the installed background daemon now")
     sub.add_parser("service-stop", help="stop the installed background daemon")
+    restart_p = sub.add_parser("restart", help="stop and start the daemon, service-managed or not")
+    restart_p.add_argument("--port", type=int, default=DEFAULT_PORT)
     purge_parser = sub.add_parser(
         "purge",
         help="remove Claude Unlimited and everything it created, including stored credentials")
     purge_parser.add_argument("--yes", action="store_true",
                                help="skip the confirmation prompt")
+    purge_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
 
     args, unknown = parser.parse_known_args(argv)
     if args.cmd == "start":
@@ -964,6 +999,8 @@ def main(argv=None) -> int:
         return service_start()
     if args.cmd == "service-stop":
         return service_stop()
+    if args.cmd == "restart":
+        return restart(args.port)
     if args.cmd == "purge":
         return purge(args.port, assume_yes=args.yes)
 

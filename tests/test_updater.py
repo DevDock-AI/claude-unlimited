@@ -422,3 +422,72 @@ def test_background_policy_still_honours_the_configured_mode(monkeypatch, tmp_pa
                                               updater.UpdateOutcome(release=None, action="none"))[1])
     daemon_mod._run_update_check(_settings_with_mode("auto_install"))
     assert modes == ["auto_install"], modes
+
+
+# ---- restarting after an install ----
+
+def test_a_service_managed_daemon_is_bounced_by_the_service_manager(monkeypatch):
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod._gateway, "_persist", lambda: None)
+    monkeypatch.setattr(daemon_mod.daemon_installer, "status", lambda: {"installed": True, "running": True, "pid": 1})
+    started = []
+    monkeypatch.setattr(daemon_mod.daemon_installer, "start", lambda: started.append(True))
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen",
+                        lambda *a, **k: pytest.fail("must not hand off when a service owns it"))
+
+    assert daemon_mod._restart_for_update(4317) is True
+    assert started
+
+
+def test_a_detached_daemon_launches_a_replacement(monkeypatch):
+    """install.sh starts the daemon detached, so no service manager will bring
+    it back — without a hand-off the update installs and nothing restarts."""
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod._gateway, "_persist", lambda: None)
+    monkeypatch.setattr(daemon_mod.daemon_installer, "status", lambda: {"installed": False, "running": False, "pid": None})
+    spawned = []
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen", lambda cmd, **k: spawned.append(cmd))
+
+    timers = []
+    class _T:
+        def __init__(self, *a, **k): timers.append(a)
+        def start(self): pass
+    monkeypatch.setattr(daemon_mod.threading, "Timer", _T)
+
+    assert daemon_mod._restart_for_update(4317) is True
+    assert spawned, "a replacement must be launched"
+    assert "claude_unlimited" in " ".join(spawned[0]) or "-c" in spawned[0]
+    assert timers, "the current process must be told to exit"
+
+
+def test_a_failed_restart_is_recorded_not_swallowed(monkeypatch):
+    import claude_unlimited.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod._gateway, "_persist", lambda: None)
+    monkeypatch.setattr(daemon_mod.daemon_installer, "status", lambda: {"installed": True, "running": True, "pid": 1})
+
+    def boom():
+        raise daemon_mod.daemon_installer.DaemonInstallerError("nope")
+
+    monkeypatch.setattr(daemon_mod.daemon_installer, "start", boom)
+    recorded = []
+    monkeypatch.setattr(daemon_mod.activity, "record", lambda *a, **k: recorded.append(a))
+
+    assert daemon_mod._restart_for_update(4317) is False
+    assert recorded and "restart failed" in recorded[0][1]
+
+
+def test_state_is_snapshotted_before_the_process_goes_away(monkeypatch):
+    """The replacement reads this back, so skipping it means the Dashboard
+    returns blank after every update."""
+    import claude_unlimited.daemon as daemon_mod
+
+    order = []
+    monkeypatch.setattr(daemon_mod._gateway, "_persist", lambda: order.append("persist"))
+    monkeypatch.setattr(daemon_mod.daemon_installer, "status", lambda: {"installed": True, "running": True, "pid": 1})
+    monkeypatch.setattr(daemon_mod.daemon_installer, "start", lambda: order.append("restart"))
+
+    daemon_mod._restart_for_update(4317)
+    assert order == ["persist", "restart"]

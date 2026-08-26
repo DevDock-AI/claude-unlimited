@@ -376,7 +376,7 @@
   "settings.updates.installing": "Se instalează…",
   "toast.update_checked": "Verificare finalizată",
   "toast.update_installed": "Actualizare instalată",
-  "toast.update_installed_sub": "Se repornește pentru finalizare",
+  "toast.update_installed_sub": "Se repornește pentru finalizare — pagina se va reîncărca",
   "toast.update_none": "Deja actualizat",
   "toast.update_failed": "Actualizarea a eșuat",
   "modal.update.title": "Verifică actualizările",
@@ -392,6 +392,8 @@
   "modal.update.installing": "Se descarcă și se instalează…",
   "modal.update.installing_sub": "Se verifică versiunea, apoi se repornește",
   "modal.update.installed": "Actualizare instalată",
-  "modal.update.installed_sub": "Daemonul repornește pentru finalizare",
-  "help.cmd.purge": "Elimină Claude Unlimited și tot ce a creat — credențiale salvate, configurație, istoric de utilizare, aplicația și mediul ei virtual și înregistrarea serviciului. Cere confirmare. Configurația ta ~/.claude nu este atinsă niciodată."
+  "modal.update.installed_sub": "Se repornește pentru finalizare — pagina se va reîncărca",
+  "help.cmd.purge": "Elimină Claude Unlimited și tot ce a creat — credențiale salvate, configurație, istoric de utilizare, aplicația și mediul ei virtual și înregistrarea serviciului. Cere confirmare. Configurația ta ~/.claude nu este atinsă niciodată.",
+  "rail.repo": "Vezi sursa pe GitHub",
+  "help.cmd.restart": "Oprește și pornește daemonul, indiferent dacă este instalat ca serviciu de fundal. Necesar după o actualizare care înlocuiește codul de pe disc, deoarece procesul care rulează servește în continuare versiunea cu care a pornit."
 }

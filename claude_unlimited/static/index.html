@@ -100,6 +100,17 @@
   /* ---- Floating support button — reuses the MAX badge's shimmer/spark
      treatment. Set only right/bottom: a fixed element with all four offsets
      stretches to fill the gap instead of hugging its content. */
+  /* Sits immediately left of the support pill, same baseline. Neutral on
+     purpose: the support pill is the one asking for something. */
+  .floating-repo { position: fixed; right: 132px; bottom: 20px; z-index: 45; display: flex;
+                    align-items: center; justify-content: center; width: 34px; height: 34px;
+                    border-radius: 999px; text-decoration: none; cursor: pointer;
+                    color: var(--text-dim); background: var(--bg-panel);
+                    border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+                    transition: transform 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
+  .floating-repo:hover { transform: scale(1.08); color: var(--text); border-color: var(--accent-border); }
+  .floating-repo svg { width: 17px; height: 17px; }
+
   .floating-support { position: fixed; right: 20px; bottom: 20px; z-index: 45; display: flex;
                        align-items: center; gap: 6px;
                        padding: 8px 14px 8px 10px; border-radius: 999px; text-decoration: none; cursor: pointer;
@@ -769,6 +780,9 @@
 <div class="ambient-glow"></div>
 <div class="cursor-glow" id="cursorGlow"></div>
 <div class="toast-container" id="toastContainer"></div>
+<a class="floating-repo" id="floatingRepoLink" href="https://github.com/DevDock-AI/claude-unlimited" target="_blank" rel="noopener noreferrer" data-i18n-title="rail.repo" title="View the source on GitHub">
+  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.79 23.4c.6.11.82-.26.82-.58v-2.2c-3.34.73-4.04-1.42-4.04-1.42-.55-1.4-1.34-1.77-1.34-1.77-1.1-.75.08-.73.08-.73 1.21.09 1.85 1.25 1.85 1.25 1.08 1.85 2.83 1.31 3.52 1 .11-.79.42-1.32.76-1.62-2.67-.3-5.47-1.34-5.47-5.96 0-1.32.47-2.39 1.24-3.23-.12-.31-.54-1.55.12-3.22 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.67.24 2.91.12 3.22.77.84 1.24 1.91 1.24 3.23 0 4.63-2.8 5.65-5.48 5.95.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .5Z"/></svg>
+</a>
 <a class="floating-support" id="floatingSupportLink" href="https://ko-fi.com/devdock" target="_blank" rel="noopener noreferrer" data-i18n-title="rail.support" title="Support this project">
   <span class="spark"></span><span class="spark"></span><span class="spark"></span>
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20.5s-7.5-4.6-9.8-9.2C.7 8 2.2 4.6 5.6 3.9c2-.4 3.9.5 5 2.1a1 1 0 0 0 1.6 0c1.1-1.6 3-2.5 5-2.1 3.4.7 4.9 4.1 3.4 7.4-2.3 4.6-9.8 9.2-9.8 9.2Z"/></svg>
@@ -1475,6 +1489,17 @@
             </div>
           </div>
           <div class="field-sub" data-i18n="help.cmd.service_stop">Stops the installed background daemon.</div>
+        </div>
+
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-restart">claude-unlimited restart</code>
+            <div class="copy-btn" data-copy-target="cmd-restart">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.restart">Stops and starts the daemon.</div>
         </div>
 
         <div class="cmd-row">

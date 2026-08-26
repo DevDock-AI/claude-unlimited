@@ -170,11 +170,11 @@ One line. Nothing else to set up:
 curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash
 ```
 
-Then check it:
+That checks the install, registers it to run in the background and start on login, and
+opens the dashboard at **http://127.0.0.1:4317/** — where you add your first account.
 
-```bash
-claude-unlimited doctor
-```
+Don't want it starting on login? Turn it off in **Settings → Daemon**, or run
+`claude-unlimited uninstall`. It keeps running either way until you stop it.
 
 > **Using an AI agent to set this up?** Point it at
 > [`AGENTS.md`](AGENTS.md) — it spells out the install, what's safe, and the
@@ -185,9 +185,13 @@ claude-unlimited doctor
 
 <br>
 
-The installer creates an isolated environment at `~/.local/share/claude-unlimited/` and
-links `claude-unlimited` into `~/.local/bin`. It touches nothing else, and tells you if
-that directory isn't on your `PATH`.
+The installer creates an isolated environment at `~/.local/share/claude-unlimited/`,
+links `claude-unlimited` into `~/.local/bin`, runs `claude-unlimited doctor`, and
+registers the daemon as a login service (`launchd` / `systemd --user` / Task Scheduler).
+It touches nothing else, and tells you if `~/.local/bin` isn't on your `PATH`.
+
+If the service can't be registered it falls back to running for this session only, and
+says so rather than pretending it succeeded.
 
 Prefer to read it first, or install from a checkout?
 
@@ -437,6 +441,7 @@ Auto-start on login — the same thing **Settings → Daemon** controls.
 | `claude-unlimited uninstall` | Stop starting on login. |
 | `claude-unlimited service-start` | Start the background daemon now. |
 | `claude-unlimited service-stop` | Stop it. |
+| `claude-unlimited restart` | Stop and start the daemon, service-managed or not. Needed after an update replaces the code, since a running process keeps serving the version it started with. |
 
 </details>
 

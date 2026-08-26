@@ -376,7 +376,7 @@
   "settings.updates.installing": "Instalando…",
   "toast.update_checked": "Comprobación completada",
   "toast.update_installed": "Actualización instalada",
-  "toast.update_installed_sub": "Reiniciando para finalizar",
+  "toast.update_installed_sub": "Reiniciando para finalizar: esta página se recargará",
   "toast.update_none": "Ya está actualizado",
   "toast.update_failed": "Error al actualizar",
   "modal.update.title": "Buscar actualizaciones",
@@ -392,6 +392,8 @@
   "modal.update.installing": "Descargando e instalando…",
   "modal.update.installing_sub": "Verificando la versión y reiniciando",
   "modal.update.installed": "Actualización instalada",
-  "modal.update.installed_sub": "El daemon se está reiniciando para finalizar",
-  "help.cmd.purge": "Elimina Claude Unlimited y todo lo que creó: credenciales guardadas, configuración, historial de uso, la aplicación y su entorno virtual, y el registro del servicio. Pide confirmación. Tu propia configuración ~/.claude nunca se toca."
+  "modal.update.installed_sub": "Reiniciando para finalizar: esta página se recargará",
+  "help.cmd.purge": "Elimina Claude Unlimited y todo lo que creó: credenciales guardadas, configuración, historial de uso, la aplicación y su entorno virtual, y el registro del servicio. Pide confirmación. Tu propia configuración ~/.claude nunca se toca.",
+  "rail.repo": "Ver el código en GitHub",
+  "help.cmd.restart": "Detiene e inicia el daemon, esté o no instalado como servicio en segundo plano. Necesario tras una actualización que reemplaza el código en disco, ya que el proceso en ejecución sigue sirviendo la versión con la que arrancó."
 }
