@@ -1,0 +1,4 @@
+# Every path needs the maintainer's review before it can merge.
+# Branch protection on `main` requires a CODEOWNERS review, so this file is
+# what makes that rule mean something.
+* @DevDock-AI
