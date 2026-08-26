@@ -18,6 +18,7 @@ import os
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -302,6 +303,36 @@ def _user_already_has_a_status_line() -> bool:
     return False
 
 
+# Claude Code applies the `env` block from its settings files on top of the
+# process environment, so a project that pins ANTHROPIC_BASE_URL or
+# ANTHROPIC_AUTH_TOKEN in .claude/settings.json silently wins over the routing
+# we just set up — requests bypass the daemon entirely and go wherever that
+# file says, using whatever credential it carries.
+_ROUTING_ENV_KEYS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+
+def _settings_files_pinning_routing() -> list:
+    """Settings files whose `env` block would redirect this session's traffic.
+
+    Only these three keys matter — everything else a project puts in `env` is
+    its own business and is left alone."""
+    candidates = [
+        Path.home() / ".claude" / "settings.json",
+        Path.cwd() / ".claude" / "settings.json",
+        Path.cwd() / ".claude" / "settings.local.json",
+    ]
+    conflicting = []
+    for f in candidates:
+        try:
+            env = (json.loads(f.read_text()) or {}).get("env") or {}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+        hits = [k for k in _ROUTING_ENV_KEYS if k in env]
+        if hits:
+            conflicting.append((f, hits))
+    return conflicting
+
+
 def _status_line_args(port: int, claude_args: list[str]) -> list[str]:
     """`claude` arguments adding a status line that shows the Dashboard URL,
     so it stays visible for the whole session instead of scrolling away with
@@ -313,15 +344,102 @@ def _status_line_args(port: int, claude_args: list[str]) -> list[str]:
     --settings, or already configured a status line."""
     if any(a == "--settings" or a.startswith("--settings=") for a in claude_args):
         return []
-    if _user_already_has_a_status_line():
-        return []
-    label = f"\u26a1 Claude Unlimited \u00b7 http://{LOOPBACK_HOST}:{port}"
-    return ["--settings", json.dumps({
-        "statusLine": {"type": "command", "command": f"printf %s {shlex.quote(label)}"},
-    })]
+
+    settings: dict = {}
+
+    # Reassert routing over any settings file that pins it, so the session
+    # actually goes through the pool it was launched for. Scoped to the three
+    # routing keys and passed inline — nothing on disk is read differently or
+    # written.
+    conflicting = _settings_files_pinning_routing()
+    if conflicting:
+        settings["env"] = {
+            "ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"],
+            "ANTHROPIC_AUTH_TOKEN": os.environ["ANTHROPIC_AUTH_TOKEN"],
+        }
+        for path, keys in conflicting:
+            print(f"Note: {path} sets {', '.join(keys)} — overriding it for this "
+                  f"session so requests go through Claude Unlimited.")
+
+    if not _user_already_has_a_status_line():
+        label = f"\u26a1 Claude Unlimited \u00b7 http://{LOOPBACK_HOST}:{port}"
+        settings["statusLine"] = {"type": "command", "command": f"printf %s {shlex.quote(label)}"}
+
+    return ["--settings", json.dumps(settings)] if settings else []
 
 
-def purge(assume_yes: bool = False) -> int:
+def _remove_isolated_claude_logins(config_dirs: list) -> None:
+    """Removes the Keychain entries created by `add-account`'s isolated logins.
+
+    Those are written by Claude Code itself, under a service name derived from
+    the isolated directory we handed it, so they are ours to clean up and would
+    otherwise outlive everything else.
+
+    The derivation is what makes this safe: each name is
+    "Claude Code-credentials-<hash of one of our own directories>". The user's
+    real login is the un-suffixed "Claude Code-credentials", which no directory
+    of ours can hash to, so it can never be selected here."""
+    if sys.platform != "darwin" or not config_dirs:
+        return
+    from .anthropic_oauth import MACOS_KEYCHAIN_SERVICE, isolated_macos_keychain_service
+
+    removed = 0
+    for config_dir in config_dirs:
+        service = isolated_macos_keychain_service(config_dir)
+        if service == MACOS_KEYCHAIN_SERVICE:
+            continue  # unreachable by construction; refuse anyway
+        try:
+            result = subprocess.run(
+                ["security", "delete-generic-password", "-s", service],
+                capture_output=True, timeout=10, check=False)
+            if result.returncode == 0:
+                removed += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+    print(f"Isolated Claude Code logins removed: {removed} "
+          f"(your own `claude` login was not touched)")
+
+
+def _stop_running_daemon(port: int, timeout: float = 8.0) -> None:
+    """Stops a daemon that the service manager does not own.
+
+    install.sh starts one detached and `claude-unlimited start` runs one in a
+    terminal; neither is a launchd/systemd job, so deregistering the service
+    does not touch them and the dashboard keeps answering. Uses the pid the
+    daemon records on every start, then confirms the port actually stopped
+    responding rather than assuming the signal worked."""
+    pid_file = Path.home() / ".claude-unlimited" / "daemon.pid"
+    pid = None
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        pass
+
+    if pid:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                break
+            except OSError:
+                break
+            deadline = time.time() + timeout / 2
+            while time.time() < deadline:
+                if not _probe_health(LOOPBACK_HOST, port, timeout=0.5):
+                    break
+                time.sleep(0.25)
+            if not _probe_health(LOOPBACK_HOST, port, timeout=0.5):
+                break
+
+    if _probe_health(LOOPBACK_HOST, port, timeout=1.0):
+        print(f"WARNING: something is still serving {LOOPBACK_HOST}:{port}. "
+              "Stop it before the files are removed, or it will keep running "
+              "against deleted code.")
+    else:
+        print("Daemon: stopped")
+
+
+def purge(port: int = DEFAULT_PORT, assume_yes: bool = False) -> int:
     """Removes everything this project created, including credentials.
 
     Deliberately more thorough than the uninstall script: it deletes each
@@ -362,18 +480,26 @@ def purge(assume_yes: bool = False) -> int:
             print("Cancelled.")
             return 1
 
+    # Deregister the login service first, so nothing brings the daemon back
+    # between here and the file removal below.
+    try:
+        daemon_installer.uninstall()
+        print("Background service: deregistered")
+    except Exception as exc:
+        print(f"Background service: not deregistered ({exc})")
     try:
         daemon_installer.stop()
     except Exception:
         pass
-    try:
-        daemon_installer.uninstall()
-        print("Background service: deregistered")
-    except Exception:
-        print("Background service: nothing to deregister")
+
+    # A daemon started outside the service manager — which is what install.sh
+    # does, and `claude-unlimited start` — is not launchd's to stop, so
+    # stopping the service leaves it serving the dashboard. Stop it directly.
+    _stop_running_daemon(port)
 
     # Before the config goes: it is the only record of which Profiles exist.
     removed = 0
+    isolated_dirs = []
     try:
         for profile in load_pool().profiles:
             try:
@@ -381,9 +507,12 @@ def purge(assume_yes: bool = False) -> int:
                 removed += 1
             except Exception:
                 pass
+            if profile.claude_config_dir:
+                isolated_dirs.append(Path(profile.claude_config_dir))
     except Exception:
         pass
     print(f"Credentials removed from the keystore: {removed}")
+    _remove_isolated_claude_logins(isolated_dirs)
 
     for path in (app_dir, install_root):
         if path.exists():
@@ -836,7 +965,7 @@ def main(argv=None) -> int:
     if args.cmd == "service-stop":
         return service_stop()
     if args.cmd == "purge":
-        return purge(assume_yes=args.yes)
+        return purge(args.port, assume_yes=args.yes)
 
     parser.print_help()
     return 0

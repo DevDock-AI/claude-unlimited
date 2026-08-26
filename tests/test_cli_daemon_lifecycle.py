@@ -264,3 +264,104 @@ def test_purge_never_touches_the_users_claude_directory(monkeypatch, tmp_path):
     assert cli.purge(assume_yes=True) == 0
     assert (claude_dir / "CLAUDE.md").read_text() == "mine"
     assert not (tmp_path / ".claude-unlimited").exists()
+
+
+def test_purge_stops_a_daemon_the_service_manager_does_not_own(monkeypatch, tmp_path):
+    """install.sh starts the daemon detached, so it is not a launchd job.
+    Deregistering the service leaves it serving the dashboard."""
+    from claude_unlimited import cli
+
+    (tmp_path / ".claude-unlimited").mkdir()
+    (tmp_path / ".claude-unlimited" / "daemon.pid").write_text("4242")
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+
+    killed = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    # Port stops answering after the signal.
+    monkeypatch.setattr(cli, "_probe_health", lambda *a, **k: False)
+
+    cli._stop_running_daemon(4317)
+    assert killed and killed[0][0] == 4242
+
+
+def test_purge_warns_when_something_still_holds_the_port(monkeypatch, tmp_path, capsys):
+    """Removing the files while a daemon is still serving would leave it
+    running against deleted code — say so rather than reporting success."""
+    from claude_unlimited import cli
+
+    (tmp_path / ".claude-unlimited").mkdir()
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(cli, "_probe_health", lambda *a, **k: True)   # never stops
+
+    cli._stop_running_daemon(4317)
+    assert "still serving" in capsys.readouterr().out
+
+
+def test_purge_deregisters_the_service_before_removing_files(monkeypatch, tmp_path):
+    """Order matters: if the login service is still registered when the app
+    directory goes, it points at missing code on every future login."""
+    from claude_unlimited import cli
+    from claude_unlimited.config import Pool
+
+    order = []
+    monkeypatch.setattr(cli, "load_pool", lambda: Pool(profiles=[]))
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".claude-unlimited").mkdir()
+    monkeypatch.setattr(cli.daemon_installer, "uninstall", lambda: order.append("deregister"))
+    monkeypatch.setattr(cli.daemon_installer, "stop", lambda: None)
+    monkeypatch.setattr(cli, "_stop_running_daemon", lambda *a, **k: order.append("stop_daemon"))
+    monkeypatch.setattr(cli.shutil, "rmtree", lambda p, **k: order.append("rmtree"))
+
+    assert cli.purge(assume_yes=True) == 0
+    assert order.index("deregister") < order.index("rmtree")
+    assert order.index("stop_daemon") < order.index("rmtree")
+
+
+def test_purge_never_removes_the_users_own_claude_login(monkeypatch, tmp_path):
+    """The isolated logins add-account creates are ours to clean up. The
+    un-suffixed 'Claude Code-credentials' is the user's real login and must
+    survive — losing it would log them out of plain `claude`."""
+    from claude_unlimited import cli
+    from claude_unlimited.anthropic_oauth import MACOS_KEYCHAIN_SERVICE
+
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    deleted = []
+
+    class _R:
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        deleted.append(cmd[cmd.index("-s") + 1])
+        return _R()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    cli._remove_isolated_claude_logins([
+        tmp_path / "claude-accounts" / "aaaa1111",
+        tmp_path / "claude-accounts" / "bbbb2222",
+    ])
+
+    assert len(deleted) == 2
+    assert MACOS_KEYCHAIN_SERVICE not in deleted, "must never delete the real login"
+    for service in deleted:
+        assert service.startswith(MACOS_KEYCHAIN_SERVICE + "-"), service
+
+
+def test_purge_leaves_the_claude_directory_and_its_credentials_alone(monkeypatch, tmp_path):
+    """~/.claude holds the user's own Claude Code setup and login."""
+    from claude_unlimited import cli
+    from claude_unlimited.config import Pool
+
+    claude = tmp_path / ".claude"
+    (claude / "projects").mkdir(parents=True)
+    (claude / ".credentials.json").write_text("the user's own login")
+    (tmp_path / ".claude-unlimited").mkdir()
+
+    monkeypatch.setattr(cli, "load_pool", lambda: Pool(profiles=[]))
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(cli.daemon_installer, "uninstall", lambda: None)
+    monkeypatch.setattr(cli.daemon_installer, "stop", lambda: None)
+    monkeypatch.setattr(cli, "_stop_running_daemon", lambda *a, **k: None)
+
+    assert cli.purge(assume_yes=True) == 0
+    assert (claude / ".credentials.json").read_text() == "the user's own login"
+    assert (claude / "projects").exists()

@@ -135,3 +135,70 @@ def test_status_line_yields_to_a_user_supplied_settings_flag(monkeypatch, tmp_pa
 
     assert cli._status_line_args(4317, ["--settings", "x.json"]) == []
     assert cli._status_line_args(4317, ["--settings=x.json"]) == []
+
+
+def _routing_env(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:4317")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-cu-local")
+
+
+def test_a_project_pinning_the_base_url_is_overridden(monkeypatch, tmp_path):
+    """Claude Code applies a settings file's env on top of the process
+    environment, so a project that pins ANTHROPIC_BASE_URL sends every request
+    somewhere else with whatever credential it carries — silently bypassing
+    the pool the session was launched for."""
+    import json as _json
+    from claude_unlimited import cli
+
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(_json.dumps({
+        "env": {"ANTHROPIC_BASE_URL": "https://gateway.example", "ANTHROPIC_AUTH_TOKEN": "theirs"},
+    }))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path / "nohome"))
+    _routing_env(monkeypatch)
+
+    args = cli._status_line_args(4317, [])
+    settings = _json.loads(args[args.index("--settings") + 1])
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4317"
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-cu-local"
+
+
+def test_only_the_routing_keys_are_touched(monkeypatch, tmp_path):
+    """A project's own env is its business — only the three keys that decide
+    where traffic goes are reasserted."""
+    import json as _json
+    from claude_unlimited import cli
+
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(_json.dumps({
+        "env": {"ANTHROPIC_BASE_URL": "https://gateway.example", "MY_PROJECT_FLAG": "keep me"},
+    }))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path / "nohome"))
+    _routing_env(monkeypatch)
+
+    settings = _json.loads(cli._status_line_args(4317, [])[1])
+    assert set(settings["env"]) == {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"}
+    assert "MY_PROJECT_FLAG" not in settings["env"]
+
+
+def test_a_project_without_routing_env_is_left_alone(monkeypatch, tmp_path):
+    import json as _json
+    from claude_unlimited import cli
+
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(_json.dumps({"env": {"EDITOR": "vim"}}))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path / "nohome"))
+    _routing_env(monkeypatch)
+
+    args = cli._status_line_args(4317, [])
+    settings = _json.loads(args[1]) if args else {}
+    assert "env" not in settings
+
+
+def test_a_user_supplied_settings_flag_still_wins(monkeypatch, tmp_path):
+    from claude_unlimited import cli
+    _routing_env(monkeypatch)
+    assert cli._status_line_args(4317, ["--settings", "mine.json"]) == []
