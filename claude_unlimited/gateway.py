@@ -155,6 +155,16 @@ class Gateway:
     # rate-limited endpoint every 60s only re-triggers the same limiter and
     # never lets it clear.
     _RATE_LIMIT_BACKOFF_SECONDS = 900.0
+    # Each further consecutive rate-limited refresh doubles the wait, up to
+    # this ceiling. A flat interval never lets a persistently rate-limited
+    # endpoint recover: it just keeps arriving at the same rate forever.
+    _RATE_LIMIT_BACKOFF_CEILING_SECONDS = 6 * 60 * 60.0
+    # After this many consecutive rate-limited refreshes, stop trying on our
+    # own. At that point the endpoint has refused for hours and only a real
+    # re-authentication will help, so continuing to ask is pure noise against
+    # someone else's rate limiter. Cleared by a success, or by the credential
+    # being replaced (`claude-unlimited reauth`, re-import, re-paste).
+    _MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES = 6
 
     def __init__(self, transport: Callable = real_send):
         self._lock = threading.Lock()
@@ -194,6 +204,9 @@ class Gateway:
         # _RATE_LIMIT_BACKOFF_SECONDS). See that method's own docstring for
         # what it's actually for.
         self._refresh_check_not_before: dict[str, float] = {}
+        # Consecutive rate-limited refreshes per Profile, driving the
+        # escalating backoff and the give-up threshold above.
+        self._refresh_rate_limited_streak: dict[str, int] = {}
         persisted = runtime_state.load()
         self._persisted_profiles: dict = persisted["profiles"]
         self._current_profile_id = persisted["current_profile_id"]
@@ -261,6 +274,13 @@ class Gateway:
                 credential_refreshed = (
                     p.credential_updated_at is not None and p.credential_updated_at != rt.credential_seen
                 )
+                if credential_refreshed:
+                    # A replaced credential is a fresh start: drop any
+                    # rate-limit backoff and the given-up state, so a
+                    # re-authenticated Profile is retried immediately rather
+                    # than waiting out a window earned by the old token.
+                    self._refresh_rate_limited_streak.pop(p.id, None)
+                    self._refresh_check_not_before.pop(p.id, None)
                 if not p.enabled:
                     new_state = ProfileState.DISABLED
                 elif rt.state == ProfileState.DISABLED and p.enabled:
@@ -843,12 +863,14 @@ class Gateway:
         oauth_login.OAuthLoginError, unchanged, for a real (non-throttled)
         failure so each caller can decide how to log/react to that."""
         now = time.monotonic()
+        if self._refresh_rate_limited_streak.get(profile_id, 0) >= self._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES:
+            return None  # given up: re-authentication is the only way back
         not_before = self._refresh_check_not_before.get(profile_id)
         if not_before is not None and now < not_before:
             return None
         self._refresh_check_not_before[profile_id] = now + self._REFRESH_CHECK_COOLDOWN_SECONDS
         try:
-            return oauth_login.refresh_access_token(refresh_token)
+            tokens = oauth_login.refresh_access_token(refresh_token)
         except oauth_login.OAuthLoginError as exc:
             if exc.status_code == 429:
                 # Anthropic's own rate limiter, not a dead credential —
@@ -856,8 +878,17 @@ class Gateway:
                 # never let the window actually clear, since each attempt
                 # is itself another strike against the same limiter. Back
                 # off much further before ANY path tries this Profile again.
-                self._refresh_check_not_before[profile_id] = now + self._RATE_LIMIT_BACKOFF_SECONDS
+                streak = self._refresh_rate_limited_streak.get(profile_id, 0) + 1
+                self._refresh_rate_limited_streak[profile_id] = streak
+                wait = min(self._RATE_LIMIT_BACKOFF_SECONDS * (2 ** (streak - 1)),
+                            self._RATE_LIMIT_BACKOFF_CEILING_SECONDS)
+                self._refresh_check_not_before[profile_id] = now + wait
+                if streak >= self._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES:
+                    activity.record("error", "Automatic token refresh gave up",
+                                     meta=f"{profile_id}: rate limited {streak} times in a row — re-authenticate to recover")
             raise
+        self._refresh_rate_limited_streak.pop(profile_id, None)
+        return tokens
 
     def _maybe_refresh_credential(self, profile: Profile, stored: str) -> str:
         """Proactively refreshes an OAuth Profile's access token before it's

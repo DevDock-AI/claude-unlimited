@@ -966,3 +966,75 @@ def test_expired_usage_number_is_not_restored_after_a_restart(pool_env):
     restored = gw2.runtime_snapshot()["a"]
     assert restored.last_usage_percent is None
     assert restored.resets_at is None
+
+
+def test_rate_limited_refresh_backs_off_further_each_time(pool_env, monkeypatch):
+    """A flat retry interval never lets a persistently rate-limited endpoint
+    recover — it keeps arriving at the same rate indefinitely."""
+    import claude_unlimited.gateway as gw_mod
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+
+    def always_rate_limited(_token):
+        raise gw_mod.oauth_login.OAuthLoginError("rate limited", status_code=429)
+
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token", always_rate_limited)
+
+    waits = []
+    now = [1000.0]
+    monkeypatch.setattr(gw_mod.time, "monotonic", lambda: now[0])
+    for _ in range(4):
+        try:
+            gw._try_refresh("a", "refresh-tok")
+        except gw_mod.oauth_login.OAuthLoginError:
+            pass
+        waits.append(gw._refresh_check_not_before["a"] - now[0])
+        now[0] = gw._refresh_check_not_before["a"]  # jump to when it is allowed again
+
+    assert waits == sorted(waits), waits
+    assert waits[1] > waits[0] and waits[2] > waits[1], waits
+    assert waits[-1] <= Gateway._RATE_LIMIT_BACKOFF_CEILING_SECONDS
+
+
+def test_refresh_gives_up_after_repeated_rate_limits(pool_env, monkeypatch):
+    """Once the endpoint has refused for hours, only re-authentication helps.
+    Continuing to ask is noise against someone else's rate limiter."""
+    import claude_unlimited.gateway as gw_mod
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+
+    calls = []
+
+    def always_rate_limited(_token):
+        calls.append(1)
+        raise gw_mod.oauth_login.OAuthLoginError("rate limited", status_code=429)
+
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token", always_rate_limited)
+    now = [1000.0]
+    monkeypatch.setattr(gw_mod.time, "monotonic", lambda: now[0])
+
+    for _ in range(20):
+        try:
+            gw._try_refresh("a", "refresh-tok")
+        except gw_mod.oauth_login.OAuthLoginError:
+            pass
+        now[0] = gw._refresh_check_not_before.get("a", now[0]) + 1
+
+    assert len(calls) == Gateway._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES, len(calls)
+    assert gw._try_refresh("a", "refresh-tok") is None  # stays given up
+
+
+def test_a_successful_refresh_clears_the_rate_limit_streak(pool_env, monkeypatch):
+    import claude_unlimited.gateway as gw_mod
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+    gw._refresh_rate_limited_streak["a"] = 3
+
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token",
+                        lambda _t: gw_mod.oauth_login.LoginTokens(
+                            access_token="new", refresh_token="r2", expires_at=None))
+    assert gw._try_refresh("a", "refresh-tok").access_token == "new"
+    assert "a" not in gw._refresh_rate_limited_streak
