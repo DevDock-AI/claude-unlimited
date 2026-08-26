@@ -378,5 +378,19 @@
   "toast.update_installed": "Actualizare instalată",
   "toast.update_installed_sub": "Se repornește pentru finalizare",
   "toast.update_none": "Deja actualizat",
-  "toast.update_failed": "Actualizarea a eșuat"
+  "toast.update_failed": "Actualizarea a eșuat",
+  "modal.update.title": "Verifică actualizările",
+  "modal.update.checking": "Se caută o versiune mai nouă…",
+  "modal.update.checking_sub": "Se interoghează GitHub pentru ultima versiune",
+  "modal.update.whats_new": "Ce e nou",
+  "modal.update.close": "Închide",
+  "modal.update.up_to_date": "Ai cea mai recentă versiune",
+  "modal.update.up_to_date_sub": "Nimic de instalat",
+  "modal.update.available": "Există o versiune mai nouă",
+  "modal.update.no_releases": "Nicio versiune publicată încă",
+  "modal.update.failed": "Verificarea actualizărilor a eșuat",
+  "modal.update.installing": "Se descarcă și se instalează…",
+  "modal.update.installing_sub": "Se verifică versiunea, apoi se repornește",
+  "modal.update.installed": "Actualizare instalată",
+  "modal.update.installed_sub": "Daemonul repornește pentru finalizare"
 }

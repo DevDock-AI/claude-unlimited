@@ -2038,6 +2038,100 @@ async function refreshUpdateState() {
   } catch (e) { /* leave whatever is shown */ }
 }
 
+function closeUpdateModal() {
+  document.getElementById('updateScrim').classList.remove('open');
+}
+
+function _updateModalPhase(phase, { title, sub } = {}) {
+  document.getElementById('updateModalLoading').style.display = phase === 'loading' ? '' : 'none';
+  document.getElementById('updateModalResult').style.display = phase === 'loading' ? 'none' : '';
+  if (title) document.querySelector('#updateScrim .modal-title').textContent = title;
+  if (sub) document.getElementById('updateModalSub').textContent = sub;
+}
+
+// Check on demand: opens the modal, spins while the request is in flight, then
+// says plainly whether there is anything to install. Installing stays a
+// separate, deliberate press — the check never installs anything by itself.
+async function runUpdateCheckModal() {
+  document.getElementById('updateScrim').classList.add('open');
+  document.getElementById('updateModalError').style.display = 'none';
+  document.getElementById('updateModalInstallBtn').style.display = 'none';
+  document.getElementById('updateModalNotesWrap').style.display = 'none';
+  _updateModalPhase('loading', { title: t('modal.update.title'), sub: t('modal.update.checking') });
+
+  let state;
+  try {
+    state = await api('/api/update/check', { method: 'POST' });
+  } catch (e) {
+    _updateModalPhase('result', { title: t('modal.update.failed'), sub: '' });
+    const err = document.getElementById('updateModalError');
+    err.textContent = String(e.message || e);
+    err.style.display = '';
+    return;
+  }
+
+  renderUpdateState(state);
+  document.getElementById('updateModalInstalled').textContent = state.current_version || '—';
+
+  if (state.error) {
+    _updateModalPhase('result', { title: t('modal.update.failed'), sub: '' });
+    document.getElementById('updateModalLatestRow').style.display = 'none';
+    const err = document.getElementById('updateModalError');
+    err.textContent = state.error;
+    err.style.display = '';
+    return;
+  }
+
+  const available = state.available;
+  document.getElementById('updateModalLatestRow').style.display = available ? '' : 'none';
+  if (!available) {
+    _updateModalPhase('result', {
+      title: t('modal.update.up_to_date'), sub: t('modal.update.up_to_date_sub'),
+    });
+    return;
+  }
+
+  document.getElementById('updateModalLatest').textContent = available.version;
+  if (available.notes) {
+    document.getElementById('updateModalNotes').textContent = available.notes;
+    document.getElementById('updateModalNotesWrap').style.display = '';
+  }
+  document.getElementById('updateModalInstallBtn').style.display = '';
+  _updateModalPhase('result', { title: t('modal.update.available'), sub: '' });
+}
+
+async function runUpdateInstall() {
+  document.getElementById('updateScrim').classList.add('open');
+  document.getElementById('updateModalError').style.display = 'none';
+  document.getElementById('updateModalInstallBtn').style.display = 'none';
+  _updateModalPhase('loading', {
+    title: t('modal.update.installing'), sub: t('modal.update.installing_sub'),
+  });
+  try {
+    // force: an explicit press overrides the idle guard that holds back
+    // automatic installs during an active session.
+    const res = await api('/api/update/install', {
+      method: 'POST', body: JSON.stringify({ force: true }),
+    });
+    if (res.installed) {
+      _updateModalPhase('result', {
+        title: t('modal.update.installed'), sub: t('modal.update.installed_sub'),
+      });
+      showToast('ok', t('toast.update_installed'), t('toast.update_installed_sub'));
+    } else {
+      _updateModalPhase('result', {
+        title: t('modal.update.up_to_date'), sub: t('modal.update.up_to_date_sub'),
+      });
+    }
+  } catch (e) {
+    _updateModalPhase('result', { title: t('modal.update.failed'), sub: '' });
+    const err = document.getElementById('updateModalError');
+    err.textContent = String(e.message || e);
+    err.style.display = '';
+  }
+  await refreshUpdateState();
+}
+
 function wireUpdateButtons() {
   const checkBtn = document.getElementById('updateCheckBtn');
   const installBtn = document.getElementById('updateInstallBtn');
@@ -2061,32 +2155,16 @@ function wireUpdateButtons() {
     };
   }
 
-  checkBtn.addEventListener('click', withProgress(checkBtn, 'settings.updates.checking', async () => {
-    try {
-      renderUpdateState(await api('/api/update/check', { method: 'POST' }));
-      showToast('ok', t('toast.update_checked'));
-    } catch (e) {
-      showToast('err', t('toast.update_failed'), String(e.message || e));
-    }
-  }));
+  checkBtn.addEventListener('click', withProgress(checkBtn, 'settings.updates.checking', runUpdateCheckModal));
 
-  installBtn.addEventListener('click', withProgress(installBtn, 'settings.updates.installing', async () => {
-    try {
-      // force: an explicit click overrides the idle guard that holds back
-      // automatic installs during an active session.
-      const res = await api('/api/update/install', {
-        method: 'POST', body: JSON.stringify({ force: true }),
-      });
-      if (res.installed) {
-        showToast('ok', t('toast.update_installed'), t('toast.update_installed_sub'));
-      } else {
-        showToast('ok', t('toast.update_none'));
-      }
-      await refreshUpdateState();
-    } catch (e) {
-      showToast('err', t('toast.update_failed'), String(e.message || e));
-    }
-  }));
+  installBtn.addEventListener('click', withProgress(installBtn, 'settings.updates.installing', runUpdateInstall));
+
+  document.getElementById('updateModalClose').addEventListener('click', closeUpdateModal);
+  document.getElementById('updateModalCloseBtn').addEventListener('click', closeUpdateModal);
+  document.getElementById('updateScrim').addEventListener('click', (e) => {
+    if (e.target.id === 'updateScrim') closeUpdateModal();
+  });
+  document.getElementById('updateModalInstallBtn').addEventListener('click', runUpdateInstall);
 }
 
 async function loadSettings() {

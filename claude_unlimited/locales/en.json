@@ -378,5 +378,19 @@
   "toast.update_installed": "Update installed",
   "toast.update_installed_sub": "Restarting to finish",
   "toast.update_none": "Already up to date",
-  "toast.update_failed": "Update failed"
+  "toast.update_failed": "Update failed",
+  "modal.update.title": "Check for updates",
+  "modal.update.checking": "Looking for a newer release…",
+  "modal.update.checking_sub": "Asking GitHub for the latest release",
+  "modal.update.whats_new": "What's new",
+  "modal.update.close": "Close",
+  "modal.update.up_to_date": "You're on the latest release",
+  "modal.update.up_to_date_sub": "Nothing to install",
+  "modal.update.available": "A newer release is available",
+  "modal.update.no_releases": "No releases published yet",
+  "modal.update.failed": "Couldn't check for updates",
+  "modal.update.installing": "Downloading and installing…",
+  "modal.update.installing_sub": "Verifying the release, then restarting",
+  "modal.update.installed": "Update installed",
+  "modal.update.installed_sub": "The daemon is restarting to finish"
 }

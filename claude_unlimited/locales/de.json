@@ -378,5 +378,19 @@
   "toast.update_installed": "Update installiert",
   "toast.update_installed_sub": "Neustart zum Abschließen",
   "toast.update_none": "Bereits aktuell",
-  "toast.update_failed": "Update fehlgeschlagen"
+  "toast.update_failed": "Update fehlgeschlagen",
+  "modal.update.title": "Nach Updates suchen",
+  "modal.update.checking": "Suche nach einer neueren Version…",
+  "modal.update.checking_sub": "GitHub wird nach der neuesten Veröffentlichung gefragt",
+  "modal.update.whats_new": "Neuerungen",
+  "modal.update.close": "Schließen",
+  "modal.update.up_to_date": "Du hast die neueste Version",
+  "modal.update.up_to_date_sub": "Nichts zu installieren",
+  "modal.update.available": "Eine neuere Version ist verfügbar",
+  "modal.update.no_releases": "Noch keine Veröffentlichungen",
+  "modal.update.failed": "Suche nach Updates fehlgeschlagen",
+  "modal.update.installing": "Wird heruntergeladen und installiert…",
+  "modal.update.installing_sub": "Version wird geprüft, dann Neustart",
+  "modal.update.installed": "Update installiert",
+  "modal.update.installed_sub": "Der Daemon startet neu, um abzuschließen"
 }

@@ -378,5 +378,19 @@
   "toast.update_installed": "Actualización instalada",
   "toast.update_installed_sub": "Reiniciando para finalizar",
   "toast.update_none": "Ya está actualizado",
-  "toast.update_failed": "Error al actualizar"
+  "toast.update_failed": "Error al actualizar",
+  "modal.update.title": "Buscar actualizaciones",
+  "modal.update.checking": "Buscando una versión más reciente…",
+  "modal.update.checking_sub": "Consultando la última versión en GitHub",
+  "modal.update.whats_new": "Novedades",
+  "modal.update.close": "Cerrar",
+  "modal.update.up_to_date": "Estás en la última versión",
+  "modal.update.up_to_date_sub": "Nada que instalar",
+  "modal.update.available": "Hay una versión más reciente",
+  "modal.update.no_releases": "Aún no hay versiones publicadas",
+  "modal.update.failed": "No se pudo buscar actualizaciones",
+  "modal.update.installing": "Descargando e instalando…",
+  "modal.update.installing_sub": "Verificando la versión y reiniciando",
+  "modal.update.installed": "Actualización instalada",
+  "modal.update.installed_sub": "El daemon se está reiniciando para finalizar"
 }

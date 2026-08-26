@@ -499,6 +499,16 @@
   .divider-line { flex: 1; height: 1px; background: var(--border); }
   .error-text { color: var(--bad); font-size: var(--fs-micro); }
 
+  /* ---- update modal ---- */
+  .update-loading { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 26px 0; }
+  .update-spinner { width: 34px; height: 34px; border-radius: 50%; border: 3px solid var(--border);
+                     border-top-color: var(--accent); animation: spin 800ms linear infinite; }
+  @media (prefers-reduced-motion: reduce) { .update-spinner { animation-duration: 2.4s; } }
+  .update-notes { margin: 6px 0 0; padding: 12px 14px; max-height: 260px; overflow: auto;
+                   background: var(--bg-field); border: 1px solid var(--border); border-radius: 10px;
+                   font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-micro);
+                   color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+
   /* ---- toasts ---- */
   .toast-container { position: fixed; top: 20px; right: 20px; z-index: 100; display: flex; flex-direction: column;
                       gap: 10px; width: 360px; max-width: calc(100vw - 40px); }
@@ -1712,6 +1722,53 @@
     <div class="modal-foot">
       <div class="btn" id="cancelBtn2" data-i18n="modal.cancel">Cancel</div>
       <div class="btn primary" id="saveBtn" data-i18n="modal.add_profile.save_btn">Save profile</div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-scrim" id="updateScrim">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" data-i18n="modal.update.title">Check for updates</div>
+        <div class="modal-sub" id="updateModalSub" data-i18n="modal.update.checking">Looking for a newer release…</div>
+      </div>
+      <div class="close-btn" id="updateModalClose">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div id="updateModalLoading" class="update-loading">
+        <div class="update-spinner"></div>
+        <div class="field-sub" data-i18n="modal.update.checking_sub">Asking GitHub for the latest release</div>
+      </div>
+
+      <div id="updateModalResult" style="display:none">
+        <div class="field-row" style="padding:0;border:none;">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.updates.installed_label">Installed version</div>
+          </div>
+          <span class="mono" id="updateModalInstalled" style="font-weight:700;">—</span>
+        </div>
+        <div class="field-row" id="updateModalLatestRow" style="padding:0;border:none;">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.updates.latest_label">Latest release</div>
+          </div>
+          <span class="mono" id="updateModalLatest" style="font-weight:700;color:var(--warn);">—</span>
+        </div>
+        <div id="updateModalNotesWrap" style="display:none">
+          <div class="field-label" data-i18n="modal.update.whats_new">What's new</div>
+          <pre class="update-notes" id="updateModalNotes"></pre>
+        </div>
+        <div class="import-status err" id="updateModalError" style="display:none"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="btn" id="updateModalCloseBtn"><span data-i18n="modal.update.close">Close</span></div>
+      <div class="btn primary" id="updateModalInstallBtn" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
+        <span data-i18n="settings.updates.install_now">Download &amp; install now</span>
+      </div>
     </div>
   </div>
 </div>
