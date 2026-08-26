@@ -34,6 +34,12 @@ classifiers = [
 # Export bundles containing real credentials. No other module may import it.
 dependencies = ["cryptography>=42"]
 
+# Not a runtime dependency: the daemon still needs only the standard library
+# plus cryptography. This is what `pip install -e ".[dev]"` adds so the test
+# suite can run.
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.urls]
 Homepage = "https://github.com/DevDock-AI/claude-unlimited"
 Repository = "https://github.com/DevDock-AI/claude-unlimited"

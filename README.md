@@ -494,8 +494,12 @@ accounts' terms.
 ## Development
 
 ```bash
+python3 -m pip install -e ".[dev]"
 python3 -m pytest tests/
 ```
+
+`pytest` is the only extra the `dev` install adds — the daemon itself still
+needs nothing but the standard library and `cryptography`.
 
 No frontend build step — `claude_unlimited/static/` is plain HTML/CSS/JS.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module map, and

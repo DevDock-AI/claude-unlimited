@@ -8,12 +8,12 @@ on:
 
 jobs:
   test:
-    # The daemon's install/service backends are macOS-only-verified today
-    # (see docs/adr/0005-*.md) — the test suite itself mocks all OS-level
-    # calls, so it runs the same on any runner, but macOS is what actually
-    # matches a real user's environment for this project right now.
+    # The install and service backends are only verified on macOS today (see
+    # docs/adr/0005-*.md). The suite mocks every OS-level call so it runs the
+    # same anywhere, but macOS is what matches a real user's environment.
     runs-on: macos-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
 
@@ -25,8 +25,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the package
-        run: pip install -e .
+      # `python -m pip`, never bare `pip`: on the macOS runners a bare `pip`
+      # can resolve to a different interpreter than the one setup-python just
+      # provisioned, installing the package somewhere the test step cannot
+      # import it from.
+      - name: Install the package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Show the resolved environment
+        run: |
+          python -c "import sys; print(sys.executable); print(sys.version)"
+          python -m pytest --version
 
       - name: Run the test suite
         run: python -m pytest tests/ -v

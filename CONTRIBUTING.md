@@ -2,6 +2,8 @@
 
 Standards for working on Claude Unlimited, so features added later — including non-macOS support — land the same way every time instead of each depending on tribal knowledge.
 
+Run the suite with `python -m pip install -e ".[dev]"` then `python -m pytest tests/`. The `dev` extra adds `pytest` and nothing else.
+
 ## Ground rules
 
 - **Backend stays dependency-free, with one recorded exception.** Python standard library only — no `pip install` required to run the daemon, except `cryptography`, used exclusively by `export_import.py` for authenticated encryption of credential-containing Export bundles. If a feature seems to need a package, look for a stdlib way first; if there truly isn't one, that's a decision for a new ADR, not a quiet addition to `pyproject.toml`.
