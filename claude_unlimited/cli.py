@@ -48,6 +48,36 @@ def _probe_health(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def _running_version(host: str, port: int, timeout: float = 1.0) -> Optional[str]:
+    """The version a daemon at host:port reports, or None if none answers.
+
+    Upgrading only replaces files on disk. A daemon already running keeps
+    serving the version it started with, so "is it up?" is the wrong question
+    after an install — "is the one that is up the one just installed?" is the
+    right one."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=timeout) as resp:
+            body = json.loads(resp.read())
+            if body.get("status") == "ok":
+                return body.get("version")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ConnectionError):
+        pass
+    return None
+
+
+def _wait_for_version(host: str, port: int, expected: str, timeout: float = 20.0) -> Optional[str]:
+    """Waits for the daemon to answer on `expected`, returning whatever it
+    last reported (None if nothing answered at all)."""
+    deadline = time.time() + timeout
+    seen = None
+    while time.time() < deadline:
+        seen = _running_version(host, port, timeout=1.0)
+        if seen == expected:
+            return seen
+        time.sleep(0.3)
+    return seen
+
+
 def _banner() -> None:
     print(f"Claude Unlimited {__version__}")
     print("=" * (18 + len(__version__)))
@@ -122,7 +152,16 @@ def status() -> int:
 
 def start(port: int) -> int:
     _banner()
-    if _probe_health(LOOPBACK_HOST, port):
+    running = _running_version(LOOPBACK_HOST, port)
+    if running is not None:
+        if running != __version__:
+            # Saying "nothing more to do" here is how an upgrade quietly fails:
+            # the files on disk are new, the daemon answering is old, and
+            # nothing says so.
+            print(f"Version {running} is already running at http://{LOOPBACK_HOST}:{port}/, "
+                  f"but {__version__} is installed.")
+            print("Run `claude-unlimited restart` to serve the installed version.")
+            return 1
         print(f"Already running at http://{LOOPBACK_HOST}:{port}/ — nothing more to do.")
         print("(Open that URL for the Dashboard, or `claude-unlimited status` for details.)")
         return 0
@@ -639,12 +678,44 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
 
 def install(port: int) -> int:
     _banner()
+
+    # Whatever is already on the port has to go first, whichever shape it is.
+    # Registering the service does not touch a daemon the service manager does
+    # not own, so a detached one (install.sh's fallback, or `start` in a
+    # terminal) keeps the port, the replacement cannot bind, and the upgrade
+    # silently leaves the OLD version serving while every health check passes.
+    running = _running_version(LOOPBACK_HOST, port)
+    if running is not None and running != __version__:
+        print(f"Stopping the running daemon (version {running})…")
+    if running is not None:
+        try:
+            daemon_installer.stop()
+        except daemon_installer.DaemonInstallerError:
+            pass  # not service-managed, or not running under it
+        _stop_running_daemon(port)
+
     try:
         daemon_installer.install(port)
     except daemon_installer.DaemonInstallerError as exc:
         print(f"Install failed: {exc}", file=sys.stderr)
         return 1
-    print(f"Installed — the daemon will now start automatically on login, on port {port}.")
+
+    # Verify rather than announce. "Installed" used to be printed on the
+    # strength of the files having been written, which is exactly the claim
+    # that was wrong when an older daemon still held the port.
+    seen = _wait_for_version(LOOPBACK_HOST, port, __version__)
+    if seen == __version__:
+        print(f"Installed — the daemon will now start automatically on login, on port {port}.")
+        print(f"Running version {__version__} at http://{LOOPBACK_HOST}:{port}/")
+    elif seen is None:
+        print(f"Installed, but nothing is answering on port {port} yet.", file=sys.stderr)
+        print("Check `claude-unlimited status`, or start it with `claude-unlimited start`.", file=sys.stderr)
+        return 1
+    else:
+        print(f"Installed {__version__}, but port {port} is still served by version {seen}.", file=sys.stderr)
+        print("Something else is holding the port. Stop it, then run "
+              "`claude-unlimited restart`.", file=sys.stderr)
+        return 1
     print("Run `claude-unlimited status` to check it, or `claude-unlimited uninstall` to remove it.")
     return 0
 

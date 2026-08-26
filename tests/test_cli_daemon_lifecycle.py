@@ -4,12 +4,24 @@ import pytest
 
 import claude_unlimited.cli as cli
 import claude_unlimited.daemon_installer as daemon_installer
+from claude_unlimited import __version__
+
+
+def _serving(monkeypatch, *versions):
+    """Scripts what /health reports on successive probes; the last value
+    repeats. None means nothing is answering."""
+    seq = list(versions)
+
+    def probe(host, port, timeout=1.0):
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    monkeypatch.setattr(cli, "_running_version", probe)
 
 
 def test_start_when_already_running_is_a_friendly_noop(monkeypatch, capsys):
     # A second `claude-unlimited start` must recognize its own daemon and exit
     # cleanly, not fail to bind the port.
-    monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: True)
+    _serving(monkeypatch, __version__)
     calls = []
     monkeypatch.setattr(cli, "run_foreground", lambda **kw: calls.append(kw))
     assert cli.main(["start"]) == 0
@@ -19,7 +31,7 @@ def test_start_when_already_running_is_a_friendly_noop(monkeypatch, capsys):
 
 
 def test_start_port_in_use_by_something_else_is_a_friendly_error(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: False)
+    _serving(monkeypatch, None)
 
     def boom(**kw):
         raise OSError(errno.EADDRINUSE, "Address already in use")
@@ -31,8 +43,18 @@ def test_start_port_in_use_by_something_else_is_a_friendly_error(monkeypatch, ca
     assert "Traceback" not in err
 
 
+def test_start_refuses_to_noop_over_a_different_version(monkeypatch, capsys):
+    # The upgrade failure the user hit: files on disk are new, the daemon
+    # answering is old, and "nothing more to do" hid it.
+    _serving(monkeypatch, "0.0.1-old")
+    monkeypatch.setattr(cli, "run_foreground", lambda **kw: None)
+    assert cli.main(["start"]) == 1
+    out = capsys.readouterr().out
+    assert "0.0.1-old" in out and "restart" in out.lower()
+
+
 def test_start_reraises_unrelated_os_errors(monkeypatch):
-    monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: False)
+    _serving(monkeypatch, None)
 
     def boom(**kw):
         raise OSError(errno.EACCES, "Permission denied")
@@ -138,6 +160,7 @@ def test_status_installed_not_running(monkeypatch, capsys):
 def test_install_success(monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(daemon_installer, "install", lambda port: calls.append(port))
+    _serving(monkeypatch, None, __version__)
     assert cli.main(["install", "--port", "5000"]) == 0
     assert calls == [5000]
     assert "Installed" in capsys.readouterr().out
@@ -146,6 +169,7 @@ def test_install_success(monkeypatch, capsys):
 def test_install_default_port(monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(daemon_installer, "install", lambda port: calls.append(port))
+    _serving(monkeypatch, None, __version__)
     assert cli.main(["install"]) == 0
     assert calls == [cli.DEFAULT_PORT]
 
@@ -155,6 +179,7 @@ def test_install_failure_returns_nonzero(monkeypatch, capsys):
         raise daemon_installer.DaemonInstallerError("launchctl exploded")
 
     monkeypatch.setattr(daemon_installer, "install", boom)
+    _serving(monkeypatch, None)
     assert cli.main(["install"]) == 1
     assert "launchctl exploded" in capsys.readouterr().err
 
@@ -365,3 +390,41 @@ def test_purge_leaves_the_claude_directory_and_its_credentials_alone(monkeypatch
     assert cli.purge(assume_yes=True) == 0
     assert (claude / ".credentials.json").read_text() == "the user's own login"
     assert (claude / "projects").exists()
+
+
+def test_install_stops_a_daemon_already_holding_the_port(monkeypatch, capsys):
+    # Registering the service does not touch a detached daemon, so without an
+    # explicit stop the old process keeps the port and the new one never binds.
+    stopped = []
+    monkeypatch.setattr(daemon_installer, "install", lambda port: None)
+    monkeypatch.setattr(daemon_installer, "stop", lambda: stopped.append("service"))
+    monkeypatch.setattr(cli, "_stop_running_daemon", lambda port, **kw: stopped.append(port))
+    _serving(monkeypatch, "0.0.1-old", __version__)
+
+    assert cli.main(["install", "--port", "4317"]) == 0
+    assert "service" in stopped and 4317 in stopped
+    assert "0.0.1-old" in capsys.readouterr().out
+
+
+def test_install_reports_failure_when_an_old_version_still_serves(monkeypatch, capsys):
+    # The exact silent failure: files installed, health check passes, but the
+    # version answering is not the one just installed.
+    monkeypatch.setattr(daemon_installer, "install", lambda port: None)
+    monkeypatch.setattr(daemon_installer, "stop", lambda: None)
+    monkeypatch.setattr(cli, "_stop_running_daemon", lambda port, **kw: None)
+    monkeypatch.setattr(cli, "_wait_for_version",
+                        lambda host, port, expected, timeout=20.0: "0.0.1-old")
+    _serving(monkeypatch, "0.0.1-old")
+
+    assert cli.main(["install"]) == 1
+    err = capsys.readouterr().err
+    assert "0.0.1-old" in err and "still served" in err
+
+
+def test_install_reports_failure_when_nothing_comes_up(monkeypatch, capsys):
+    monkeypatch.setattr(daemon_installer, "install", lambda port: None)
+    monkeypatch.setattr(cli, "_wait_for_version",
+                        lambda host, port, expected, timeout=20.0: None)
+    _serving(monkeypatch, None)
+    assert cli.main(["install"]) == 1
+    assert "nothing is answering" in capsys.readouterr().err

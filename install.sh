@@ -105,9 +105,14 @@ URL="http://127.0.0.1:${PORT}/"
 # turned off in Settings, which is also where its state is visible.
 echo
 echo "Setting it to run in the background…"
-if "$CLI" install --port "$PORT" >/dev/null 2>&1; then
+# `install` stops whatever already holds the port and then verifies the daemon
+# answering is the version just installed, so its exit status is meaningful —
+# don't discard it. Upgrading over a running daemon used to report success
+# while the OLD version kept serving, because nobody checked.
+if INSTALL_OUTPUT="$("$CLI" install --port "$PORT" 2>&1)"; then
   echo "Background service: installed (starts on login)"
 else
+  echo "$INSTALL_OUTPUT" >&2
   echo "Background service: could not be installed — starting it for this session only"
   nohup "$CLI" start --port "$PORT" >/dev/null 2>&1 &
 fi
