@@ -882,7 +882,11 @@ async function loadProfiles() {
       setLiveHtml(el, `<div class="empty">${esc(t('empty.no_profiles_hint'))}</div>`);
       return;
     }
-    setLiveHtml(el, profiles.map((p) => renderProfileCard(p)).join(''));
+    // Ordered by priority, which is the order rotation actually tries them
+    // in. Rendering the API's own order left the cards sitting where they
+    // were before a reorder, showing a sequence the router does not use.
+    const ordered = profiles.slice().sort((a, b) => a.priority - b.priority);
+    setLiveHtml(el, ordered.map((p) => renderProfileCard(p)).join(''));
   } catch (e) {
     setLiveHtml(el, `<div class="empty">${esc(t('empty.profiles_load_error_prefix'))} ${esc(e.message)}</div>`);
   }
@@ -1126,7 +1130,10 @@ async function loadProfilesTable() {
       .filter(({ id, priority }) => byId.get(id)?.priority !== priority);
     await Promise.all(updates.map(({ id, priority }) =>
       api(`/api/profiles/${id}`, { method: 'PATCH', body: JSON.stringify({ priority }) })));
-    await loadProfilesTable();
+    // Both views show priority, so both are stale after a reorder — refreshing
+    // only the table left the Overview showing the previous order until
+    // something else happened to reload it.
+    await Promise.all([loadProfilesTable(), loadProfiles()]);
   });
 }
 
