@@ -12,7 +12,7 @@ def test_known_claude_models_map_to_their_confirmed_parity_target():
     # spent on reasoning output weighted by model tier (docs/adr/0007), so the
     # default session must not land on it.
     assert map_model("claude-fable-5") == OpenAIModelTarget("gpt-5.6-sol", "high")
-    assert map_model("claude-opus-5") == OpenAIModelTarget("gpt-5.6-terra", "medium")
+    assert map_model("claude-opus-5") == OpenAIModelTarget("gpt-5.6-terra", "high")
     assert map_model("claude-sonnet-5") == OpenAIModelTarget("gpt-5.6-terra", "medium")
     assert map_model("claude-haiku-4-5-20251001") == OpenAIModelTarget("gpt-5.6-luna", "low")
 
@@ -31,7 +31,7 @@ def test_unknown_model_falls_back_to_the_balanced_default():
 def test_family_prefix_fallback_for_an_unrecognized_but_familiar_id():
     # A dated id the table has no exact entry for, but which still names a
     # recognizable tier by substring.
-    assert map_model("claude-opus-4-1-20260101") == OpenAIModelTarget("gpt-5.6-terra", "medium")
+    assert map_model("claude-opus-4-1-20260101") == OpenAIModelTarget("gpt-5.6-terra", "high")
     assert map_model("claude-fable-legacy") == OpenAIModelTarget("gpt-5.6-sol", "high")
     assert map_model("claude-haiku-legacy") == OpenAIModelTarget("gpt-5.6-luna", "low")
 

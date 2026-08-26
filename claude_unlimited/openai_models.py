@@ -29,7 +29,7 @@ class OpenAIModelTarget:
 # Ordered most-capable-first — used only for the substring-match fallback below.
 _MODEL_MAP: dict[str, OpenAIModelTarget] = {
     "claude-fable-5": OpenAIModelTarget("gpt-5.6-sol", "high"),
-    "claude-opus-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
+    "claude-opus-5": OpenAIModelTarget("gpt-5.6-terra", "high"),
     "claude-sonnet-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
     "claude-haiku-4-5-20251001": OpenAIModelTarget("gpt-5.6-luna", "low"),
 }
@@ -44,7 +44,7 @@ _DEFAULT_TARGET = OpenAIModelTarget("gpt-5.6-terra", "medium")
 # _DEFAULT_TARGET.
 _FAMILY_FALLBACKS: list[tuple[str, OpenAIModelTarget]] = [
     ("claude-fable", OpenAIModelTarget("gpt-5.6-sol", "high")),
-    ("claude-opus", OpenAIModelTarget("gpt-5.6-terra", "medium")),
+    ("claude-opus", OpenAIModelTarget("gpt-5.6-terra", "high")),
     ("claude-sonnet", OpenAIModelTarget("gpt-5.6-terra", "medium")),
     ("claude-haiku", OpenAIModelTarget("gpt-5.6-luna", "low")),
 ]
