@@ -50,8 +50,13 @@ find "$INSTALL_ROOT/app" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/nu
 
 echo "Setting up an isolated environment…"
 python3 -m venv "$INSTALL_ROOT/venv"
-"$INSTALL_ROOT/venv/bin/pip" install --upgrade pip -q
-"$INSTALL_ROOT/venv/bin/pip" install "$INSTALL_ROOT/app" -q
+# --no-cache-dir: this venv is built once and never shares wheels with
+# anything else, so the cache buys nothing — and a corrupt entry in the user's
+# existing pip cache prints alarming warnings during an otherwise clean
+# install.
+PIP="$INSTALL_ROOT/venv/bin/pip"
+"$PIP" install --upgrade pip -q --no-cache-dir --disable-pip-version-check
+"$PIP" install "$INSTALL_ROOT/app" -q --no-cache-dir --disable-pip-version-check
 
 # Symlink the venv's own console_script (pyproject's [project.scripts]) so the
 # command on PATH always matches what was installed, with its dependency
