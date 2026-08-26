@@ -17,14 +17,16 @@ import http.client
 import json
 import os
 import platform
+import re
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator, Optional
 from urllib.parse import urlsplit
 
 from . import openai_credential, openai_login
 from .config import Profile
-from .openai_models import map_model
+from .openai_models import fallback_models, map_model
 from .openai_translate import ResponseTranslator, anthropic_request_to_openai
 
 CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -125,6 +127,50 @@ def _installation_id() -> str:
     return _INSTALLATION_ID_CACHE
 
 
+# A model this backend has already rejected -> the one that worked instead.
+# Learned at runtime so the cost of a retired model is one failed request per
+# daemon lifetime, not one on every request. Deliberately not persisted: a
+# model that comes back, or an account that gains access to one, should be
+# retried after a restart rather than written off permanently.
+_MODEL_SUBSTITUTIONS: dict[str, str] = {}
+_MODEL_SUBSTITUTION_LOCK = threading.Lock()
+
+# Matched against the error body, not the status code: the backend answers 400
+# for a rejected model and 400 for a malformed request alike, and retrying the
+# latter on another model would just burn a second request to fail identically.
+_MODEL_REJECTION_PATTERN = re.compile(
+    r"model[^.]{0,80}?(not supported|not found|does not exist|no longer|"
+    r"deprecat|retired|unavailable|invalid)"
+    r"|(unsupported|unknown|invalid|deprecated)[^.]{0,40}?model"
+    r"|model_not_found",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_model_rejection(status: int, body_text: str) -> bool:
+    """Whether an error response means "not this model" rather than "not this
+    request". Only these are worth retrying on a different model."""
+    if status not in (400, 403, 404, 422):
+        return False
+    return bool(_MODEL_REJECTION_PATTERN.search(body_text))
+
+
+def _substitute_model(model: str) -> str:
+    with _MODEL_SUBSTITUTION_LOCK:
+        seen = set()
+        while model in _MODEL_SUBSTITUTIONS and model not in seen:
+            seen.add(model)
+            model = _MODEL_SUBSTITUTIONS[model]
+        return model
+
+
+def _remember_substitution(rejected: str, accepted: str) -> None:
+    if rejected == accepted:
+        return
+    with _MODEL_SUBSTITUTION_LOCK:
+        _MODEL_SUBSTITUTIONS[rejected] = accepted
+
+
 def _build_headers(cred: openai_credential.StoredOpenAICredential, *, is_subscription: bool) -> dict[str, str]:
     session_id = _uuid7()
     thread_id = _uuid7()
@@ -216,40 +262,62 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         override_model=profile.codex_model,
         override_reasoning_effort=profile.codex_reasoning_effort,
     )
-    openai_body = anthropic_request_to_openai(anthropic_body, target)
-    payload = json.dumps(openai_body).encode("utf-8")
-
     if is_subscription:
         url = CHATGPT_BACKEND_URL
     else:
         base = (profile.base_url or "https://api.openai.com/v1").rstrip("/")
         url = f"{base}/responses"
-
-    headers = _build_headers(cred, is_subscription=is_subscription)
-    headers["Content-Length"] = str(len(payload))
-
     parts = urlsplit(url)
-    try:
-        conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
-        conn.request("POST", parts.path or "/", body=payload, headers=headers)
-        resp = conn.getresponse()
-    except OSError as exc:
-        raise OpenAIBridgeError(f"Could not reach {parts.hostname}: {exc}") from exc
 
-    response_headers = dict(resp.getheaders())
+    # Start from whatever this backend last accepted in place of the mapped
+    # model, then walk the ladder if that is rejected too. A Profile override
+    # is honoured as the first candidate but is not the only one: a pinned
+    # model that gets retired should degrade to a working one rather than take
+    # the Profile down with it.
+    first_choice = _substitute_model(target.model)
+    candidates = [first_choice]
+    candidates += [m for m in fallback_models(first_choice) if m not in candidates]
 
-    if resp.status >= 400:
+    resp = None
+    conn = None
+    for model in candidates:
+        attempt_target = replace(target, model=model)
+        payload = json.dumps(anthropic_request_to_openai(anthropic_body, attempt_target)).encode("utf-8")
+        headers = _build_headers(cred, is_subscription=is_subscription)
+        headers["Content-Length"] = str(len(payload))
+
+        try:
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+            conn.request("POST", parts.path or "/", body=payload, headers=headers)
+            resp = conn.getresponse()
+        except OSError as exc:
+            raise OpenAIBridgeError(f"Could not reach {parts.hostname}: {exc}") from exc
+
+        if resp.status < 400:
+            _remember_substitution(target.model, model)
+            break
+
         # An error response is never SSE, so read it whole (error bodies are
         # small) and hand it back as one Anthropic-shaped error chunk. The
         # SSE translator only understands `event: ... / data: ...` frames.
         raw = resp.read()
+        response_headers = dict(resp.getheaders())
+        status = resp.status
         conn.close()
 
-        def _error_chunks() -> Iterator[bytes]:
+        if model is not candidates[-1] and _looks_like_model_rejection(
+            status, raw.decode("utf-8", errors="replace")
+        ):
+            continue
+
+        def _error_chunks(raw: bytes = raw) -> Iterator[bytes]:
             message = raw.decode("utf-8", errors="replace")[:2000]
             yield json.dumps({"type": "error", "error": {"type": "api_error", "message": message}}).encode("utf-8")
 
-        return OpenAIBridgeResult(status=resp.status, headers=response_headers, body_chunks=_error_chunks())
+        return OpenAIBridgeResult(status=status, headers=response_headers, body_chunks=_error_chunks())
+
+    assert resp is not None and conn is not None  # candidates is never empty
+    response_headers = dict(resp.getheaders())
 
     def _translated_chunks() -> Iterator[bytes]:
         translator = ResponseTranslator()

@@ -65,6 +65,11 @@ def _subscription_profile(**overrides) -> Profile:
     return Profile(**defaults)
 
 
+def _cred() -> str:
+    return encode(StoredOpenAICredential(
+        access_token="tok-a", refresh_token=None, account_id="acct-1", id_token=None))
+
+
 def _sse_body(events: list[dict]) -> bytes:
     out = b""
     for event in events:
@@ -75,8 +80,112 @@ def _sse_body(events: list[dict]) -> bytes:
 @pytest.fixture(autouse=True)
 def reset_backoff_state():
     bridge_module._refresh_not_before.clear()
+    bridge_module._MODEL_SUBSTITUTIONS.clear()
     yield
     bridge_module._refresh_not_before.clear()
+    bridge_module._MODEL_SUBSTITUTIONS.clear()
+
+
+def _install_fake_connections(monkeypatch, responses: list[FakeHTTPResponse]) -> list:
+    """Hands out one queued response per connection, so a test can script a
+    rejection followed by a success."""
+    conns: list = []
+    queue = list(responses)
+
+    def factory(host, port, timeout=None):
+        conn = FakeHTTPSConnection(host, port, timeout)
+        conn._response = queue.pop(0)
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(bridge_module.http.client, "HTTPSConnection", factory)
+    return conns
+
+
+def _model_error(message: str, status: int = 400) -> FakeHTTPResponse:
+    return FakeHTTPResponse(status, {}, json.dumps(
+        {"error": {"type": "invalid_request_error", "message": message}}).encode())
+
+
+def _ok() -> FakeHTTPResponse:
+    return FakeHTTPResponse(200, {}, _sse_body([{"type": "response.completed", "response": {"usage": {}}}]))
+
+
+def _sent_model(conn) -> str:
+    return json.loads(conn.requests[0]["body"])["model"]
+
+
+def test_a_rejected_model_falls_back_to_the_next_one(monkeypatch):
+    conns = _install_fake_connections(monkeypatch, [
+        _model_error("The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."),
+        _ok(),
+    ])
+    body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    result = run(_subscription_profile(), _cred(), body)
+    list(result.body_chunks)
+
+    assert result.status == 200
+    assert _sent_model(conns[0]) == "gpt-5.6-sol"
+    assert _sent_model(conns[1]) == "gpt-5.6-terra"
+
+
+def test_a_working_substitution_is_reused_on_the_next_request(monkeypatch):
+    conns = _install_fake_connections(monkeypatch, [
+        _model_error("The model `gpt-5.6-sol` does not exist."), _ok(), _ok(),
+    ])
+    body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    list(run(_subscription_profile(), _cred(), body).body_chunks)
+    list(run(_subscription_profile(), _cred(), body).body_chunks)
+
+    # The third connection is the second request: it must skip the model
+    # already known to be rejected rather than pay for that failure again.
+    assert len(conns) == 3
+    assert _sent_model(conns[2]) == "gpt-5.6-terra"
+
+
+def test_a_non_model_error_is_returned_without_retrying(monkeypatch):
+    conns = _install_fake_connections(monkeypatch, [
+        _model_error("Invalid value for 'temperature': must be <= 2."),
+    ])
+    body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    result = run(_subscription_profile(), _cred(), body)
+    chunks = b"".join(result.body_chunks)
+
+    assert result.status == 400
+    assert len(conns) == 1
+    assert b"temperature" in chunks
+
+
+def test_when_every_model_is_rejected_the_last_error_is_returned(monkeypatch):
+    rejection = "model is not supported"
+    conns = _install_fake_connections(monkeypatch, [_model_error(rejection) for _ in range(3)])
+    body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    result = run(_subscription_profile(), _cred(), body)
+    chunks = b"".join(result.body_chunks)
+
+    assert result.status == 400
+    assert len(conns) == 3
+    assert b"not supported" in chunks
+
+
+def test_a_retired_profile_override_still_falls_back(monkeypatch):
+    # A pinned model that gets retired must not take the Profile down with it.
+    conns = _install_fake_connections(monkeypatch, [
+        _model_error("The model `gpt-4o-legacy` has been deprecated."), _ok(),
+    ])
+    profile = _subscription_profile(codex_model="gpt-4o-legacy")
+    body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    result = run(profile, _cred(), body)
+    list(result.body_chunks)
+
+    assert result.status == 200
+    assert _sent_model(conns[0]) == "gpt-4o-legacy"
+    assert _sent_model(conns[1]) in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 
 
 def test_run_sends_the_real_confirmed_subscription_endpoint_and_headers(monkeypatch):

@@ -1,6 +1,11 @@
 # Response chaining is not available on the Codex subscription backend
 
-Status: accepted
+Status: superseded by [0007](0007-codex-quota-is-driven-by-reasoning-not-context.md)
+
+> This ADR tested only the HTTP endpoint and concluded chaining was impossible.
+> It is wrong: the real client chains over a WebSocket, which does accept
+> `previous_response_id`. Its closing hypothesis — that quota is counted per
+> request — is also wrong. See 0007 for the measurements and the actual driver.
 
 ## Context
 

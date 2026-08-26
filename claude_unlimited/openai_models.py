@@ -81,6 +81,29 @@ _OPENAI_DISPLAY_NAMES: dict[str, str] = {
 }
 
 
+# Ordered most- to least-capable. A model id is a moving target: OpenAI
+# retires them, and the Codex subscription backend refuses some outright
+# ("The 'gpt-5.6-codex' model is not supported when using Codex with a ChatGPT
+# account"). Rather than hardcode one id per tier and fail hard when it goes
+# away, a rejected model walks down this ladder, so the pool keeps working as
+# long as any one model in it is still served.
+_MODEL_LADDER: tuple[str, ...] = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+
+
+def fallback_models(model: str) -> list[str]:
+    """Models to try, in order, after `model` was rejected.
+
+    Starts one rung below `model` so a downgrade never re-tries something more
+    capable that is likely rejected for the same reason, then wraps to the
+    rungs above so a retired mid-tier model can still reach a working one. A
+    model outside the ladder (a Profile override, or a lineup this build has
+    never heard of) falls back to the whole ladder."""
+    if model not in _MODEL_LADDER:
+        return list(_MODEL_LADDER)
+    index = _MODEL_LADDER.index(model)
+    return list(_MODEL_LADDER[index + 1:]) + list(_MODEL_LADDER[:index])
+
+
 def advertised_models() -> list[tuple[str, str]]:
     """(model_id, display_name) pairs for the Anthropic-shaped /v1/models
     listing a codex Profile answers with, newest-capability-first.
