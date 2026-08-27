@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 from . import openai_credential, openai_login
 from .config import Profile
 from .openai_models import fallback_models, map_model
-from .openai_translate import ResponseTranslator, anthropic_request_to_openai
+from . import wire_formats
 
 CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
 API_KEY_BACKEND_URL = "https://api.openai.com/v1/responses"
@@ -155,6 +155,18 @@ def _looks_like_model_rejection(status: int, body_text: str) -> bool:
     return bool(_MODEL_REJECTION_PATTERN.search(body_text))
 
 
+def forget_model_substitutions() -> None:
+    """Drops everything learned about rejected models.
+
+    Called when the parity mapping changes: a model rejected once would
+    otherwise be substituted for the rest of this daemon's life, so a user who
+    deliberately selects that model in Settings would silently keep getting the
+    fallback with no feedback — the exact "I set it and nothing happened"
+    failure the setting exists to avoid."""
+    with _MODEL_SUBSTITUTION_LOCK:
+        _MODEL_SUBSTITUTIONS.clear()
+
+
 def _substitute_model(model: str) -> str:
     with _MODEL_SUBSTITUTION_LOCK:
         seen = set()
@@ -198,12 +210,42 @@ def _refresh_if_needed(profile: Profile, cred: openai_credential.StoredOpenAICre
     the request itself is what drives AUTH_INVALID."""
     if not cred.refresh_token or not openai_credential.is_expiring_soon(cred.access_token):
         return cred
+    return refresh_now(profile.id, cred) or cred
 
+
+def refresh_attempt_due(profile_id: str) -> bool:
+    """Whether refresh_now() could do anything for this Profile right now.
+
+    The counterpart of gateway._refresh_attempt_due, and for the same reason:
+    the sync-driven recovery path would otherwise read this Profile's
+    credential out of the keychain — a subprocess on macOS — on every poll
+    tick just to find out it is still inside the backoff window."""
+    not_before = _refresh_not_before.get(profile_id)
+    return not_before is None or time.monotonic() >= not_before
+
+
+def refresh_now(profile_id: str,
+                cred: openai_credential.StoredOpenAICredential
+                ) -> Optional[openai_credential.StoredOpenAICredential]:
+    """The ONE place that calls openai_login.refresh_access_token.
+
+    Shared by _refresh_if_needed (the per-request path, for whichever Profile
+    was just chosen) and gateway.py's sync-driven recovery (which covers idle
+    and AUTH_INVALID Profiles a request never reaches) specifically so the two
+    share ONE per-Profile backoff clock rather than two independent ones —
+    the same reasoning as gateway._try_refresh on the Anthropic side. With
+    separate clocks, one path takes a 429 and the other retries the same
+    account moments later, unaware, and each attempt is itself another strike
+    against the limiter.
+
+    Returns None both when still inside the backoff window and when the
+    refresh genuinely failed; the caller keeps using whatever it had.
+    """
     now = time.monotonic()
-    not_before = _refresh_not_before.get(profile.id)
+    not_before = _refresh_not_before.get(profile_id)
     if not_before is not None and now < not_before:
-        return cred  # still inside the backoff window from a recent failed attempt
-    _refresh_not_before[profile.id] = now + _REFRESH_CHECK_COOLDOWN_SECONDS
+        return None  # still inside the backoff window from a recent failed attempt
+    _refresh_not_before[profile_id] = now + _REFRESH_CHECK_COOLDOWN_SECONDS
 
     try:
         refreshed = openai_login.refresh_access_token(cred.refresh_token)
@@ -211,8 +253,8 @@ def _refresh_if_needed(profile: Profile, cred: openai_credential.StoredOpenAICre
         if exc.status_code == 429:
             # A rate limit, not a dead refresh_token: back off far longer
             # than the normal cooldown.
-            _refresh_not_before[profile.id] = now + _RATE_LIMIT_BACKOFF_SECONDS
-        return cred
+            _refresh_not_before[profile_id] = now + _RATE_LIMIT_BACKOFF_SECONDS
+        return None
     new_cred = openai_credential.StoredOpenAICredential(
         access_token=refreshed.access_token,
         refresh_token=refreshed.refresh_token or cred.refresh_token,
@@ -225,14 +267,14 @@ def _refresh_if_needed(profile: Profile, cred: openai_credential.StoredOpenAICre
         # through oauth_credential.py's Anthropic-specific blob shape, which
         # would wrap this already-encoded JSON string inside another one and
         # break every future decode.
-        profile_repo.update_credential_raw(profile.id, openai_credential.encode(new_cred))
+        profile_repo.update_credential_raw(profile_id, openai_credential.encode(new_cred))
     except Exception:
         pass  # the refreshed credential still serves this request even if persisting failed
     return new_cred
 
 
 def run(profile: Profile, stored_credential: str, body: bytes,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS) -> OpenAIBridgeResult:
+        timeout: float = DEFAULT_TIMEOUT_SECONDS, parity: Optional[dict] = None) -> OpenAIBridgeResult:
     """Runs one Claude Code request through a codex-kind Profile: decode the
     credential, maybe refresh it, translate the Anthropic request body, make
     the HTTPS call, and return a lazily-translated body_chunks generator of
@@ -261,12 +303,14 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         anthropic_body.get("model"),
         override_model=profile.codex_model,
         override_reasoning_effort=profile.codex_reasoning_effort,
+        parity=parity,
     )
+    fmt = wire_formats.get(getattr(profile, "wire_format", None))
     if is_subscription:
         url = CHATGPT_BACKEND_URL
     else:
         base = (profile.base_url or "https://api.openai.com/v1").rstrip("/")
-        url = f"{base}/responses"
+        url = f"{base}{fmt.endpoint_path}"
     parts = urlsplit(url)
 
     # Start from whatever this backend last accepted in place of the mapped
@@ -274,15 +318,23 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     # is honoured as the first candidate but is not the only one: a pinned
     # model that gets retired should degrade to a working one rather than take
     # the Profile down with it.
-    first_choice = _substitute_model(target.model)
+    # Gated with the ladder, not before it: the memo is a process-global dict
+    # keyed by model name alone, so a substitution learned against the Codex
+    # backend would otherwise be applied to a same-named model on a completely
+    # different server.
+    first_choice = _substitute_model(target.model) if fmt.uses_model_ladder else target.model
     candidates = [first_choice]
-    candidates += [m for m in fallback_models(first_choice) if m not in candidates]
+    if fmt.uses_model_ladder:
+        # Scoped to formats served by the Codex backend, whose lineup the
+        # ladder describes. A local server serves arbitrary model names, so
+        # substituting a Codex model for a rejected one would be nonsense.
+        candidates += [m for m in fallback_models(first_choice) if m not in candidates]
 
     resp = None
     conn = None
     for model in candidates:
         attempt_target = replace(target, model=model)
-        payload = json.dumps(anthropic_request_to_openai(anthropic_body, attempt_target)).encode("utf-8")
+        payload = json.dumps(fmt.to_provider(anthropic_body, attempt_target)).encode("utf-8")
         headers = _build_headers(cred, is_subscription=is_subscription)
         headers["Content-Length"] = str(len(payload))
 
@@ -320,7 +372,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     response_headers = dict(resp.getheaders())
 
     def _translated_chunks() -> Iterator[bytes]:
-        translator = ResponseTranslator()
+        translator = fmt.response_stream()
         buffer = b""
         try:
             while True:

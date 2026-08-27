@@ -38,7 +38,7 @@ def _codex_profile(**overrides) -> Profile:
 def test_successful_codex_request_returns_200_and_sets_current_profile(pool_env, monkeypatch):
     save_pool(Pool(profiles=[_codex_profile()]))
 
-    def fake_run(profile, credential, body, timeout=120):
+    def fake_run(profile, credential, body, timeout=120, parity=None):
         assert credential == "tok-c"
         return OpenAIBridgeResult(status=200, headers={"content-type": "text/event-stream"},
                                    body_chunks=iter([b"event: message_stop\ndata: {}\n\n"]))
@@ -59,7 +59,7 @@ def test_success_response_never_leaks_raw_openai_headers_to_the_client(pool_env,
     # the client can see it is not talking to Anthropic.
     save_pool(Pool(profiles=[_codex_profile()]))
 
-    def fake_run(profile, credential, body, timeout=120):
+    def fake_run(profile, credential, body, timeout=120, parity=None):
         return OpenAIBridgeResult(
             status=200,
             headers={"Server": "cloudflare", "CF-RAY": "abcd1234", "x-codex-plan-type": "plus",
@@ -81,7 +81,7 @@ def test_success_response_never_leaks_raw_openai_headers_to_the_client(pool_env,
 def test_error_response_headers_are_json_not_event_stream(pool_env, monkeypatch):
     save_pool(Pool(profiles=[_codex_profile()]))
 
-    def fake_run(profile, credential, body, timeout=120):
+    def fake_run(profile, credential, body, timeout=120, parity=None):
         return OpenAIBridgeResult(status=401, headers={"Server": "cloudflare"},
                                    body_chunks=iter([b'{"error":"bad token"}']))
 
@@ -191,7 +191,7 @@ def test_auth_invalid_codex_profile_rotates_to_next_eligible_profile(pool_env, m
         Profile(id="a", name="A", kind="oauth", priority=2, automatic=True, enabled=True),
     ]))
 
-    def fake_run(profile, credential, body, timeout=120):
+    def fake_run(profile, credential, body, timeout=120, parity=None):
         return OpenAIBridgeResult(status=401, headers={}, body_chunks=iter([b'{"error":"bad token"}']))
 
     monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
@@ -229,7 +229,7 @@ def test_openai_bridge_connection_failure_rotates_to_next_profile(pool_env, monk
         Profile(id="a", name="A", kind="oauth", priority=2, automatic=True, enabled=True),
     ]))
 
-    def fake_run(profile, credential, body, timeout=120):
+    def fake_run(profile, credential, body, timeout=120, parity=None):
         raise OpenAIBridgeError("could not reach chatgpt.com")
 
     monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
@@ -253,7 +253,7 @@ def test_openai_bridge_connection_failure_rotates_to_next_profile(pool_env, monk
 def test_pinned_codex_profile_that_fails_returns_error_not_rotate(pool_env, monkeypatch):
     save_pool(Pool(profiles=[_codex_profile()]))
 
-    def fake_run(profile, credential, body, timeout=120):
+    def fake_run(profile, credential, body, timeout=120, parity=None):
         raise OpenAIBridgeError("network down")
 
     monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
