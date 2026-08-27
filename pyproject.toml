@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-unlimited"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local daemon that pools Claude Pro/Max subscriptions, Anthropic API keys, and ChatGPT/Codex accounts behind one proxy, with a web Dashboard"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,6 +48,13 @@ Funding = "https://ko-fi.com/devdock"
 
 [project.scripts]
 claude-unlimited = "claude_unlimited.cli:main"
+
+[tool.setuptools.dynamic]
+# Read from claude_unlimited/__init__.py rather than restated here. The two
+# had already drifted — this said 0.1.0 while the package said 1.1.8, so a
+# `pip install .` recorded the wrong version and nothing caught it: CI only
+# compares the git tag against __version__.
+version = { attr = "claude_unlimited.__version__" }
 
 [tool.setuptools]
 packages = ["claude_unlimited", "claude_unlimited.secret_store", "claude_unlimited.daemon_installer"]
