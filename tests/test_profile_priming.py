@@ -101,6 +101,28 @@ def test_priming_skips_a_disabled_profile(monkeypatch):
     assert called == []  # never spend a request on an account that is switched off
 
 
+def test_enabling_a_disabled_profile_that_is_automatic_triggers_a_refresh():
+    # The reported bug: a deactivated Profile had auto-rotation switched on and
+    # nothing was fetched, because priming refuses to ping a disabled Profile
+    # and enabling it later did not re-trigger.
+    assert daemon._should_prime_after_update(
+        _oauth_profile(enabled=False, automatic=True),
+        _oauth_profile(enabled=True, automatic=True)) is True
+
+
+def test_automating_an_enabled_profile_triggers_a_refresh():
+    assert daemon._should_prime_after_update(
+        _oauth_profile(enabled=True, automatic=False),
+        _oauth_profile(enabled=True, automatic=True)) is True
+
+
+def test_automating_a_disabled_profile_does_not_ping_it():
+    # Still not a rotation candidate, and priming would refuse anyway.
+    assert daemon._should_prime_after_update(
+        _oauth_profile(enabled=False, automatic=False),
+        _oauth_profile(enabled=False, automatic=True)) is False
+
+
 def test_turning_on_auto_rotation_triggers_a_refresh():
     # Becoming a rotation candidate is the point where usage starts deciding
     # routing, and the Profile may never have served a request.
@@ -124,17 +146,14 @@ def test_an_unrelated_edit_does_not_ping():
         _oauth_profile(automatic=False, name="b")) is False
 
 
-def test_a_failed_probe_never_marks_a_profile_auth_invalid(monkeypatch):
-    # Pressing "Test connection" once marked a healthy account "needs re-auth":
-    # the probe sent a mis-resolved credential, got a 401, and the recording
-    # applied it. A probe may only improve what is known about a Profile.
-    observed = []
-    monkeypatch.setattr(daemon._gateway, "_observe",
-                        lambda pid, obs, now: observed.append(obs))
-    monkeypatch.setattr(daemon._gateway, "_persist", lambda: None)
-
-    daemon._record_ping(_oauth_profile(), {"ok": False, "status": 401, "headers": {}})
-    assert observed == []
+# NOTE: an earlier version of this file asserted that a 401 from a probe was
+# ALWAYS discarded. That was the wrong fix for the right problem: the probe was
+# mis-resolving oauth credentials (sending a JSON blob as the bearer token) and
+# manufacturing false 401s, so suppressing the result hid the symptom. The
+# resolution bug is fixed and covered by tests/test_connection_test_credentials.py
+# — which is where that protection actually lives. Suppressing AuthInvalid here
+# only hid genuinely dead credentials from the Dashboard, which is what the user
+# hit: "test connection says re-auth needed, but the status never changes".
 
 
 def test_a_rate_limited_probe_is_also_discarded(monkeypatch):
@@ -144,4 +163,32 @@ def test_a_rate_limited_probe_is_also_discarded(monkeypatch):
     monkeypatch.setattr(daemon._gateway, "_persist", lambda: None)
 
     daemon._record_ping(_oauth_profile(), {"ok": False, "status": 429, "headers": {}})
+    assert observed == []
+
+
+def test_a_genuine_auth_failure_is_recorded(monkeypatch):
+    # The user-reported bug: an expired account probed via Test connection or
+    # Fetch info returned 401, but the Profile stayed "healthy" because the
+    # probe discarded everything that was not a usage reading.
+    from claude_unlimited.observation import AuthInvalid
+    observed = []
+    monkeypatch.setattr(daemon._gateway, "_observe",
+                        lambda pid, obs, now: observed.append(obs))
+    monkeypatch.setattr(daemon._gateway, "_persist", lambda: None)
+
+    daemon._record_ping(_oauth_profile(), {"ok": False, "status": 401, "headers": {}})
+    assert len(observed) == 1 and isinstance(observed[0], AuthInvalid)
+
+
+def test_a_transient_failure_is_still_discarded(monkeypatch):
+    # A 5xx or a short rate-limit says something about this one small request
+    # or about the provider right now — not about the account. One probe is
+    # weak evidence, and acting on it would drop a healthy account.
+    observed = []
+    monkeypatch.setattr(daemon._gateway, "_observe",
+                        lambda pid, obs, now: observed.append(obs))
+    monkeypatch.setattr(daemon._gateway, "_persist", lambda: None)
+
+    for status in (429, 500, 503, 418):
+        daemon._record_ping(_oauth_profile(), {"ok": False, "status": status, "headers": {}})
     assert observed == []

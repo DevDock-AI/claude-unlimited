@@ -19,6 +19,7 @@ underneath it.
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -26,7 +27,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Callable, Iterator, Optional
 
-from . import activity, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_tracking
+from . import activity, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_tracking
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, ProviderUnavailable, QuotaExhausted, Unknown, UsageSnapshot, classify
@@ -36,6 +37,23 @@ from .upstream import UpstreamResponse
 from .upstream import send as real_send
 
 MAX_ROTATION_ATTEMPTS = 4  # bounded — never loop the whole pool forever on a bad run
+
+
+def _client_label(headers: dict) -> str:
+    """A short name for whoever sent this request, for the Activity log.
+
+    Exists because "is the desktop app actually routed through the pool?" was
+    only answerable by correlating timestamps by hand. The Claude Code CLI and
+    the desktop app both identify themselves in User-Agent; anything else is
+    reported as-is, truncated."""
+    ua = ""
+    for key, value in (headers or {}).items():
+        if key.lower() == "user-agent":
+            ua = str(value)
+            break
+    if not ua:
+        return "unknown"
+    return ua[:60]
 
 
 def _filter_openai_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -363,11 +381,14 @@ class Gateway:
                     # raising token_threshold above the current lifetime
                     # usage recovers it immediately.
                     new_state = ProfileState.ELIGIBLE
-                elif self._maybe_check_oauth_credential(p, rt) == ProfileState.ELIGIBLE:
-                    # An AUTH_INVALID OAuth Profile just self-recovered via
-                    # its refresh_token — see that method's docstring. For
-                    # every other state this call is either a no-op (not
-                    # oauth, not due for a check yet) or a proactive refresh
+                elif (self._maybe_check_oauth_credential(p, rt) == ProfileState.ELIGIBLE
+                        or self._maybe_check_codex_credential(p, rt) == ProfileState.ELIGIBLE):
+                    # An AUTH_INVALID Profile just self-recovered via its
+                    # refresh_token — see those methods' docstrings. Both
+                    # kinds that HAVE a refresh token are covered; checking
+                    # only one of them is what stranded codex accounts. For
+                    # every other state each call is either a no-op (wrong
+                    # kind, not due for a check yet) or a proactive refresh
                     # with no state change (still ELIGIBLE, just less close
                     # to actually expiring now).
                     new_state = ProfileState.ELIGIBLE
@@ -458,12 +479,14 @@ class Gateway:
             if decision.profile_id is None or decision.profile_id in attempted:
                 if forced_profile_id is not None:
                     activity.record("error", "Pinned Profile unavailable — request rejected",
-                                     meta=f"{forced_profile_id}: {decision.reason}")
+                                     meta=f"{forced_profile_id}: {decision.reason}, "
+                                          f"client={_client_label(headers)}")
                     return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
                                           error=decision.reason)
                 if previous_profile_id is not None:
                     activity.record("error", "No eligible Profile available — request rejected",
-                                     meta=f"last active was {previous_profile_id}")
+                                     meta=f"last active was {previous_profile_id}, "
+                                          f"client={_client_label(headers)}")
                     notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
                                                       "No eligible Profile is available — a request was rejected.",
                                                       pool.settings)
@@ -479,14 +502,25 @@ class Gateway:
             # else falls through and relays upstream exactly as before, so
             # a Claude Profile keeps serving Anthropic's own live list.
             if method == "GET" and path.startswith("/v1/models"):
-                listing = connectors.models_listing(profile.kind)
+                listing = connectors.models_listing(profile.kind, pool.settings.model_parity)
                 if listing is not None:
                     return self._models_listing_response(profile, path, listing)
 
             try:
                 credential = secret_store.get_token(profile.id)
             except Exception:
-                self._observe(profile.id, QuotaExhausted(resets_at=None), now)  # treat as unusable, try next
+                # NOT QuotaExhausted, which this used to report. A credential
+                # store that will not answer is transient — a locked Keychain,
+                # a daemon started before first unlock — and says nothing about
+                # this account's quota. QuotaExhausted(resets_at=None) has no
+                # deadline, and recover_expired_cooldowns() only recovers an
+                # EXHAUSTED Profile that HAS one, so a Keychain locked for ten
+                # seconds took a perfectly healthy account out of rotation
+                # until the next daemon restart, showing "exhausted" as the
+                # reason. ProviderUnavailable cools it down for a bounded
+                # time and lets it come back on its own.
+                with self._lock:
+                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
                 continue
 
             if profile.kind == "codex":
@@ -523,7 +557,16 @@ class Gateway:
 
             try:
                 resp: UpstreamResponse = self._transport(upstream_req)
-            except OSError:
+            except (OSError, http.client.HTTPException):
+                # http.client.HTTPException is NOT an OSError, so catching
+                # only OSError missed a whole real class of transport failure:
+                # BadStatusLine and IncompleteRead from a proxy or middlebox
+                # returning a malformed response. Those escaped handle()
+                # entirely — the client got a dropped connection with no HTTP
+                # status, and the Profile's in-flight slot leaked, which pins
+                # "Used now" on forever and wedges the idle check the updater
+                # waits for.
+                #
                 # Real network failure reaching this Profile's upstream
                 # (timeout, DNS, connection refused, TLS) — not a quota
                 # problem. Same handling as a 503/529 ProviderUnavailable
@@ -531,9 +574,14 @@ class Gateway:
                 # Previously unhandled here, this could crash the request
                 # thread with no HTTP response at all (daemon.py's proxy
                 # handler has no guard around Gateway.handle() either).
+                # One lock for both: _observe read-modify-writes self._runtime,
+                # so doing it unlocked let a concurrent request's completed
+                # observation be overwritten by this thread's stale snapshot —
+                # silently reviving a Profile another thread had just learned
+                # was out of quota.
                 with self._lock:
                     self._mark_profile_idle(profile.id)
-                self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
                 if forced_profile_id is not None:
                     # No other Profile to fall back to when pinned — fail
                     # the request clearly instead of a pointless immediate
@@ -545,6 +593,13 @@ class Gateway:
                 activity.record("error", f"{profile.name} — could not reach upstream",
                                  meta="network error, rotating to next eligible profile")
                 continue
+            except BaseException:
+                # Anything else is a bug, and should surface as one — but not
+                # while silently leaking this Profile's in-flight slot, which
+                # nothing else would ever clear.
+                with self._lock:
+                    self._mark_profile_idle(profile.id)
+                raise
 
             observation = classify(resp.status, filter_response_headers(resp.headers), now)
 
@@ -675,6 +730,15 @@ class Gateway:
         stays AUTH_INVALID; this never fakes a recovery)."""
         if p.kind != "oauth" or rt.state == ProfileState.DISABLED:
             return None
+        if not self._refresh_attempt_due(p.id):
+            # Checked BEFORE the secret_store read, not after. The read forks
+            # the `security` CLI on macOS, and this method runs for every
+            # oauth Profile on every _sync_snapshot — i.e. every ~1s Dashboard
+            # poll — while the gateway lock every request also needs is held.
+            # The throttle used to live only inside _try_refresh, so it gated
+            # the network call but not the subprocess, which is exactly what
+            # this field's own docstring says must not happen.
+            return None
         try:
             stored = secret_store.get_token(p.id)
         except Exception:
@@ -713,6 +777,55 @@ class Gateway:
             return ProfileState.ELIGIBLE
         return None
 
+    def _maybe_check_codex_credential(self, p: Profile, rt: ProfileRuntime) -> Optional[ProfileState]:
+        """The codex-kind counterpart of _maybe_check_oauth_credential.
+
+        It exists because the oauth version starts `if p.kind != "oauth"`, so
+        for a while a codex Profile had NO route out of AUTH_INVALID at all:
+        choose() never picks an AUTH_INVALID Profile, the per-request refresh
+        in openai_bridge only ever runs for a Profile that WAS picked, and
+        AUTH_INVALID is one of the few states restored across a daemon
+        restart. One transient 401 stranded an account holding a perfectly
+        good refresh_token until someone re-authenticated it by hand — while
+        the identical situation on an oauth Profile healed itself. The rule
+        this broke is that a behaviour verified on one Profile kind is
+        verified on none.
+
+        Deliberately delegates to openai_bridge.refresh_now() rather than
+        calling openai_login itself, so this path and the per-request path
+        share one backoff clock — see that function's docstring."""
+        if p.kind != "codex" or rt.state == ProfileState.DISABLED:
+            return None
+        if p.auth_mode != "chatgpt_subscription":
+            return None  # a raw OpenAI API key has no refresh token to try
+        if not openai_bridge.refresh_attempt_due(p.id):
+            return None  # before the keychain read, same reasoning as above
+        try:
+            cred = openai_credential.decode(secret_store.get_token(p.id))
+        except Exception:
+            return None
+        if not cred.refresh_token:
+            return None
+        was_auth_invalid = rt.state == ProfileState.AUTH_INVALID
+        # Same asymmetry as the oauth path: an AUTH_INVALID access token has
+        # already proved itself dead via a real 401, so it is worth trying the
+        # refresh_token regardless of what its stored expiry claims.
+        if not was_auth_invalid and not openai_credential.is_expiring_soon(cred.access_token):
+            return None
+        try:
+            refreshed = openai_bridge.refresh_now(p.id, cred)
+        except Exception:
+            refreshed = None
+        if refreshed is None:
+            # Throttled, or a genuinely dead refresh_token. Either way this
+            # never fakes a recovery — a revoked grant correctly stays
+            # AUTH_INVALID until the person re-authenticates.
+            return None
+        if was_auth_invalid:
+            activity.record("rotation", f"{p.name} — token refreshed automatically, back online")
+            return ProfileState.ELIGIBLE
+        return None
+
     def _handle_codex(self, profile: Profile, credential: str, method: str, path: str, headers: dict,
                        body: bytes, now: datetime, forced_profile_id: Optional[str],
                        previous_profile_id: Optional[str], pool: Pool) -> Optional["GatewayResult"]:
@@ -738,11 +851,12 @@ class Gateway:
             self._in_flight.add(profile.id)
 
         try:
-            result = openai_bridge.run(profile, credential, body)
+            result = openai_bridge.run(profile, credential, body,
+                                        parity=pool.settings.model_parity)
         except openai_bridge.OpenAIBridgeError as exc:
-            with self._lock:
+            with self._lock:  # same atomicity reasoning as the Anthropic path
                 self._mark_profile_idle(profile.id)
-            self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
             if forced_profile_id is not None:
                 activity.record("error", f"{profile.name} — could not reach OpenAI",
                                  meta=f"pinned profile, not rotating ({exc})")
@@ -751,6 +865,13 @@ class Gateway:
             activity.record("error", f"{profile.name} — could not reach OpenAI",
                              meta=f"network error, rotating to next eligible profile ({exc})")
             return None
+        except BaseException:
+            # Same reasoning as the Anthropic path: an unexpected failure must
+            # still surface, but not while leaking this Profile's in-flight
+            # slot, which nothing else clears.
+            with self._lock:
+                self._mark_profile_idle(profile.id)
+            raise
 
         observation = openai_observation.classify(
             result.status, _filter_openai_headers(result.headers), now)
@@ -897,6 +1018,20 @@ class Gateway:
         payload = b'{"type":"error","error":{"type":"not_found_error","message":"Not supported for a codex Profile."}}'
         return GatewayResult(status=404, headers={"content-type": "application/json"},
                               body_chunks=iter([payload]), profile_id=profile.id)
+
+    def _refresh_attempt_due(self, profile_id: str) -> bool:
+        """Whether a refresh attempt for this Profile could do anything right
+        now — the same conditions _try_refresh checks before acting.
+
+        Exists so callers can skip the expensive preamble (a keychain read per
+        Profile per sync tick) rather than discovering the answer after paying
+        for it. _try_refresh still re-checks, since it is what sets the clock
+        and is reachable by other paths; this is a cheap pre-filter, never the
+        authority."""
+        if self._refresh_rate_limited_streak.get(profile_id, 0) >= self._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES:
+            return False
+        not_before = self._refresh_check_not_before.get(profile_id)
+        return not_before is None or time.monotonic() >= not_before
 
     def _try_refresh(self, profile_id: str, refresh_token: str) -> Optional["oauth_login.LoginTokens"]:
         """The ONE place that actually calls oauth_login.refresh_access_token

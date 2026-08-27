@@ -1108,3 +1108,193 @@ def test_is_idle_reflects_real_usage():
     assert gw.seconds_since_last_activity() < 5
     gw._in_flight.add("a")
     assert gw.seconds_since_last_activity() == 0.0
+
+
+# --- a credential store that will not answer is transient, not "exhausted" ---
+
+
+def test_a_keychain_failure_cools_the_profile_down_instead_of_exhausting_it(pool_env, monkeypatch):
+    """A locked Keychain says nothing about an account's quota.
+
+    This used to report QuotaExhausted(resets_at=None), and
+    recover_expired_cooldowns() only recovers an EXHAUSTED Profile that HAS a
+    reset time — so a Keychain locked for a few seconds removed a healthy
+    account from rotation until the next daemon restart, labelled "exhausted"
+    on the Dashboard."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
+    ]))
+
+    class LockedForA:
+        def get_token(self, profile_id):
+            if profile_id == "a":
+                raise RuntimeError("User interaction is not allowed (keychain locked)")
+            return "tok-b"
+
+    monkeypatch.setattr(gateway_module, "secret_store", LockedForA())
+    gw = Gateway(transport=lambda req: fake_response(
+        200, {"anthropic-ratelimit-unified-5h-utilization": "0.1",
+              "anthropic-ratelimit-unified-5h-reset": "1787191800"}))
+
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+    assert result.status == 200 and result.profile_id == "b"  # rotated past it
+
+    runtime = gw.runtime_snapshot()["a"]
+    assert runtime.state == ProfileState.COOLDOWN
+    # The property that matters: a deadline exists, so it comes back by itself.
+    assert runtime.cooldown_until is not None
+    assert runtime.state != ProfileState.EXHAUSTED
+
+
+# --- a codex account must be able to self-heal, exactly like an oauth one ---
+
+
+def _codex_pool():
+    save_pool(Pool(profiles=[Profile(
+        id="a", name="Codex", kind="codex", auth_mode="chatgpt_subscription",
+        automatic=True, enabled=True)]))
+
+
+def test_an_auth_invalid_codex_profile_recovers_via_its_refresh_token(pool_env, monkeypatch):
+    """choose() never picks an AUTH_INVALID Profile, and the per-request
+    refresh only runs for a Profile that was picked — so without a sync-driven
+    recovery a codex account was stranded until a manual re-auth, while the
+    identical oauth case healed itself. AUTH_INVALID also survives a restart,
+    so "restart the daemon" was not a way out either."""
+    import claude_unlimited.openai_credential as openai_credential
+
+    _codex_pool()
+    stored = openai_credential.encode(openai_credential.StoredOpenAICredential(
+        access_token="dead", refresh_token="ref-1", account_id="acct-1", id_token=None))
+    monkeypatch.setattr(gateway_module, "secret_store", FakeSecretStore({"a": stored}))
+    # Patched before anything can call it: the real one reaches OpenAI.
+    calls = []
+    fresh = openai_credential.StoredOpenAICredential(
+        access_token="alive", refresh_token="ref-2", account_id="acct-1", id_token=None)
+    monkeypatch.setattr(gateway_module.openai_bridge, "refresh_now",
+                        lambda profile_id, cred: calls.append(profile_id) or fresh)
+
+    gw = Gateway(transport=lambda req: fake_response(200))
+    gw.runtime_snapshot()  # populate _runtime before observing into it
+    gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert gw._runtime["a"].state == ProfileState.AUTH_INVALID
+
+    assert gw.runtime_snapshot()["a"].state == ProfileState.ELIGIBLE
+    assert calls == ["a"], "the refresh was never attempted for a codex profile"
+
+
+def test_a_codex_profile_whose_refresh_token_is_dead_stays_auth_invalid(pool_env, monkeypatch):
+    """Recovery must never be faked: a revoked grant still needs a re-auth."""
+    import claude_unlimited.openai_credential as openai_credential
+
+    _codex_pool()
+    stored = openai_credential.encode(openai_credential.StoredOpenAICredential(
+        access_token="dead", refresh_token="revoked", account_id="acct-1", id_token=None))
+    monkeypatch.setattr(gateway_module, "secret_store", FakeSecretStore({"a": stored}))
+    monkeypatch.setattr(gateway_module.openai_bridge, "refresh_now",
+                        lambda profile_id, cred: None)
+
+    gw = Gateway(transport=lambda req: fake_response(200))
+    gw.runtime_snapshot()  # populate _runtime before observing into it
+    gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert gw.runtime_snapshot()["a"].state == ProfileState.AUTH_INVALID
+
+
+def test_a_codex_api_key_profile_is_left_alone(pool_env, monkeypatch):
+    """A raw OpenAI API key has no refresh token; probing one would be a
+    pointless keychain read on every sync tick."""
+    save_pool(Pool(profiles=[Profile(
+        id="a", name="Key", kind="codex", auth_mode="api_key",
+        automatic=True, enabled=True)]))
+    monkeypatch.setattr(gateway_module, "secret_store", FakeSecretStore({"a": "sk-proj-x"}))
+    monkeypatch.setattr(gateway_module.openai_bridge, "refresh_now",
+                        lambda profile_id, cred: pytest.fail("refreshed an API-key profile"))
+
+    gw = Gateway(transport=lambda req: fake_response(200))
+    gw.runtime_snapshot()  # populate _runtime before observing into it
+    gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert gw.runtime_snapshot()["a"].state == ProfileState.AUTH_INVALID
+
+
+# --- transport failures that are not OSError -------------------------------
+
+
+def test_a_malformed_upstream_response_rotates_instead_of_crashing(pool_env):
+    """http.client.HTTPException is NOT an OSError. Catching only OSError let
+    BadStatusLine/IncompleteRead — a proxy or middlebox returning garbage —
+    escape handle() entirely: the client got a dropped connection with no HTTP
+    status at all, and the Profile's in-flight slot leaked forever."""
+    import http.client
+
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
+    ]))
+
+    seen = []
+
+    def transport(req):
+        seen.append(req.headers.get("Authorization"))
+        if len(seen) == 1:
+            raise http.client.BadStatusLine("\x16\x03\x01")
+        return fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.2",
+                                    "anthropic-ratelimit-unified-5h-reset": "1787191800"})
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert result.status == 200 and result.profile_id == "b"
+    assert gw.runtime_snapshot()["a"].state == ProfileState.COOLDOWN
+
+
+def test_an_unexpected_transport_error_does_not_leak_the_in_flight_slot(pool_env):
+    """A leaked slot pins "Used now" on forever and wedges the idle check the
+    auto-updater waits for, so the bug outlives the request that caused it."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+
+    def transport(req):
+        raise RuntimeError("a genuine bug, not a network failure")
+
+    gw = Gateway(transport=transport)
+    with pytest.raises(RuntimeError):
+        gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert gw._in_flight == set()
+
+
+def test_the_sync_loop_does_not_read_the_keychain_on_every_poll(pool_env, monkeypatch):
+    """secret_store.get_token forks the `security` CLI on macOS, and this runs
+    for every oauth Profile on every ~1s Dashboard poll, inside the lock every
+    request also takes. The throttle used to be checked only inside
+    _try_refresh — after the read — so it gated the network call but not the
+    subprocess, contradicting its own field docstring."""
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
+    ]))
+
+    reads = []
+
+    class CountingStore:
+        def get_token(self, profile_id):
+            reads.append(profile_id)
+            return "tok"
+
+    monkeypatch.setattr(gateway_module, "secret_store", CountingStore())
+    monkeypatch.setattr(gateway_module.oauth_credential, "decode",
+                        lambda blob: gateway_module.oauth_credential.StoredOAuthCredential(
+                            access_token="t", refresh_token="r", expires_at=None))
+    monkeypatch.setattr(gateway_module.oauth_credential, "is_expiring_soon", lambda cred: True)
+    monkeypatch.setattr(gateway_module.oauth_login, "refresh_access_token",
+                        lambda token: (_ for _ in ()).throw(
+                            gateway_module.oauth_login.OAuthLoginError("nope")))
+
+    gw = Gateway(transport=lambda req: fake_response(200))
+    gw.runtime_snapshot()
+    after_first = len(reads)
+    for _ in range(20):          # twenty more poll ticks, well inside the window
+        gw.runtime_snapshot()
+
+    assert len(reads) == after_first, (
+        f"the keychain was read {len(reads) - after_first} more times across 20 polls")
