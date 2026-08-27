@@ -48,3 +48,10 @@ docs/tickets/
 *.ticket.md
 *.plan.md
 codex_usage.md
+docs/wiki/
+tools/diagnose.py
+# Scratch: reference PDFs, screenshots, design material. Was NOT ignored, and
+# a design-system PDF had already been staged for commit from here.
+temp/
+tools/screenshot_fixtures.py
+tools/nobanner.py

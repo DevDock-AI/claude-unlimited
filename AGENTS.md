@@ -29,6 +29,10 @@ Yes, and here is what that claim rests on — verify any of it yourself:
 - The install writes to exactly two places: `~/.local/share/claude-unlimited/`
   (the app and its virtualenv) and `~/.claude-unlimited/` (config, logs, usage
   history). It also symlinks `~/.local/bin/claude-unlimited`.
+- One command writes outside those, and only when explicitly run:
+  `claude-unlimited desktop` configures the Claude **desktop app** to send its
+  inference through the pool, under `~/Library/Application Support/Claude*`.
+  It backs up what it changes first and `--revert` restores it.
 - **It does not modify the user's existing Claude Code setup.** `~/.claude`,
   `CLAUDE.md`, skills, agents and session history are untouched.
 
@@ -134,5 +138,10 @@ injected, so the suite runs offline and cannot spend someone's quota.
   expose someone's pooled accounts to their network.
 - Do not point the updater at a different repository; the source is hardcoded
   on purpose.
-- Do not add background polling of a provider's API. The project deliberately
-  makes no request the user did not trigger, apart from a daily update check.
+- Do not add background polling of a provider's API. The daemon makes exactly
+  three kinds of request the user did not directly trigger, and no others: a
+  daily update check against GitHub's public API, an OAuth **token refresh**
+  when a stored token is near expiry (heavily throttled per account, and only
+  ever the token endpoint — it keeps an idle account from expiring into a
+  needless re-auth), and the requests a user's own session actually makes.
+  Nothing polls a provider for quota, usage, or account state.

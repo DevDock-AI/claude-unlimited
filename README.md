@@ -52,7 +52,9 @@ Rotation happens **between requests**, in the background. No logout, no prompt, 
 | **[<img src="docs/logos/claude.png" height="14" alt=""> Add a Claude subscription](#add-a-claude-subscription)** | One command |
 | **[<img src="docs/logos/openai.png" height="14" alt=""> Add a ChatGPT / Codex subscription](#add-a-chatgpt--codex-subscription)** | One command |
 | **[Add an API key](#add-an-api-key)** | Dashboard only |
+| **[Models parity](#which-gpt-model-runs-your-claude-model)** | Which GPT model runs each Claude model |
 | **[Usage](#usage)** | Daily driving |
+| **[The Claude desktop app](#using-the-claude-desktop-app)** | Route the app through your pool too |
 | **[The dashboard](#the-dashboard)** | What you can see and control |
 | **[Notifications](#notifications)** | Know before you run out |
 | **[Updates](#updates)** | How new versions reach you |
@@ -90,6 +92,8 @@ Anthropic API keys, your own gateway — and treats them as one continuous suppl
 | 🔄 | **Seamless rotation** — the handover happens between requests. Your session never breaks, never prompts, never restarts. |
 | <img src="docs/logos/claude.png" height="14" alt=""><img src="docs/logos/openai.png" height="14" alt=""> | **Mixed pools** — Claude subscriptions, ChatGPT/Codex, and API keys side by side, each with its own priority and threshold. |
 | <img src="docs/logos/openai.png" height="14" alt=""> | **Claude Code, powered by GPT** — a Codex account is translated to and from the Anthropic API shape, with real token-level streaming. Claude Code can't tell. |
+| 🎚️ | **[Models parity](#which-gpt-model-runs-your-claude-model)** — you decide which GPT model and reasoning effort each Claude model maps to, and what it costs your Codex quota. |
+| 🖥️ | **[The Claude desktop app too](#using-the-claude-desktop-app)** — not just the terminal. One command points it at your pool, and `--revert` puts it back. |
 | 📊 | **A dashboard you'll actually open** — live usage bars, cost tracking, model split, per-project attribution, activity log. |
 | 🔒 | **100% local** — no account, no telemetry, no cloud. Your credentials never leave your machine. |
 | ⚙️ | **One command to work** — `claude-unlimited code` and you're routed. |
@@ -156,9 +160,12 @@ This is the part worth being explicit about:
 - **`claude` never sees your real credentials either.** It authenticates to the daemon
   with a local placeholder token. The real credential is substituted server-side and never
   returned to the client.
-- **The only outbound traffic is the API call you already intended to make.** Same
-  destination as without this tool. Nothing extra: no quota probing, no keep-warm pings,
-  no background chatter.
+- **Almost the only outbound traffic is the API call you already intended to make** —
+  same destination as without this tool. No quota probing, no keep-warm pings, no
+  background chatter. The two exceptions are both ones you can name: a once-a-day
+  version check against GitHub's public API, and refreshing an account's own OAuth
+  token shortly before it expires, so an account you haven't used in a while doesn't
+  quietly need a re-login.
 
 ---
 
@@ -237,6 +244,33 @@ to and from OpenAI's transparently, streaming included.
 
 Also isolated: your existing `codex` login is left alone.
 
+### Which GPT model runs your Claude model
+
+Claude Code asks for a Claude model. When the request lands on a Codex account, something
+has to decide which GPT model actually answers — and how hard it thinks. That mapping is
+yours to set, in **Settings → Models parity**:
+
+| Claude model | Runs as | Reasoning effort |
+|---|---|---|
+| Claude Fable 5 | `gpt-5.6-sol` | high |
+| Claude Opus 5 | `gpt-5.6-terra` | high |
+| Claude Sonnet 5 | `gpt-5.6-terra` | medium |
+| Claude Haiku 4.5 | `gpt-5.6-luna` | low |
+
+Change either column per row, or hit **Reset to defaults**. Effort runs from `minimal`
+through `low`, `medium`, `high`, `xhigh`, `max` to `ultra`.
+
+**Effort is the expensive dial, not model size.** A Codex plan's quota is spent on
+reasoning tokens produced, multiplied by the model's tier — not on how much context you
+send. Turning Sonnet up to `high` costs noticeably more of your weekly allowance than
+leaving it at `medium`; resending a long conversation costs nothing extra. That's
+measured behaviour, not a guess — see
+[`docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md`](docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).
+
+This mapping applies to Codex profiles left on **Automatic**. A profile with its own model
+override keeps using that instead, so you can pin one account to a specific model and let
+the rest follow the table.
+
 ---
 
 ## Add an API key
@@ -286,6 +320,55 @@ The dashboard URL stays in Claude Code's status line while you work.
 A brief rate-limit blip never causes a switch — only a real threshold crossing or genuine
 exhaustion does.
 
+### Using the Claude desktop app
+
+The desktop app can send its inference through your pool too, not just the
+terminal:
+
+```bash
+claude-unlimited desktop
+```
+
+It creates an inference profile named **Claude Unlimited** in the app, points it
+at the local daemon, makes it active, and starts the app. Any inference profiles
+you already have are left alone.
+
+> **This restarts the Claude desktop app.** If it is running, the command asks
+> it to quit, waits for it to close, and reopens it afterwards. **Save anything
+> you are working on first.** The app rewrites its own settings as it exits, so
+> it has to be fully stopped before its configuration can be changed — a
+> half-quit app would overwrite the new settings on its way out. If it will not
+> quit (a dialog, unsaved work), the command stops and changes nothing rather
+> than writing settings that are about to be clobbered.
+
+**Undoing it.** Everything the command changes is backed up before the first
+write, and:
+
+```bash
+claude-unlimited desktop --revert
+```
+
+restores it. Quit the app before reverting too, for the same reason. The
+inference profile named *Claude Unlimited* stays in the app's list — remove it
+there if you no longer want it.
+
+Three things worth knowing:
+
+- The app calls this **third-party inference mode**, and it runs from a separate
+  app profile with its own session — so you may be asked to sign in again. Your
+  normal Claude setup is unaffected.
+- The app's **own chat still talks to claude.ai** and is not routed through the
+  pool. Only Claude Code sessions inside the app are.
+- **Enable at least one account first.** Otherwise the app's "Test connection"
+  fails with *No eligible Profile available*, which looks like a configuration
+  error but isn't.
+
+This is the only command that writes outside `~/.claude-unlimited/` and
+`~/.local/share/claude-unlimited/`; it touches
+`~/Library/Application Support/Claude*`, and only when you run it. macOS only
+for now. The Help page in the dashboard also documents the manual route, if you
+would rather set it up in the app yourself.
+
 ### Your project setup is untouched
 
 `claude-unlimited code` runs the same `claude` binary in the same directory. Your
@@ -322,11 +405,15 @@ says so when it happens. Nothing else in `env` is touched, and no file is modifi
 - **Profiles** — the full table: search, filter, sort, drag to reorder priority, and a
   menu to edit, test, disable, or remove.
 - **Activity** — every rotation, session, and config change, filterable and exportable.
-- **Settings** — auto-start, process controls, notifications, export/import, language.
+- **Settings** — updates, [models parity](#which-gpt-model-runs-your-claude-model),
+  auto-start, process controls, notifications, export/import, language.
 - **Help** — every CLI command, explained.
 
 Numbers update live, without refreshing. Usage bars shift amber then red as an account
 nears its threshold, so you see it coming.
+
+Every view has its own URL — `/profiles`, `/activity`, `/settings`, `/help` — so you can
+bookmark one, reload without losing your place, and use the browser's back button.
 
 <details>
 <summary>More screenshots — activity log, settings, help, light theme</summary>
@@ -423,6 +510,7 @@ is in the dashboard under **Help**.
 |---|---|
 | `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
+| `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |
 | `claude-unlimited start` | Run the daemon in this terminal (Ctrl-C to stop). |
 
@@ -452,7 +540,7 @@ Auto-start on login — the same thing **Settings → Daemon** controls.
 
 | Command | What it's for |
 |---|---|
-| `claude-unlimited purge` | Removes everything: stored credentials, config, usage history, the app and its virtualenv, the CLI symlink, and the service registration. Asks for confirmation first. `~/.claude` is never touched. |
+| `claude-unlimited purge` | Removes everything: stored credentials, config, usage history, the app and its virtualenv, the CLI symlink, and the service registration. If the Claude desktop app was routed through the pool, its own settings are restored first. Asks for confirmation first. `~/.claude` is never touched. |
 
 Credentials are deleted from your OS keystore *before* the config goes, since
 the config is the only record of which Profiles exist.

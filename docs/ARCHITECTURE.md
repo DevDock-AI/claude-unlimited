@@ -1,105 +1,183 @@
 # Architecture
 
-A module-by-module map of what actually exists in Claude Unlimited today, plus the two verification passes it's had against real traffic and a real Dashboard session. This is the deep-dive companion to `README.md` — start there for the pitch and the quick start; come here for how it's actually built.
+How Claude Unlimited is put together. Start with [`README.md`](../README.md) for what it
+does; this is the map for someone about to change it.
 
-See also `docs/adr/` for why specific architectural calls were made.
+See [`docs/adr/`](adr/) for why specific calls were made, and
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) for the rules a change has to follow.
+
+## The shape
+
+One process, one loopback port, two jobs:
+
+```
+Claude Code ──▶ 127.0.0.1:4317 ──┬──▶ /api/*  the Dashboard's own API
+                                 ├──▶ /       the Dashboard itself
+                                 └──▶ *       the live proxy, forwarded upstream
+```
+
+The two namespaces never share auth logic. `/api/*` is CSRF- and Host-checked and never
+touches a provider credential. Everything else is checked against the local placeholder
+token and never sees the Dashboard's CSRF token.
+
+Because the proxy is the catch-all, **any path the daemon does not explicitly recognise is
+forwarded upstream**. Adding a Dashboard route means adding it to `_VIEW_ROUTES` in
+`daemon.py` and `VIEW_ROUTES` in `static/app.js`, which a test holds to agreement.
+
+## Profile kinds
+
+A Profile is one account. Three kinds share the same rotation, thresholds and Dashboard:
+
+| kind | What it is | How it talks upstream |
+|---|---|---|
+| `oauth` | A Claude Pro/Max subscription | Proxied byte-for-byte to Anthropic |
+| `api` | An Anthropic API key or compatible gateway | Proxied byte-for-byte |
+| `codex` | A ChatGPT/Codex subscription | Translated to and from OpenAI's Responses API |
+
+They differ in credential handling, transport and quota signals. A change verified on one
+kind is not verified on the others — this is the project's most repeated defect.
 
 ## Module map
 
-- `claude_unlimited/config.py` — the `Profile`/`Pool` data model (unified `oauth`/`api`/`codex` kind) and atomic on-disk persistence.
-- `claude_unlimited/secret_store/` — credential storage behind a pluggable interface (`docs/adr/0002-*.md`): macOS Keychain (`security` CLI, verified), Linux Secret Service (`secret-tool`, unverified — no Linux dev machine), Windows DPAPI (`ctypes`, unverified — no Windows dev machine). See `docs/adr/0005-*.md` for what "unverified" means here and why the two newer backends still shipped.
-- `claude_unlimited/router.py` / `claude_unlimited/observation.py` — the pure Rotation decision logic and response classification, fully unit tested, zero I/O. A `ShortRateLimit`/`ProviderUnavailable` cooldown honors a real `Retry-After` from Anthropic up to a defensive 1800s ceiling (previously clamped to a flat 60s, which could under-honor a real longer wait and risk re-hitting the same rate limit); with no `Retry-After` at all (Anthropic's documented shape for a spend-cap/billing 429 — "keeps failing until access resumes") the cooldown instead escalates exponentially per consecutive failure (30s → 60s → 120s → … capped at the same 1800s), tracked via `ProfileRuntime.consecutive_unretryable_failures` and reset by either a real success or a `Retry-After` actually being present. `AUTH_INVALID` (a Profile whose credential was rejected — "needs re-auth" in the Dashboard) recovers two ways: `gateway.py`'s `_sync_snapshot()` clears it back to `ELIGIBLE` when it notices `Profile.credential_updated_at` has changed (the signal `profiles.py`'s `update_credential()` stamps on every refresh — `claude-unlimited add-account`/`reauth` re-run, "Import current login", or re-pasting a token), and — since 2026-08-23 — `Gateway._maybe_check_oauth_credential()` also tries the Profile's own stored `refresh_token` automatically, on every sync (Dashboard poll, the daemon's own 60s background thread in `daemon.py`'s `_oauth_refresh_loop`, or a live request), not just at request time for whichever Profile happened to be selected — so an OAuth Profile that goes idle (not currently in rotation) still gets refreshed before it actually expires, and one that's already `AUTH_INVALID` gets a real chance to self-heal instead of staying stuck until a manual re-auth. Both refresh call sites (`_maybe_refresh_credential` and `_maybe_check_oauth_credential`) share ONE per-Profile backoff clock (`Gateway._try_refresh`'s `_refresh_check_not_before`) specifically so a 429 from Anthropic's own token endpoint backs both of them off together (900s, not the normal 60s) — retrying a rate-limited token endpoint every 60s only re-triggers the same limiter, since each attempt is itself another strike against it.
-- `claude_unlimited/proxy.py` / `claude_unlimited/upstream.py` / `claude_unlimited/gateway.py` — builds and sends the real upstream request (credential substitution, header stripping, the `account_uuid` rewrite inside `metadata.user_id`) and orchestrates transparent Rotation on quota-exhaustion. Verified against a fake upstream, including a test that proves a 429 on one Profile causes an invisible retry on the next with the client seeing only a 200.
-- `claude_unlimited/anthropic_oauth.py` — three ways to add an OAuth Profile, none of which ever ask for an account UUID by hand: `claude-unlimited add-account` (alias `ac` — logs into an isolated Claude Code session via a `CLAUDE_CONFIG_DIR` override, which keeps other logged-in accounts untouched, then reads that session's credential back, from a `.credentials.json` file or, on macOS, a directory-derived Keychain service name — see `isolated_macos_keychain_service()`), "Import current login" (reads Claude Code's own default Keychain/file session), or pasting a token — the account UUID is always resolved automatically from Anthropic's `/api/oauth/profile`. Endpoint names and the Keychain service name are verified against a real, working reference implementation, not guessed. `claude_unlimited/oauth_login.py` handles what happens after a Profile is added: `refresh_access_token()` exchanges a stored refresh_token for a new access token before one expires (see `gateway.py`'s proactive refresh check), going through `curl` (subprocess) rather than `urllib.request` for that call, because Cloudflare's bot-management blocks bare Python `urllib.request` requests to `platform.claude.com` with a 403 ("error code: 1010") before they reach Anthropic's servers at all, while `curl`'s TLS fingerprint isn't flagged; falls back to `urllib.request` only if `curl` isn't on `PATH`.
-- `claude_unlimited/daemon.py` + `claude_unlimited/static/` — the HTTP server (binds to `127.0.0.1` only, refuses any other bind target) serving `/health`, the Dashboard's JSON API (`/api/*`, CSRF + Host-header protected), the live proxy (placeholder-token protected), and a real single-page Dashboard at `/` (Overview/Profiles/Activity/Settings), backed entirely by the real API: real SVG icons, per-Profile 5h/7d usage bars with a threshold marker and proximity-based coloring sourced from `Gateway.runtime_snapshot()`, sectioned Settings with real daemon-service/process/network/notification controls.
-- `GET /api/profiles` merges live Router state into each Profile (`state`, `status_word`, `usage_5h_percent`/`usage_7d_percent` + their reset times) via `Gateway.runtime_snapshot()`; `GET /api/status` reports real `uptime_seconds` and the currently-active Profile. `GET/POST /api/service` and `GET/POST /api/placeholder-token[/regenerate]` back the Settings page's daemon-lifecycle toggle and network code-rows. `GET /api/process` + `POST /api/process/kill` / `POST /api/process/restart` expose the daemon's own pid/memory/uptime and let the Dashboard kill or restart it.
-- `claude_unlimited/export_import.py` — encrypted credential Export/Import bundles (Fernet + PBKDF2HMAC-SHA256, 600k iterations — the one approved dependency exception). Two-step by design: `import_bundle()` only decrypts/parses (never writes), `apply_import()` writes only after an explicit caller confirmation, matching the Export/Import modals. Wired to `POST /api/export`, `POST /api/import/preview`, `POST /api/import/apply`.
-- `claude_unlimited/i18n.py` + `claude_unlimited/locales/*.json` — Dashboard translations. Each `<code>.json` is a flat key→string map; a locale missing a key falls back to `en.json`'s string for it, so a partial translation still renders. Adding a language is: add `<code>.json`, done — `list_locales()` derives the available set from the files present, no registration step. English, Spanish, Romanian, and German ship today. Wired to `GET /api/locales` (available languages + current) and `GET /api/locales/<code>` (the strings); the frontend applies them via `data-i18n`/`data-i18n-placeholder`/`data-i18n-title` attributes and a language selector in Settings.
-- `claude_unlimited/notifications.py` — real macOS desktop notifications via `osascript` (zero dependency). `notify_if_enabled(category, ...)` is the one call site every caller uses; it checks both the master `notifications_enabled` switch and the specific `Settings.notify_*` flag. Wired into `gateway.py` for the categories that already have a clear signal point: rotated (a Profile actually switched), quota_reset (a Profile's cooldown/exhaustion window passed and it's eligible again), approaching_threshold (usage is within 5 points of `switch_threshold`, fires once per crossing), and needs_attention (no eligible Profile, or a credential was rejected). `notify_update_available` is wired end-to-end but has no automatic caller yet — there's no update-checker built (see "What's designed but not built" below).
-- `claude_unlimited/daemon_installer/` — the install/auto-start half of `docs/adr/0002-*.md`'s pluggable-OS-backend pattern (mirrors `secret_store/`'s shape exactly). Exposes `install`/`uninstall`/`is_installed`/`status`/`start`/`stop`. macOS registers a `launchd` LaunchAgent (`~/Library/LaunchAgents/com.claude-unlimited.daemon.plist`, `RunAtLoad`+`KeepAlive`, verified). Linux registers a `systemd --user` unit (unverified). Windows registers a logon-triggered Task Scheduler task and tracks its pid via a pidfile the daemon writes on startup, since `schtasks` doesn't expose a task's own child-process pid (unverified). Logs for all three go under `~/.claude-unlimited/logs/`.
-- `claude_unlimited/cli.py` — `claude-unlimited doctor` / `start` / `status` / `add-account` (alias `ac`) / `add-codex-account` / `reauth` / `code` / `install` / `uninstall` / `service-start` / `service-stop`. `add-codex-account` mirrors `add_account()`'s exact shape but for a ChatGPT/Codex subscription — see the `openai_bridge.py` entry above. `doctor` also reports desktop-notification availability, background-service status, and available Dashboard languages. `code` optionally pins one terminal session to one Profile (`--profile <name-or-id>`, or an interactive `[1] Rotated accounts / [2] <name> / ...` picker when stdin is a tty and more than one Profile is enabled) — see `claude_unlimited/session_tokens.py` below. `reauth` is the same shape of picker, but scoped to whichever OAuth Profile(s) the running daemon currently reports as `AUTH_INVALID` (falls back to listing every OAuth Profile if the daemon isn't reachable) — it re-authenticates in place via the Profile's own `claude_config_dir` (the same isolated session `add-account` created it under) rather than adding a new, ambiguous one, and refuses to save if the account logged into doesn't match the Profile's `account_uuid`.
-- `claude_unlimited/session_tokens.py` — mints/resolves the per-session credential behind `code --profile`, distinct from the one shared `placeholder_token.py` credential every unpinned `claude-unlimited code` invocation uses. `GET /api/session-token?profile_id=` (a GET, not a POST, so a plain CLI process can call it before it has any Dashboard CSRF token) returns a token reused across repeated calls for the same profile_id (30-day TTL). `daemon.py`'s `_check_placeholder_token` recognizes either kind of token and resolves a `forced_profile_id`, which `Gateway.handle(..., forced_profile_id=)` uses to always pick exactly that Profile — bypassing COOLDOWN/EXHAUSTED/DRAINING (like `force_active`/"Take over" does) but refusing immediately on AUTH_INVALID, never rotating away from it on failure (relays the real upstream response/error instead), and never touching the shared `_current_profile_id`/"Rotated" notification, since other concurrent pinned or unpinned sessions must be unaffected.
-- `claude_unlimited/runtime_state.py` — persists the Dashboard-visible slice of Gateway's live state (usage %, reset times, current Profile) across daemon restarts, a display cache only — Rotation state itself (COOLDOWN/EXHAUSTED/etc.) deliberately does not persist, so every enabled Profile gets a fresh try after a restart, same as always.
-- `claude_unlimited/project_attribution.py` + `claude_unlimited/project_usage.py` — best-effort per-project usage attribution. Claude Code sends its own session id in an `X-Claude-Code-Session-Id` request header; separately, entirely off the network, it maintains local session transcripts at `~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl`. Matching the two attributes a request to a project directory using only a header value and a local filename — no request body or conversation content is read for this. `project_usage.py` persists a request count per project to `~/.claude-unlimited/project_usage.json`; wired into `gateway.py` defensively (any failure is swallowed — attribution can never affect a real request) and exposed via `GET /api/usage/projects`, enriched with real tokens/cost from `usage_history.py`. The Overview page's "Usage by project" section, marked Best-effort, shows this live.
-- `claude_unlimited/usage_tracking.py` + `claude_unlimited/usage_history.py` + `claude_unlimited/pricing.py` — real per-request token/model/cost tracking. See the dedicated section below.
-- `claude_unlimited/connectors.py` — Phase 0 of an in-progress connector-abstraction: a `ConnectorSpec` registry declaring each kind's *identity* (auth_modes, which Profile fields it owns, whether it needs account_uuid, its quota display style) in one place, so `profiles.py`'s `_VALID_KINDS`/`_VALID_AUTH_MODES` derive from it instead of duplicating a literal tuple. Deliberately does NOT yet own transport dispatch, credential refresh, or classification — those stay in gateway.py/each kind's own modules for now; see this module's own docstring for the planned 3-phase migration (api → oauth → codex) that would fold those in too, not executed yet as of this writing — added incrementally, one low-risk phase at a time, specifically so each phase's test-suite run stays unambiguous about what changed, rather than one large, harder-to-verify pass.
-- `claude_unlimited/openai_bridge.py` + `openai_translate.py` + `openai_credential.py` + `openai_login.py` + `openai_observation.py` + `openai_models.py` — a third Profile kind, `codex`, that routes Claude Code requests through OpenAI's GPT models (a real ChatGPT/Codex subscription, or a raw OpenAI API key) instead of Anthropic, translated to look like a real Anthropic response so Claude Code can't tell the difference. Added 2026-08-24 after extensive research directly against the cloned `openai/codex` source and one live, minimal test call. Architecture decision, not incidental: this talks DIRECTLY to OpenAI's own backend (`https://chatgpt.com/backend-api/codex/responses` for a subscription, `https://api.openai.com/v1/responses` for an API key — the real OpenAI Responses API, confirmed via the cloned source's `codex-rs/codex-api/`) rather than shelling out to the `codex` CLI binary per request; the CLI is used ONLY for the one-time interactive OAuth login (`claude-unlimited add-codex-account`, mirroring `add-account`'s exact shape) via `codex login` under an isolated `CODEX_HOME`, after which its `auth.json` is read once, re-encoded (`openai_credential.py`, mirrors `oauth_credential.py`'s blob shape) and stored in `secret_store` — the daemon never shells out to `codex` again after that for this Profile. This was a deliberate pivot away from an initially-planned CLI-subprocess design (spawning `codex exec --json` per request, parsing its JSONL event stream) after live testing found that transport's real streaming to be item-level only (no token-by-token deltas — confirmed by reading `codex-rs/exec/src/event_processor_with_jsonl_output.rs`, which never surfaces the delta events the underlying backend actually sends) and its tool-call capture to be structurally lossy (`FileChangeItem` has no diff field, `PatchApplyStatus`/`McpToolCallStatus` have no `Declined` variant to distinguish a blocked action from a genuine error) — talking to the real Responses API directly sidesteps both: genuine token-level SSE deltas (`response.output_text.delta`) and OpenAI's own `tools`/function-calling schema, which Claude Code's own `tools` array translates onto near-1:1 (`openai_translate.py`, pure/no I/O, the actual Anthropic↔OpenAI shape mapping in both directions — request messages/tool_use/tool_result/images one way, SSE events → Anthropic content blocks the other).
+**Request path** — everything a live session touches.
 
-  `codex`-kind Profiles reuse `switch_threshold`/`ProfileState` exactly as `oauth`-kind ones do, not `api`-kind's `token_threshold` — the real backend returns genuine percentage-based quota headers (`x-codex-primary-used-percent`, `x-codex-primary-reset-after-seconds`, `x-codex-plan-type`) that `openai_observation.py` classifies into the SAME `Observation` union `observation.py` already defines, so `router.py`'s rotation logic needed zero changes to support a third kind. **Correction, 2026-08-24, from the real account holder**: unlike Claude's genuinely-fixed dual 5h+7d window, Codex's primary/secondary headers are NOT a fixed "primary=5h, secondary=7d" mapping — confirmed by reading the real client's own `codex-rs/tui/src/chatwidget/rate_limits.rs`/`codex-rs/codex-api/src/rate_limits.rs`: each window is labeled by its own real `window-minutes` value (5h/daily/weekly/monthly/annual), and an all-zero window (0% used, 0 minutes, no reset time) is treated as ABSENT, not a real 0%-used window — the real client doesn't render it at all in that case. A real account can have only the primary window populated (labeled "weekly," confirmed 10080 minutes = 7 days), secondary genuinely absent. `observation.UsageSnapshot` gained two new optional fields, `window_label`/`window_label_7d` (None means "assume the Anthropic default," backward-compatible with every existing caller), threaded through `router.ProfileRuntime` and exposed via `GET /api/profiles`'s `usage_window_label`/`usage_window_label_7d`, so the Dashboard can show a single dynamically-labeled bar instead of a fabricated second one.
+- `gateway.py` — orchestrates one request: pick a Profile, send it, classify the answer,
+  rotate and retry on failure. The one place the three kinds branch.
+- `router.py` — the pure rotation decision. No I/O, no clock of its own, fully unit tested.
+- `observation.py` / `openai_observation.py` — turn a provider response into one of a small
+  set of facts: usage snapshot, quota exhausted, rate limit, auth invalid, unavailable.
+- `proxy.py` / `upstream.py` — build and send the real upstream request, substitute the
+  credential, strip hop-by-hop headers, rewrite `metadata.user_id`.
+- `openai_bridge.py` — the codex path: owns its own HTTPS call and response translation.
+- `openai_translate.py` — pure Anthropic ⇄ OpenAI shape mapping, both directions.
+- `wire_formats.py` — which endpoint shape a Profile speaks, and how to translate to it.
+- `usage_tracking.py` — tees the response to count tokens without altering a byte of it.
+- `session_tokens.py` — the per-session credential behind `code --profile`.
 
-  **A related correctness note**: `gateway.py`'s `_sync_snapshot()` reconstructs `ProfileRuntime` from scratch on EVERY call (every ~1s Dashboard poll tick, not just a real observation) — and until this fix, that reconstruction silently dropped `consecutive_unretryable_failures` back to 0 every single time, defeating the entire no-Retry-After escalating-backoff design (see `router.py`'s entry above) within about a second of it ever incrementing, any time the Dashboard was open. The exact class of bug the "Background API retry safety" standing rule exists to catch — found this time by code inspection, not a second live incident. Fixed by carrying the field over explicitly in that reconstruction, same as every other runtime field already was; covered by `test_no_retry_after_escalation_streak_survives_intervening_sync_calls` in `tests/test_gateway.py`. `Gateway._handle_codex()` is the one branch point inside the existing `handle()` retry loop (not a parallel `handle()`) — `openai_bridge.run()` owns its own HTTPS call and response translation entirely, since a codex-kind Profile has no `proxy.build_upstream_request()`-shaped relay to make, but everything downstream (rotation-on-failure, `Gateway.observe()`, "Rotated"/"needs re-authentication" notifications, usage-capture wrapping, in-flight tracking for "Used now") is shared with the Anthropic path. Token refresh (`openai_login.py`, endpoint/client_id/request-shape copied verbatim from the real `codex-rs/login/src/auth/manager.rs`) shares the SAME shared-backoff-with-a-longer-429-penalty design `Gateway._try_refresh` already uses for Anthropic (`openai_bridge.py`'s own `_refresh_not_before` throttle) — a direct, deliberate application of the lesson from the real OAuth-refresh-spam incident documented in the `router.py` entry above, applied here from the start rather than discovered the same way twice. Header construction (`_build_headers`, `_codex_user_agent`, `_uuid7`) matches the real `codex` CLI's own request shape (User-Agent format, `originator: codex_cli_rs`, UUIDv7-shaped session/thread ids) as closely as verified from the cloned source, on the user's own explicit request to look like genuine Codex CLI traffic rather than a hand-built probe.
+**State**
 
-## Real per-request usage tracking
+- `config.py` — the `Profile`/`Pool` model and atomic on-disk persistence. Profiles save
+  via `asdict()` but load by explicit enumeration, so the load side is what drifts.
+- `profiles.py` — the only place config.json and the keychain are coordinated. Validates
+  everything a caller may set, because `load_pool()` coerces on read.
+- `secret_store/` — credentials, one backend per OS behind one interface.
+- `runtime_state.py` — the Dashboard-visible slice of live state, across restarts. A
+  display cache: rotation state itself deliberately does not persist.
+- `usage_history.py` / `pricing.py` — per-request tokens and estimated cost.
+- `activity.py` — the append-only event log behind the Activity page.
+- `export_import.py` — encrypted bundles. The only user of `cryptography`.
 
-`claude_unlimited/usage_tracking.py` captures token counts and model from real Anthropic response bodies. It's a strict tee: `UsageCapture.wrap()` forwards every byte read from upstream completely unmodified, in the same order, and only ever inspects its own separate copy; any parsing error is swallowed, never affecting what the real client receives (proven by a test that forwards the exact real-shaped stream, byte-for-byte, at five different chunk sizes). `message_start`'s SSE event carries the model name; `message_delta`'s carries the authoritative final usage. A non-streaming JSON fallback exists too, bounded at 5MB so an oversized body can't be buffered forever.
+**Surface**
 
-`claude_unlimited/usage_history.py` persists one bounded local record per completed request (`~/.claude-unlimited/usage_history.jsonl`, capped at 20,000 events) and aggregates it on read — daily token totals, model split, an hourly histogram (local time, not UTC), and cost by Profile. `claude_unlimited/pricing.py` estimates cost from Anthropic's published API pricing, matched by model-id prefix since real ids carry a dated snapshot suffix — always labeled as an estimate, never a guaranteed dollar figure. Wired into `gateway.py` on the committed (non-retry) response path only, after the Rotation decision is already made; recording happens only once the body is fully forwarded, so a client that disconnects mid-stream just doesn't get a usage record, never a broken response. Exposed via `GET /api/usage/summary` and an enriched `GET /api/usage/projects`.
+- `daemon.py` — the HTTP server and every route.
+- `static/` — the Dashboard. Plain HTML/CSS/JS, no build step.
+- `locales/*.json` — one flat key→string map per language. A missing key falls back to
+  English; a key in only one file is a bug a test catches.
+- `cli.py` — daemon lifecycle, the interactive logins, `code`, `desktop`, `purge`.
+- `daemon_installer/` — auto-start, one backend per OS behind one interface.
+- `notifications.py` — OS-native desktop notifications, no dependency.
+- `updater.py` — checks, verifies and installs releases.
+- `connection_test.py` — the Profiles menu's "Test connection".
 
-Two correctness constraints in this pipeline: the daemon forwarding the client's `Accept-Encoding` header upstream caused Anthropic to compress the SSE body, which silently broke the plain-text usage parser (fixed by stripping that header before forwarding); and a `BrokenPipeError`/`ConnectionResetError` in the write loop could abandon the usage-capture generator before it reached its own recording code (fixed with a `try/finally` so `GeneratorExit` still unwinds through the recording call). Both are covered by regression tests.
+## How a request flows
 
-## The Dashboard
+1. Claude Code sends a normal Anthropic request to the loopback port.
+2. `gateway.handle()` recovers any expired cooldowns, then asks `router.choose()` for a
+   Profile.
+3. The credential is fetched from the OS keychain and substituted in.
+4. For `oauth`/`api` the request is relayed as-is; for `codex` it is translated.
+5. The response is classified into an `Observation` and folded back into rotation state.
+6. On quota exhaustion the next eligible Profile is tried, invisibly — the client sees one
+   request and one answer.
+7. The body streams back untouched while a tee counts tokens for the usage history.
 
-Server-rendered zero-build vanilla JS/HTML/CSS, served directly from `claude_unlimited/static/` — no npm, no framework, no bundler. Everything that shows numbers polls live:
+## Rotation rules
 
-- A diff-aware live-update loop (`pollLiveUpdate`, every 1s) refreshes profile cards, the profiles table, usage charts, project usage, and the activity log depending on which view is open, plus `loadStatus()` unconditionally every tick (so the "Active" indicator can't go stale while a different view is open) — skipped while the tab is hidden, a modal is open, or a profile drag-reorder is in progress; a `visibilitychange` listener forces an immediate refresh when the tab regains focus instead of waiting for the next tick.
-- `setLiveHtml()` morphs the DOM in place (patches attributes/text, keyed reconciliation by `data-id` for list items) rather than swapping innerHTML wholesale — a surviving node is never destroyed and recreated just because a poll ran, which is also why per-node event listeners were converted to event delegation on the stable parent container (`wireProfileCardEvents`/`wireProfileTableEvents`). A new keyed item gets a `.live-enter` animation, a removed one gets `.live-exit`; the Activity log additionally layers a FLIP position transition (`renderActivityFeed`) so existing rows visibly slide down when a new one pops in at the top, instead of silently teleporting. All of it respects `prefers-reduced-motion`.
-- Per-card mini chart-style toggles (bars vs. round) persist independently per chart in `localStorage`.
-- Usage bars and the "% used" figures shift to yellow within 15 points of a Profile's switch threshold, and red within 5 points — a heads-up before Rotation actually happens, not just a readout after.
-- The Activity log shows relative timestamps ("5m ago", "1h ago", "2d ago"...) with the exact local date/time in a hover tooltip.
-- A Help view lists every `claude-unlimited` CLI command with a plain-language description and a one-click copy button (reuses the existing `.copy-btn`/`wireCopyButtons()` machinery, no new wiring needed).
-- The frontend's `api()` helper detects a stale CSRF token specifically (`body.error === 'csrf'`, the shape the daemon returns when it restarted since the page loaded and regenerated its token) and auto-reloads the page after a toast, instead of leaving every write silently broken until a manual refresh.
+- Requests go to the enabled Profile with the **lowest priority number**.
+- It stays there — *sticky* — until it crosses its `switch_threshold` or hits a real quota
+  limit.
+- A brief rate limit is a cooldown, never a state change away from eligible.
+- A cooldown honours a real `Retry-After`; with none, it backs off exponentially, because
+  retrying a rate-limited endpoint every minute never lets the window clear.
+- When a window resets, the Profile rejoins rotation automatically.
+- An account whose credential was rejected shows "needs re-auth" and tries its own refresh
+  token to recover, rather than waiting for a manual re-login.
 
-Two visual passes were done against an approved design reference, both live-verified with Playwright (every view and modal, zero console/page errors):
+## Usage tracking
 
-1. **First pass**: rail with real SVG icons, gradient mark, pulsing status dot, topbar, stat-strip, Profile cards with real usage bars + threshold marker + status word, sectioned Settings, Add Profile/Export/Import modals with type-cards/steppers/tag-color picker/passphrase-block.
-2. **Second pass**: a real theme (dark/light) and chart-style (bars/round) toggle; the Overview page as a two-column layout (Profiles + usage/cost charts on the left, Activity log on the right); a full Profiles table (search, status filters, sort, drag-to-reorder priority, inline 5h/7d bars, a threshold chip, a kebab menu); an Activity export button and date-range filter; a real toast system and a connection-lost banner (replacing every `window.confirm`/`alert`, including a type-to-confirm dialog for destructive actions); a Profile Detail modal; a custom themed dropdown and drag-and-drop file dropzone for Import; a "Send test notification" button; a Process section in Settings (pid, memory, uptime, kill/restart); an ambient background glow and cursor-follow spotlight.
+`usage_tracking.py` is a **strict tee**. Every chunk read from upstream is yielded onward
+unmodified and in order; a separate copy is parsed for token counts. Every parse is
+guarded, so a malformed body costs a usage record and never the response.
 
-A few notable fixes along the way: the custom dropdown's re-render closure captured a stale, untranslated options array (a Settings dropdown briefly showed a raw i18n key instead of its label after page load); the export/import checkboxes always rendered their checkmark icon regardless of checked state; `tests/test_gateway_usage_tracking.py` didn't isolate `project_usage.py`'s storage file, so running the test suite was writing fake entries into this machine's real `~/.claude-unlimited/project_usage.json` (fixed and verified the suite no longer touches real local state); and the model-split donut/bar colors originally put two similar light blues next to each other in the palette, making adjacent models hard to tell apart (rebuilt with maximally distinct hues).
+Recording happens once the body is fully forwarded, on the committed (non-retry) path
+only. A client that disconnects mid-stream simply gets no usage record.
+
+## Model parity (codex only)
+
+Claude Code asks for a Claude model; something has to choose which GPT model answers and
+how hard it reasons. `openai_models.py` owns that mapping and Settings → Models parity
+edits it. A Profile with its own override ignores the table.
+
+Codex quota is spent on reasoning tokens produced × model tier, not on context size — see
+[ADR 0007](adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).
+
+## The Claude desktop app
+
+`claude-unlimited desktop` points the desktop app's inference at the pool. The app calls
+this third-party inference mode and runs it from a **separate** userData directory,
+`~/Library/Application Support/Claude-3p/`, which is why none of it appears in the normal
+profile. The settings live in `configLibrary/<uuid>.json` with a `_meta.json` naming the
+applied entry.
+
+Two constraints shape the command:
+
+- The app loads this config at startup and rewrites parts of it on exit, so it must be
+  fully stopped before anything is written. `desktop` quits it gracefully, waits, writes,
+  then relaunches. If it will not quit, the command refuses rather than writing something
+  about to be overwritten.
+- One backup is taken before the first modification and never overwritten. `--revert`
+  restores it, and `purge` restores it too — purge deletes the directory that backup lives
+  in, so without that the app would be left pointing at a gateway that no longer exists.
 
 ## Environment parity with plain `claude`
 
-A stated hard requirement: `claude-unlimited code` must give a project **exactly**
-the setup and behavior it gets from firing up `claude` directly. This holds
-structurally, not by accident — `code()` (cli.py) only ever adds
-`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, and the `/model` labels
-(`_apply_model_labels`), then `os.execvp`s the *same* `claude` binary in the
-*same* cwd with all other args forwarded. In particular it never sets
-`CLAUDE_CONFIG_DIR` — that is used only by the `add-account`/`reauth`
-subprocesses, so `~/.claude` (settings, skills, agents, plugins, memory,
-session history) is the user's real one, and everything Claude Code discovers
-from cwd (`CLAUDE.md`, `.claude/`) is untouched.
+`claude-unlimited code` must give a project exactly what plain `claude` gives it. It adds
+only `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and the model labels, then `execvp`s the
+same binary in the same directory. It never sets `CLAUDE_CONFIG_DIR` — that is used only
+by the `add-account`/`reauth` subprocesses — so `~/.claude`, `CLAUDE.md`, skills, agents
+and session history are the user's real ones.
 
-On the wire, an oauth Profile's request body is passed through byte-for-byte
-except `metadata.user_id` (`proxy._rewrite_account_uuid`); the system prompt,
-tools, and all CLAUDE.md/skill content reach Anthropic unmodified.
+One unavoidable difference: setting `ANTHROPIC_AUTH_TOKEN` makes Claude Code treat this as
+a custom auth source, which disables claude.ai-hosted connectors. Locally-configured MCP
+servers are unaffected. This is inherent to routing through a custom base URL — the proxy
+has to authenticate its callers, or any local process could spend the pool.
 
-Verified live (2026-08-24) with a throwaway project exercising four separate
-mechanisms — a `CLAUDE.md` instruction, a project `.claude/skills/` skill, an
-`env` var from project `.claude/settings.json`, and a project
-`.claude/agents/` subagent — run three ways: plain `claude`, through the proxy
-rotated (which happened to be served by **Codex/GPT**), and through the proxy
-pinned to a Claude Profile. All three loaded and honored all four identically.
-(One first-run difference on the subagent probe was plain model
-non-determinism — plain `claude` skipped the delegation once and matched on
-retry — not a config difference.)
+## OS support
 
-The one real, unavoidable difference: setting `ANTHROPIC_AUTH_TOKEN` makes
-Claude Code treat this as a custom auth source, which disables **claude.ai-hosted
-connectors** ("claude.ai connectors are disabled because ... takes precedence
-over your claude.ai login"). Locally-configured MCP servers (`mcpServers` in
-settings/`.mcp.json`) are unaffected. This is inherent to routing through a
-custom base URL and cannot be fixed from this side — the proxy must
-authenticate its callers, or any local process could spend the pool's accounts.
+Three backends exist behind each interface. macOS is the only one verified on real
+hardware; see [ADR 0005](adr/0005-windows-linux-backends-unverified-first-cut.md) for what
+that means and [`CONTRIBUTING.md`](../CONTRIBUTING.md#os-support-status) for what to check
+if you are the first to run it elsewhere.
 
-## What's designed but not built
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Credentials | Keychain ✅ | Secret Service | DPAPI |
+| Auto-start | launchd ✅ | systemd --user | Task Scheduler |
+| Notifications | osascript ✅ | notify-send | PowerShell toast |
 
-- **Automatic download+install updates** — still explicitly deferred pending a real signing/trust-root decision (see the Roadmap in `README.md`); manual update notification is the shipped subset. `Settings.notify_update_available` and `notifications.py` are ready for this; there's just no update-checker calling them yet.
-- **"Test connection"** from the Profiles menu — omitted rather than faked, since there's no live test-request endpoint yet. ("Pin as active now" shipped as "Take over" — `Gateway.force_active()`.)
-- **Real-hardware verification of the Linux and Windows backends** — `secret_store/` and `daemon_installer/` both have real, unit-tested Linux (`secret-tool`/Secret Service, `systemd --user`) and Windows (DPAPI via `ctypes`, Task Scheduler) implementations behind the pluggable interfaces `docs/adr/0002-*.md` set up (`docs/adr/0005-*.md`), so this isn't a missing feature — it's an unverified one, never run on real Linux/Windows hardware. macOS remains the only platform verified against real hardware.
+## Not built yet
+
+- **Signed releases.** The updater proves a download matches the commit GitHub names for
+  its tag, which shows it came from this repository's history. It does not prove
+  authorship; a detached signature could layer on top.
+- **Real-hardware verification of Linux and Windows.** The code exists and is unit tested.
 
 ## Testing
 
 ```bash
-python3 -m pytest tests/ -v
+python3 -m pytest tests/
 ```
-463 tests as of this writing, exercising the Rotation state machine in isolation, the gateway against a fake upstream (including real SSE-shaped streaming bodies, and per-session Profile pinning), the encrypted export/import round-trip, i18n key parity across all locale files, and the Dashboard's JSON API. Every change in this project's history has also been verified live — against a real running daemon and a real Claude Max account; a live-browser Playwright pass is done whenever the browser extension is actually connected, and explicitly flagged as skipped in this project's own working notes on the (not infrequent) sessions where it wasn't.
+
+Tests never reach the network, the real keychain, `~/.claude`, or the real `claude`
+binary — anything that talks to a provider is injected, so the suite runs offline and
+cannot spend anyone's quota.

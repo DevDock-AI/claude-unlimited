@@ -68,6 +68,14 @@ Consequences:
 
 - **Never move or delete a published tag.** The updater resolves tag → SHA,
   so a moved tag means an installed version no longer matches its own release.
+
+  This is not just untidy — it is **unrecoverable**. Releases on GitHub are
+  immutable: once a version has carried a published release, that version
+  number is permanently reserved, and deleting the release does not free it.
+  Re-publishing under the same tag is refused, so the only way forward is to
+  skip the number entirely. Seven consecutive versions were burned this way in
+  this repository, by deleting releases in order to re-publish them. If a
+  release is wrong, **publish a new patch version** — never delete and retry.
 - **Never publish a release for a tag that failed CI.** The workflow enforces
   this, so the only way to break it is by publishing a release by hand.
 - Release notes are informational — nothing parses them.

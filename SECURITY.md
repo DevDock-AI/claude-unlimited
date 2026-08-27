@@ -17,7 +17,7 @@ Claude Unlimited does **not** defend against:
 
 ## What never leaves your machine
 
-Nothing — usage stats, project attribution, the activity log, your Profile configuration — is transmitted anywhere except to the provider you configured — Anthropic, OpenAI/Codex, or your own gateway — as part of the API requests you're already making. There is no telemetry, no analytics, and no phone-home beyond polling GitHub's public Releases API to compare version numbers.
+Nothing — usage stats, project attribution, the activity log, your Profile configuration — is transmitted anywhere except to the provider you configured — Anthropic, OpenAI/Codex, or your own gateway — as part of the API requests you're already making. There is no telemetry, no analytics, and no phone-home beyond polling GitHub's public Releases API to compare version numbers. The daemon does make one other request you didn't directly trigger: refreshing an OAuth account's access token shortly before it expires, which sends that account's own refresh token to the provider it already belongs to and nothing else.
 
 ## Hardening in place
 
