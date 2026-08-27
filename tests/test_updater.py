@@ -292,7 +292,11 @@ def test_a_repo_with_no_releases_is_not_an_error(tmp_path):
         raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
 
     out = updater.run_update_cycle("0.1.0", "auto_install", opener=opener, staging_dir=tmp_path / "s")
-    assert out.action == "none" and out.error is None
+    assert out.error is None and out.release is None
+    # Not "none": that means "checked, you already have the newest release",
+    # and the dashboard says exactly that. A repo with nothing published is a
+    # different fact, and claiming the person is up to date would be false.
+    assert out.action == "no_releases"
 
 
 def test_other_http_errors_are_still_reported(tmp_path):
@@ -491,3 +495,17 @@ def test_state_is_snapshotted_before_the_process_goes_away(monkeypatch):
 
     daemon_mod._restart_for_update(4317)
     assert order == ["persist", "restart"]
+
+
+def test_recording_a_no_releases_outcome_notifies_nothing_and_does_not_crash():
+    """`_record_update_outcome` dereferences outcome.release for anything it
+    treats as newsworthy. "no_releases" carries no Release, so mistaking it for
+    an actionable outcome is an AttributeError in a background loop."""
+    from claude_unlimited import daemon
+
+    outcome = updater.UpdateOutcome(release=None, action="no_releases")
+    daemon._record_update_outcome(outcome, None)
+
+    assert daemon._update_state["action"] == "no_releases"
+    assert daemon._update_state["available"] is None
+    assert daemon._update_state["error"] is None

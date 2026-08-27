@@ -86,7 +86,16 @@ def list_events() -> list[UsageEvent]:
             data = json.loads(line)
         except json.JSONDecodeError:
             continue  # a corrupt line never breaks the whole log
-        events.append(UsageEvent(**data))
+        if not isinstance(data, dict):
+            continue
+        try:
+            events.append(UsageEvent(**data))
+        except TypeError:
+            # Valid JSON, wrong shape — an unknown or missing field. This
+            # file is read by GET /api/profiles, the usage pages AND the
+            # api-kind token-budget check on the request path, so one such
+            # line would otherwise take all of them down at once.
+            continue
     return events
 
 

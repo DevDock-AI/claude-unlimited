@@ -210,7 +210,15 @@ MODE_INSTALLS = ("auto_install",)
 @dataclass(frozen=True)
 class UpdateOutcome:
     release: Optional[Release]
-    action: str  # "none" | "available" | "downloaded" | "installed"
+    # "none" | "no_releases" | "available" | "downloaded" | "installed"
+    #
+    # "no_releases" is deliberately NOT folded into "none". They look alike
+    # from here but mean opposite things to the person reading the dashboard:
+    # "none" means we asked and you already have the newest release, while
+    # "no_releases" means the repository has published none at all. Collapsing
+    # them made the UI claim "You're on the latest release" for a repo with no
+    # releases — a sentence that is simply untrue.
+    action: str
     error: Optional[str] = None
 
     @property
@@ -229,7 +237,7 @@ def run_update_cycle(current_version: str, mode: str, *,
     try:
         release = check_for_update(current_version, opener=opener)
     except NoReleasesYet:
-        return UpdateOutcome(release=None, action="none")
+        return UpdateOutcome(release=None, action="no_releases")
     except UpdateError as exc:
         return UpdateOutcome(release=None, action="none", error=str(exc))
     if release is None:

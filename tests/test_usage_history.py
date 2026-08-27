@@ -321,3 +321,26 @@ def test_tokens_by_project_cost_none_when_no_priced_events():
     events = [_event_at(now, project_id="-Users-a-app", cost_usd=None)]
     totals = usage_history.tokens_by_project(events)
     assert totals["-Users-a-app"]["cost_usd"] is None
+
+
+def test_a_line_with_the_wrong_shape_is_skipped_not_fatal(monkeypatch, tmp_path):
+    """This file feeds GET /api/profiles, both usage pages, and the api-kind
+    token-budget check on the request path. One valid-JSON-wrong-shape line
+    used to take all of them down together with a TypeError."""
+    log = tmp_path / "usage_history.jsonl"
+    monkeypatch.setattr(usage_history, "APP_DIR", tmp_path)
+    monkeypatch.setattr(usage_history, "USAGE_HISTORY_FILE", log)
+
+    usage_history.record("a", None, "claude-opus-4",
+                         {"input_tokens": 10, "output_tokens": 20})
+    with log.open("a", encoding="utf-8") as f:
+        f.write('{"timestamp":"2026-01-02T00:00:00+00:00","profile_id":"a",'
+                '"project_id":null,"model":"m","input_tokens":1,"output_tokens":1,'
+                '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,'
+                '"cost_usd":null,"reasoning_tokens":7}\n')   # a field this build does not know
+        f.write('{"timestamp":"2026-01-02T00:00:00+00:00"}\n')  # missing fields
+        f.write('[1, 2, 3]\n')                                   # not an object
+
+    events = usage_history.list_events()
+    assert [e.profile_id for e in events] == ["a"]
+    assert events[0].input_tokens == 10

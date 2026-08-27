@@ -38,11 +38,23 @@ def record(category: str, text: str, meta: Optional[str] = None) -> ActivityEven
         raise ValueError(f"Unknown activity category {category!r}; must be one of {CATEGORIES}")
 
     event = ActivityEvent(timestamp=datetime.now(timezone.utc).isoformat(), category=category, text=text, meta=meta)
-    ensure_app_dir()
-    with _lock:
-        with ACTIVITY_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(event)) + "\n")
-        _trim_if_needed()
+    # An unwritable log must never break the request that was being logged.
+    # record() is called from inside the live request path — a rotation, a
+    # rejected credential — after the upstream response has already come back,
+    # so a full disk or a removed app directory would have turned a request
+    # that genuinely succeeded into a dropped connection, and leaked the
+    # profile's in-flight slot on the way out. Losing an audit line is the
+    # lesser failure, and the same trade-off notifications and runtime-state
+    # persistence already make. The category check above still raises: that is
+    # a programming error, not an environmental one.
+    try:
+        ensure_app_dir()
+        with _lock:
+            with ACTIVITY_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(event)) + "\n")
+            _trim_if_needed()
+    except OSError:
+        pass
     return event
 
 
@@ -80,6 +92,8 @@ def list_events(
             data = json.loads(line)
         except json.JSONDecodeError:
             continue  # a corrupt line never breaks the whole log
+        if not isinstance(data, dict):
+            continue
         if category and data.get("category") != category:
             continue
         ts = data.get("timestamp", "")
@@ -87,7 +101,14 @@ def list_events(
             continue
         if until and ts > until:
             continue
-        events.append(ActivityEvent(**data))
+        try:
+            events.append(ActivityEvent(**data))
+        except TypeError:
+            # Valid JSON, wrong shape: a field this build does not know
+            # (written by a newer version, then downgraded) or one missing.
+            # "A corrupt line never breaks the whole log" has to mean this
+            # too, or one such line 500s the whole Activity page.
+            continue
         if len(events) >= limit:
             break
     return events

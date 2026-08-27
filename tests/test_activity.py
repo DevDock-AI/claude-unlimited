@@ -85,3 +85,51 @@ def test_list_events_until_excludes_later_events():
 
     events = activity.list_events(until="2026-08-19T00:00:00+00:00")
     assert [e.text for e in events] == ["day-19", "day-18"]
+
+
+# --- the log must never be able to break what it is logging ----------------
+
+
+def test_an_unwritable_log_does_not_raise(monkeypatch, tmp_path):
+    """record() runs inside the live request path, after the upstream response
+    has already come back. A full disk turning a successful request into a
+    dropped connection is a far worse failure than a missing audit line."""
+    monkeypatch.setattr(activity, "APP_DIR", tmp_path)
+    monkeypatch.setattr(activity, "ACTIVITY_FILE", tmp_path / "activity.jsonl")
+
+    def no_disk(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(activity.ACTIVITY_FILE.__class__, "open", no_disk)
+    event = activity.record("rotation", "switched to B")
+    assert event.text == "switched to B"  # still returns the event it built
+
+
+def test_a_bad_category_still_raises(monkeypatch, tmp_path):
+    """A programming error, not an environmental one — it must not be
+    swallowed alongside the I/O guard."""
+    monkeypatch.setattr(activity, "APP_DIR", tmp_path)
+    monkeypatch.setattr(activity, "ACTIVITY_FILE", tmp_path / "activity.jsonl")
+    with pytest.raises(ValueError):
+        activity.record("not-a-category", "x")
+
+
+def test_a_line_with_the_wrong_shape_is_skipped_not_fatal(monkeypatch, tmp_path):
+    """Only json.JSONDecodeError used to be caught, so a line that parsed but
+    did not match the dataclass — an unknown field from a newer version, a
+    bare number — raised TypeError and 500'd the whole Activity page."""
+    monkeypatch.setattr(activity, "APP_DIR", tmp_path)
+    log = tmp_path / "activity.jsonl"
+    monkeypatch.setattr(activity, "ACTIVITY_FILE", log)
+
+    activity.record("rotation", "good one")
+    with log.open("a", encoding="utf-8") as f:
+        f.write('{"timestamp":"2026-01-01T00:00:00+00:00","category":"rotation",'
+                '"text":"from the future","severity":"high"}\n')   # unknown field
+        f.write('{"timestamp":"2026-01-01T00:00:00+00:00"}\n')     # missing fields
+        f.write('123\n')                                            # not an object
+        f.write('not json at all\n')
+    activity.record("config", "another good one")
+
+    texts = [e.text for e in activity.list_events()]
+    assert texts == ["another good one", "good one"]

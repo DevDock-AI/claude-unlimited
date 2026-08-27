@@ -60,6 +60,11 @@ class ExportedProfile:
     tag_color: Optional[str]
     account_uuid: Optional[str]
     credential: str  # the one place a secret is ever put in a serializable structure
+    # The account's tier ("max"/"pro"), which only the add-account and
+    # import-login flows ever discover. Nothing recomputes it for an oauth
+    # Profile afterwards, so leaving it out of the bundle meant a restored
+    # account showed no tier in the Dashboard forever.
+    plan: Optional[str] = None
     # codex_home is deliberately NOT exported: it is a local path from the
     # one-time `codex login` handshake, meaningless on another machine, and
     # the credential that a re-import actually needs is already carried
@@ -94,7 +99,7 @@ def build_export_bundle(
                 automatic=p.automatic, default_model=p.default_model, monthly_budget_cap=p.monthly_budget_cap,
                 token_threshold=p.token_threshold,
                 tag_color=p.tag_color, account_uuid=p.account_uuid, credential=cred,
-                codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
+                plan=p.plan, codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
             )))
         payload["profiles"] = exported
 
@@ -206,7 +211,7 @@ def apply_import(
                         switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
                         automatic=item.get("automatic", True), default_model=item.get("default_model"),
                         monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
-                        tag_color=item.get("tag_color"),
+                        tag_color=item.get("tag_color"), plan=item.get("plan"),
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
@@ -222,7 +227,7 @@ def apply_import(
                     automatic=item.get("automatic", True), default_model=item.get("default_model"),
                     monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                     tag_color=item.get("tag_color"),
-                    account_uuid=item.get("account_uuid"),
+                    account_uuid=item.get("account_uuid"), plan=item.get("plan"),
                     codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                 )
                 secret_store.set_token(new_profile.id, item["credential"])
@@ -231,11 +236,27 @@ def apply_import(
             save_pool(pool)
 
     if import_settings and parsed.settings:
-        from .config import Settings
+        from .config import Settings, validated_settings_changes
+
+        # Validated, not trusted. A bundle is a file from somewhere else, and
+        # settings now carry decisions with real consequences — model_parity
+        # picks which model every codex request runs on, which is what Codex
+        # quota is spent on (docs/adr/0007). Importing that unchecked would let
+        # a bundle silently change someone's spending.
+        incoming = {k: v for k, v in parsed.settings.items() if k in Settings.__dataclass_fields__}
+        incoming = validated_settings_changes(incoming)
 
         with CONFIG_LOCK:
             pool = load_pool()
-            pool.settings = Settings(**{k: v for k, v in parsed.settings.items() if k in Settings.__dataclass_fields__})
+            # Merged onto the current settings, not built fresh from the
+            # bundle. Settings(**incoming) reverted every field the bundle did
+            # not mention back to its dataclass default — and a bundle exported
+            # by a version that predates a field simply has no key for it. So
+            # importing an older bundle silently reset the language and
+            # notification preferences of whoever imported it. This is also
+            # what update_settings() does, and the two should not disagree
+            # about what writing settings means.
+            pool.settings = replace(pool.settings, **incoming)
             save_pool(pool)
         result["settings_applied"] = True
 

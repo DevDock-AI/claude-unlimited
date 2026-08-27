@@ -201,3 +201,38 @@ def test_unsupported_bundle_version_rejected(env):
 def test_not_json_raises_clear_error(env):
     with pytest.raises(ei.ExportImportError):
         ei.import_bundle(b"not json at all")
+
+
+def test_the_account_tier_survives_an_export_import_round_trip(env):
+    """`plan` ("max"/"pro") is discovered only by the add-account and
+    import-login flows, and nothing recomputes it afterwards — so a Profile
+    restored from a bundle used to show no tier in the Dashboard forever."""
+    profile_repo.create_profile(name="Max account", kind="oauth", credential="sk-ant-12345678",
+                            account_uuid="acct-1", plan="max")
+    bundle = ei.build_export_bundle(
+        include_profiles=True, include_settings=False, include_activity=False,
+        passphrase="hunter22")
+
+    profile_repo.reset_all_profiles()
+    parsed = ei.import_bundle(bundle, passphrase="hunter22")
+    ei.apply_import(parsed, import_profiles=True, import_settings=False)
+
+    assert [p.plan for p in profile_repo.list_profiles()] == ["max"]
+
+
+def test_importing_settings_does_not_reset_fields_the_bundle_never_carried(env):
+    """A bundle exported by a version predating a field simply has no key for
+    it. Rebuilding Settings from scratch turned that into "reset it to the
+    default", silently changing preferences of whoever imported."""
+    from claude_unlimited.config import update_settings
+
+    update_settings(language="ro", notifications_enabled=False)
+    parsed = ei.ParsedBundle(
+        profiles=[], settings={"update_mode": "manual"}, activity=None)
+
+    ei.apply_import(parsed, import_profiles=False, import_settings=True)
+
+    settings = load_pool().settings
+    assert settings.update_mode == "manual"     # what the bundle asked for
+    assert settings.language == "ro"            # untouched, not reset to "en"
+    assert settings.notifications_enabled is False
