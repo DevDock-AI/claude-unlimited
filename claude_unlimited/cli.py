@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import uuid
 import os
 import secrets
 import shlex
@@ -33,7 +34,7 @@ from . import anthropic_oauth
 from . import daemon_installer
 from . import i18n
 from . import profiles as profile_repo
-from .config import ensure_app_dir, load_pool
+from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, ensure_app_dir, load_pool
 from .daemon import DEFAULT_PORT, LOOPBACK_HOST, run_foreground
 
 
@@ -408,33 +409,11 @@ def _status_line_args(port: int, claude_args: list[str]) -> list[str]:
 
 
 def _remove_isolated_claude_logins(config_dirs: list) -> None:
-    """Removes the Keychain entries created by `add-account`'s isolated logins.
+    """purge's reporting wrapper around anthropic_oauth.remove_isolated_logins.
 
-    Those are written by Claude Code itself, under a service name derived from
-    the isolated directory we handed it, so they are ours to clean up and would
-    otherwise outlive everything else.
-
-    The derivation is what makes this safe: each name is
-    "Claude Code-credentials-<hash of one of our own directories>". The user's
-    real login is the un-suffixed "Claude Code-credentials", which no directory
-    of ours can hash to, so it can never be selected here."""
-    if sys.platform != "darwin" or not config_dirs:
-        return
-    from .anthropic_oauth import MACOS_KEYCHAIN_SERVICE, isolated_macos_keychain_service
-
-    removed = 0
-    for config_dir in config_dirs:
-        service = isolated_macos_keychain_service(config_dir)
-        if service == MACOS_KEYCHAIN_SERVICE:
-            continue  # unreachable by construction; refuse anyway
-        try:
-            result = subprocess.run(
-                ["security", "delete-generic-password", "-s", service],
-                capture_output=True, timeout=10, check=False)
-            if result.returncode == 0:
-                removed += 1
-        except (OSError, subprocess.SubprocessError):
-            pass
+    The removal itself lives there because delete_profile() needs the same
+    thing and cannot import this module."""
+    removed = anthropic_oauth.remove_isolated_logins(config_dirs)
     print(f"Isolated Claude Code logins removed: {removed} "
           f"(your own `claude` login was not touched)")
 
@@ -594,6 +573,9 @@ def purge(port: int = DEFAULT_PORT, assume_yes: bool = False) -> int:
     print(f"  - {install_root}  (the app and its virtualenv)")
     print(f"  - {cli_link}")
     print("  - the background service registration, if installed")
+    if (APP_DIR_PATH() / "claude-desktop-backup").is_dir():
+        print("  - the Claude desktop app's routing through the pool (its own settings")
+        print("    are restored to how they were before `claude-unlimited desktop`)")
     print()
     print("Your own Claude Code setup (~/.claude) is NOT touched.")
     print()
@@ -644,6 +626,7 @@ def purge(port: int = DEFAULT_PORT, assume_yes: bool = False) -> int:
         pass
     print(f"Credentials removed from the keystore: {removed}")
     _remove_isolated_claude_logins(isolated_dirs)
+    _revert_desktop_config_for_purge()
 
     for path in (app_dir, install_root):
         if path.exists():
@@ -658,31 +641,366 @@ def purge(port: int = DEFAULT_PORT, assume_yes: bool = False) -> int:
     return 0
 
 
+def _ensure_daemon(port: int) -> bool:
+    """Starts the daemon if it is not already answering. Shared by `code` and
+    `ui` so the two cannot drift apart on how routing is set up."""
+    if _probe_health(LOOPBACK_HOST, port):
+        return True
+    print(f"Daemon isn't running on {LOOPBACK_HOST}:{port} yet — starting it now…")
+    try:
+        _spawn_background_daemon(port)
+    except OSError as exc:
+        print(f"Could not start the daemon: {exc}", file=sys.stderr)
+        return False
+    for _ in range(30):
+        if _probe_health(LOOPBACK_HOST, port):
+            print("Started (not installed for auto-start — run `claude-unlimited install` for that).")
+            return True
+        time.sleep(0.2)
+    print(f"Daemon didn't come up on {LOOPBACK_HOST}:{port} within 6s — "
+          "check ~/.claude-unlimited/logs/daemon.err.log.", file=sys.stderr)
+    return False
+
+
+def _pool_base_url(port: int) -> str:
+    """THE one place the pool's address is constructed. Everything that points
+    a client at the pool — env for the CLI, the desktop app's gateway config —
+    goes through here, so they cannot drift apart."""
+    return f"http://{LOOPBACK_HOST}:{port}"
+
+
+def _routing_env(port: int, *, token: Optional[str] = None) -> dict[str, str]:
+    """The two variables that point a Claude Code client at the pool.
+
+    THE one definition, used by `code` (which passes a token it already
+    fetched) and by `ui`. Restating the pair anywhere else is how the two
+    commands would end up routing differently after a change to one — a test
+    asserts this file names ANTHROPIC_BASE_URL exactly once outside the
+    settings-scrubbing constants."""
+    return {
+        "ANTHROPIC_BASE_URL": _pool_base_url(port),
+        "ANTHROPIC_AUTH_TOKEN": token if token is not None else _fetch_placeholder_token(LOOPBACK_HOST, port),
+    }
+
+
+CLAUDE_APP_BUNDLE_ID = "com.anthropic.claudefordesktop"
+
+# --- Claude desktop app, third-party inference mode -------------------------
+#
+# "3p" is the app's own term for third-party inference: pointing it at a
+# gateway instead of Anthropic directly. In that mode it runs from a SEPARATE
+# userData directory, `Claude-3p`, with its own settings, session and bundled
+# Claude Code. That separation is why searching the normal `Claude` directory
+# for these settings finds nothing.
+#
+# Schema below is not guessed — it was read back out of the app after
+# configuring it by hand through Developer > Configure Third-Party Inference.
+CLAUDE_APP_SUPPORT = Path.home() / "Library" / "Application Support"
+CLAUDE_1P_DIR = CLAUDE_APP_SUPPORT / "Claude"
+CLAUDE_3P_DIR = CLAUDE_APP_SUPPORT / "Claude-3p"
+CU_CONFIG_NAME = "Claude Unlimited"
+
+
+def _desktop_app_running() -> bool:
+    """Whether the Claude desktop app has a live process.
+
+    It loads this configuration at startup and rewrites parts of it on exit,
+    so configuring a running instance is either ignored or clobbered."""
+    try:
+        result = subprocess.run(["pgrep", "-f", "Claude.app/Contents/MacOS/Claude"],
+                                capture_output=True, text=True, timeout=5)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _quit_desktop_app(timeout: float = 20.0) -> bool:
+    """Asks the Claude desktop app to quit, and waits until it really has.
+
+    A graceful quit, never a kill: the app rewrites parts of its configuration
+    as it exits, so it has to finish doing that BEFORE we write ours — a kill
+    would either lose the person's in-progress work or leave a half-written
+    config that then overwrites what we put there.
+
+    Returns False if it is still running when the timeout expires, so the
+    caller can stop rather than write a configuration the app is about to
+    overwrite."""
+    try:
+        subprocess.run(["osascript", "-e", 'tell application id "%s" to quit' % CLAUDE_APP_BUNDLE_ID],
+                        capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return not _desktop_app_running()
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _desktop_app_running():
+            # The app's own exit writes land after the process disappears on
+            # some runs; a short settle avoids racing them.
+            time.sleep(1.0)
+            return True
+        time.sleep(0.4)
+    return not _desktop_app_running()
+
+
+def _desktop_paths(base: Path) -> dict:
+    return {
+        "desktop_config": base / "claude_desktop_config.json",
+        "developer": base / "developer_settings.json",
+        "library": base / "configLibrary",
+        "meta": base / "configLibrary" / "_meta.json",
+    }
+
+
+def _read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".cu-tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _backup_desktop_config() -> None:
+    """One snapshot of everything we are about to touch, taken once.
+
+    Not overwritten on later runs: the first backup is the only one taken
+    before this tool ever modified anything, so it is the only one that can
+    restore the app to how the person had it."""
+    backup = APP_DIR_PATH() / "claude-desktop-backup"
+    if backup.exists():
+        return
+    backup.mkdir(parents=True, exist_ok=True)
+    for base in (CLAUDE_1P_DIR, CLAUDE_3P_DIR):
+        for name, path in _desktop_paths(base).items():
+            if name == "library" or not path.exists():
+                continue
+            target = backup / base.name / path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        lib = _desktop_paths(base)["library"]
+        if lib.is_dir():
+            for entry in lib.glob("*.json"):
+                target = backup / base.name / "configLibrary" / entry.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(entry.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def APP_DIR_PATH() -> Path:
+    from .config import APP_DIR
+    return Path(APP_DIR)
+
+
+def _configure_desktop_app(port: int, token: str) -> str:
+    """Creates (or updates) a "Claude Unlimited" inference profile in the
+    desktop app and makes it the applied one.
+
+    Returns the entry id. Everything else in the app's config library is left
+    alone — a person may have other gateways configured, and replacing their
+    library would be destructive."""
+    paths = _desktop_paths(CLAUDE_3P_DIR)
+    paths["library"].mkdir(parents=True, exist_ok=True)
+
+    meta = _read_json(paths["meta"], {})
+    entries = meta.get("entries") or []
+
+    existing = next((e for e in entries if e.get("name") == CU_CONFIG_NAME), None)
+    entry_id = existing["id"] if existing else str(uuid.uuid4())
+    if existing is None:
+        entries.append({"id": entry_id, "name": CU_CONFIG_NAME})
+
+    _write_json(paths["library"] / f"{entry_id}.json", {
+        "inferenceGatewayBaseUrl": _pool_base_url(port),
+        "inferenceGatewayApiKey": token,
+        "inferenceProvider": "gateway",
+        "inferenceCredentialKind": "static",
+    })
+    meta["entries"] = entries
+    meta["appliedId"] = entry_id
+    _write_json(paths["meta"], meta)
+
+    # Developer mode, and the third-party deployment switch. Written to both
+    # profiles: the app reads the mode from its config to decide which profile
+    # to run from, so a first-time switch has to be visible to the 1p profile.
+    for base in (CLAUDE_1P_DIR, CLAUDE_3P_DIR):
+        p = _desktop_paths(base)
+        # Created rather than skipped: on a fresh install neither directory
+        # exists yet, and the 1p config is precisely where the deployment
+        # switch has to land for the next launch to open the 3p profile.
+        base.mkdir(parents=True, exist_ok=True)
+        dev = _read_json(p["developer"], {})
+        dev["allowDevTools"] = True
+        _write_json(p["developer"], dev)
+        cfg = _read_json(p["desktop_config"], {})
+        cfg["deploymentMode"] = "3p"
+        _write_json(p["desktop_config"], cfg)
+
+    return entry_id
+
+
+def desktop(port: int) -> int:
+    """Configures the Claude desktop app to route through the pool, and starts it.
+
+    The app calls this third-party ("3p") inference mode: pointing it at a
+    gateway instead of Anthropic. In that mode it runs from its own userData
+    directory with its own settings and bundled Claude Code.
+
+    This writes the same configuration the app's own
+    Developer > Configure Third-Party Inference dialog writes, so the app is
+    ready on launch rather than needing a form filled in by hand."""
+    _banner()
+
+    if sys.platform != "darwin":
+        print("`desktop` is macOS-only for now: the app's config layout has only been "
+              "verified there.", file=sys.stderr)
+        return 1
+
+    if not Path("/Applications/Claude.app").exists():
+        print("Claude desktop app not found at /Applications/Claude.app.", file=sys.stderr)
+        print("Install it from https://claude.ai/download, or use `claude-unlimited code` "
+              "for the terminal.", file=sys.stderr)
+        return 1
+
+    # The app reads this configuration at startup and rewrites parts of it as
+    # it exits, so it must be fully stopped before anything is written —
+    # otherwise its shutdown overwrites what we just put there.
+    if _desktop_app_running():
+        print("Claude is running — asking it to quit so its settings can be updated…")
+        print("(any unsaved work in the app should be saved first)")
+        if not _quit_desktop_app():
+            print("", file=sys.stderr)
+            print("Claude is still running. It may be showing a dialog, or waiting on "
+                  "unsaved work.", file=sys.stderr)
+            print("Quit it yourself (Cmd-Q) and run this again — configuring it while it "
+                  "runs would be overwritten when it exits.", file=sys.stderr)
+            return 1
+        print("Stopped.")
+
+    if not _ensure_daemon(port):
+        return 1
+
+    enabled = [p for p in load_pool().profiles if p.enabled]
+    if not enabled:
+        print("WARNING: no Profile is enabled, so every request will be refused with")
+        print("         \"No eligible Profile available\". Enable one in the Dashboard.")
+        print("")
+
+    token = _fetch_placeholder_token(LOOPBACK_HOST, port)
+    _backup_desktop_config()
+    _configure_desktop_app(port, token)
+    print(f"Configured the desktop app: inference profile {CU_CONFIG_NAME!r} -> "
+          f"{_pool_base_url(port)}")
+    print("(previous configuration backed up — `claude-unlimited desktop --revert` undoes this)")
+
+    try:
+        result = subprocess.run(["open", "-b", CLAUDE_APP_BUNDLE_ID],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Could not launch the app: {exc}", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        print(f"`open` failed: {(result.stderr or result.stdout).strip()}", file=sys.stderr)
+        return 1
+
+    print("")
+    print(f"Launched. Dashboard: {_pool_base_url(port)}/")
+    print("Claude Code sessions inside the app now route through the pool; the app's own")
+    print("chat talks to claude.ai and is unaffected. Watch the Activity page to confirm.")
+    return 0
+
+
+def _restore_desktop_backup(backup: Path) -> int:
+    """Copies a snapshot back over the desktop app's configuration.
+
+    Shared by `desktop --revert` and by purge, which must undo the same change
+    for the same reason. Neither checks whether the app is running — that is
+    the caller's job, because they handle a running app differently."""
+    restored = 0
+    for profile_dir in backup.iterdir():
+        if not profile_dir.is_dir():
+            continue
+        target_base = CLAUDE_APP_SUPPORT / profile_dir.name
+        for item in profile_dir.rglob("*.json"):
+            target = target_base / item.relative_to(profile_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(item.read_text(encoding="utf-8"), encoding="utf-8")
+            restored += 1
+    return restored
+
+
+def _revert_desktop_config_for_purge() -> None:
+    """Undoes `claude-unlimited desktop`, before purge deletes the app
+    directory the snapshot lives in.
+
+    Skipping this would leave the desktop app pointed at a gateway that is
+    about to stop existing, with the only snapshot that could restore it
+    deleted moments later. Best-effort throughout: purge must finish even when
+    the app will not quit, so in that case the snapshot is moved somewhere it
+    survives and the person is told where."""
+    backup = APP_DIR_PATH() / "claude-desktop-backup"
+    if not backup.is_dir():
+        return
+
+    if _desktop_app_running():
+        print("Claude desktop app is running — asking it to quit so its "
+              "configuration can be restored…")
+        if not _quit_desktop_app():
+            keep = Path.home() / "claude-unlimited-desktop-backup"
+            try:
+                if keep.exists():
+                    shutil.rmtree(keep, ignore_errors=True)
+                shutil.move(str(backup), str(keep))
+            except OSError as exc:
+                print(f"Desktop app: could not preserve its backup ({exc})", file=sys.stderr)
+                return
+            print("Desktop app: still running, so its configuration was left "
+                  "pointing at Claude Unlimited.", file=sys.stderr)
+            print(f"             Its original settings were saved to {keep} —", file=sys.stderr)
+            print("             quit Claude and copy them back into "
+                  f"{CLAUDE_APP_SUPPORT} to undo it.", file=sys.stderr)
+            return
+
+    try:
+        restored = _restore_desktop_backup(backup)
+    except OSError as exc:
+        print(f"Desktop app: configuration not restored ({exc})", file=sys.stderr)
+        return
+    print(f"Desktop app: restored {restored} configuration file(s) to how they were")
+
+
+def desktop_revert() -> int:
+    """Restores the desktop app's configuration from the snapshot taken before
+    this tool first changed it."""
+    _banner()
+    backup = APP_DIR_PATH() / "claude-desktop-backup"
+    if not backup.is_dir():
+        print("No backup found — nothing to restore.", file=sys.stderr)
+        return 1
+    if _desktop_app_running():
+        print("Quit Claude (Cmd-Q) first, or it will rewrite these files on exit.",
+              file=sys.stderr)
+        return 1
+
+    restored = _restore_desktop_backup(backup)
+    print(f"Restored {restored} configuration file(s).")
+    print("Note: an inference profile named "
+          f"{CU_CONFIG_NAME!r} may remain in the app's list — remove it there if you "
+          "no longer want it.")
+    return 0
+
+
 def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -> int:
     _banner()
     if not shutil.which("claude"):
         print("Claude Code CLI (`claude`) not found on PATH. Install/update Claude Code first.", file=sys.stderr)
         return 1
 
-    if not _probe_health(LOOPBACK_HOST, port):
-        print(f"Daemon isn't running on {LOOPBACK_HOST}:{port} yet — starting it now…")
-        try:
-            _spawn_background_daemon(port)
-        except OSError as exc:
-            print(f"Could not start the daemon: {exc}", file=sys.stderr)
-            return 1
-        for _ in range(30):
-            if _probe_health(LOOPBACK_HOST, port):
-                break
-            time.sleep(0.2)
-        else:
-            print(
-                f"Daemon didn't come up on {LOOPBACK_HOST}:{port} within 6s — "
-                "check ~/.claude-unlimited/logs/daemon.err.log.",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"Started (not installed for auto-start — run `claude-unlimited install` for that).")
+    if not _ensure_daemon(port):
+        return 1
 
     # Picking a specific Profile pins THIS terminal session to it (see
     # session_tokens.py and gateway.py's forced_profile_id); other
@@ -719,8 +1037,7 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
         print(f"Could not fetch the local credential from the daemon: {exc}", file=sys.stderr)
         return 1
 
-    os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{port}"
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = token
+    os.environ.update(_routing_env(port, token=token))
     _apply_model_labels(forced_profile, enabled_profiles)
     if forced_profile is not None:
         print(f"Routing through Claude Unlimited at {LOOPBACK_HOST}:{port}, pinned to {forced_profile.name} "
@@ -813,7 +1130,6 @@ def service_stop() -> int:
     return 0
 
 
-CLAUDE_ACCOUNTS_DIR = Path.home() / ".claude-unlimited" / "claude-accounts"
 
 
 def add_account() -> int:
@@ -882,7 +1198,6 @@ def add_account() -> int:
     return 0
 
 
-CODEX_ACCOUNTS_DIR = Path.home() / ".claude-unlimited" / "codex-accounts"
 
 
 def add_codex_account() -> int:
@@ -1115,6 +1430,11 @@ def main(argv=None) -> int:
     reauth_p = sub.add_parser("reauth", help="re-authenticate an OAuth Profile that needs it "
                                               "(defaults to whichever ones the daemon reports as needing it)")
     reauth_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    desktop_p = sub.add_parser("desktop", help="configure the Claude desktop app to use the pool, then launch it")
+    desktop_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    desktop_p.add_argument("--revert", action="store_true",
+                            help="restore the desktop app's previous configuration and exit")
+
     code_p = sub.add_parser("code", help="start the daemon if needed, then launch `claude` routed through it")
     code_p.add_argument("--port", type=int, default=DEFAULT_PORT)
     code_p.add_argument("--profile", metavar="NAME_OR_ID", default=None,
@@ -1153,6 +1473,8 @@ def main(argv=None) -> int:
         return reauth(args.port)
     if args.cmd == "code":
         return code(args.port, unknown, profile_arg=args.profile)
+    if args.cmd == "desktop":
+        return desktop_revert() if args.revert else desktop(args.port)
     if args.cmd == "install":
         return install(args.port)
     if args.cmd == "uninstall":

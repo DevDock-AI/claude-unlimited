@@ -121,6 +121,43 @@ def read_claude_code_credentials(config_dir: Optional[Path] = None) -> ImportedC
     return _credentials_from_raw(raw, "default session")
 
 
+def remove_isolated_logins(config_dirs) -> int:
+    """Removes the Keychain entries created by `add-account`'s isolated logins.
+
+    Those are written by Claude Code itself, under a service name derived from
+    the isolated directory we handed it, so they are ours to clean up and would
+    otherwise outlive everything else — a live Anthropic refresh token sitting
+    in the Keychain with nothing left referencing it.
+
+    The derivation is what makes this safe: each name is
+    "Claude Code-credentials-<hash of one of our own directories>". The user's
+    real login is the un-suffixed "Claude Code-credentials", which no directory
+    of ours can hash to, so it can never be selected here.
+
+    Lives here rather than in cli.py because deleting a Profile has to do
+    exactly this too, and cli.py is the layer above profiles.py — only `purge`
+    used to clean these up, so removing an account from the Dashboard left its
+    credential behind forever. Returns how many were removed."""
+    if platform.system() != "Darwin" or not config_dirs:
+        return 0
+    removed = 0
+    for config_dir in config_dirs:
+        if not config_dir:
+            continue
+        service = isolated_macos_keychain_service(config_dir)
+        if service == MACOS_KEYCHAIN_SERVICE:
+            continue  # unreachable by construction; refuse anyway
+        try:
+            result = subprocess.run(
+                ["security", "delete-generic-password", "-s", service],
+                capture_output=True, timeout=10, check=False)
+            if result.returncode == 0:
+                removed += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return removed
+
+
 def _read_macos_keychain_credentials(service: str = MACOS_KEYCHAIN_SERVICE) -> Optional[dict]:
     try:
         cp = subprocess.run(
