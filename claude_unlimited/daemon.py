@@ -25,7 +25,6 @@ import json
 import os
 import platform
 import secrets
-import socket
 import signal
 import subprocess
 import sys
@@ -65,6 +64,30 @@ from .gateway import Gateway
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 4317
 ALLOWED_HOST_NAMES = {"127.0.0.1", "localhost", "claude.unlimited"}
+
+
+def _qs_int(qs: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
+    """A clamped integer from a query string, tolerating rubbish.
+
+    A query string is user input — a typo in a pasted URL, a stale bookmark,
+    anything. `int(qs["days"][0])` raised ValueError straight out of the
+    handler, so `?days=abc` answered 500 rather than simply ignoring a value
+    it could not use."""
+    raw = qs.get(key, [str(default)])[0]
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+# Paths that serve the Dashboard itself, so a refresh or a pasted link opens
+# the right view. An explicit set, never a prefix or a catch-all: this daemon
+# is also a live proxy, and every unknown path falls through to be forwarded
+# upstream. A catch-all here would swallow real traffic.
+_VIEW_ROUTES = frozenset({
+    "/", "/profiles", "/activity", "/settings", "/help",
+})
 
 _gateway = Gateway()
 _DAEMON_STARTED_AT = datetime.now(timezone.utc)
@@ -304,7 +327,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "version": __version__})
             return
 
-        if path == "/":
+        if (path.rstrip("/") or "/") in _VIEW_ROUTES:
             html = _INDEX_HTML.replace("__CSRF_TOKEN__", _CSRF_TOKEN)
             body = html.encode("utf-8")
             self.send_response(200)
@@ -371,7 +394,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             # Served rather than restated in the page: the Dashboard used to
             # carry its own copy of this table, which went stale the first
             # time the mapping changed.
-            self._send_json(200, {"mapping": openai_models.automatic_mapping()})
+            self._send_json(200, {
+                "mapping": openai_models.automatic_mapping(load_pool().settings.model_parity),
+                "selectable_models": openai_models.selectable_models(),
+                "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),
+            })
             return
 
         if path == "/api/settings":
@@ -464,10 +491,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 chart_totals = usage_history.monthly_totals(ranged_events)
             else:
                 default_days = usage_history.RANGE_TO_DAYS[range_key]
-                days = min(max(int(qs.get("days", [str(default_days)])[0]), 1), 31)
+                days = _qs_int(qs, "days", default_days, minimum=1, maximum=31)
                 chart_totals = usage_history.daily_totals(ranged_events, days=days)
             profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
-            by_profile_days = min(max(int(qs.get("days", ["7"])[0]), 1), 31)
+            by_profile_days = _qs_int(qs, "days", 7, minimum=1, maximum=31)
             by_profile_totals = usage_history.daily_totals_by_profile(events, days=by_profile_days)
             # usage_history is append-only, so it still carries entries for
             # a deleted Profile's id. Drop anything that isn't a current
@@ -493,7 +520,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/activity":
             qs = parse_qs(urlparse(self.path).query)
-            limit = min(int(qs.get("limit", ["200"])[0]), 1000)
+            limit = _qs_int(qs, "limit", 200, minimum=1, maximum=1000)
             category = qs.get("category", [None])[0]
             since = qs.get("since", [None])[0]
             until = qs.get("until", [None])[0]
@@ -788,8 +815,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 result = connection_test.test_connection(
                     profile_id, credential=_resolved_credential(profile))
                 _record_ping(profile, result)
-                activity.record("session", f"Fetched info for {profile.name}",
-                                 meta=f"status={result.get('status')}")
+                # Report what actually happened. Announcing "fetched" after a
+                # 401 told people the account was fine while the Dashboard
+                # showed nothing new — the two together read as a broken
+                # feature rather than a dead credential.
+                if result.get("ok"):
+                    activity.record("session", f"Fetched info for {profile.name}",
+                                     meta=f"status={result.get('status')}")
+                else:
+                    activity.record("error", f"Couldn't fetch info for {profile.name}",
+                                     meta=f"status={result.get('status')}")
             except connection_test.ConnectionTestThrottled as exc:
                 self._send_json(429, {"error": "throttled", "message": str(exc),
                                        "retry_after_seconds": exc.retry_after_seconds})
@@ -799,7 +834,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return
             fresh = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
             runtime = _gateway.runtime_snapshot().get(profile_id)
-            self._send_json(200, {"profile": _profile_to_public_dict(fresh or profile, runtime)})
+            self._send_json(200, {
+                "profile": _profile_to_public_dict(fresh or profile, runtime),
+                "ok": bool(result.get("ok")),
+                "status": result.get("status"),
+                "message": result.get("message"),
+            })
             return
 
         if path.startswith("/api/profiles/") and path.endswith("/test"):
@@ -994,6 +1034,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_json_body()
                 s = update_settings(**body)
+                if "model_parity" in body:
+                    from . import openai_bridge
+                    openai_bridge.forget_model_substitutions()
                 self._send_json(200, {"settings": asdict(s)})
             except ValueError as exc:
                 self._send_json(400, {"error": "validation", "message": str(exc)})
@@ -1073,7 +1116,9 @@ def _record_update_outcome(outcome, settings) -> None:
             "action": outcome.action,
             "error": outcome.error,
         })
-    if outcome.action == "none":
+    # Both mean "nothing to tell the person about" and both carry no Release,
+    # so everything below — which dereferences one — must be skipped.
+    if outcome.action in ("none", "no_releases"):
         return
     if outcome.action == "installed":
         activity.record("config", f"Updated to {release.version}", meta="restart to finish")
@@ -1100,16 +1145,24 @@ def _resolved_credential(profile):
         return None
 
 
+def _is_rotation_candidate(profile) -> bool:
+    """Whether the router could pick this Profile: both switches must be on."""
+    return bool(profile is not None and getattr(profile, "enabled", False)
+                and getattr(profile, "automatic", False))
+
+
 def _should_prime_after_update(before, after) -> bool:
     """Whether a Profile edit is one that should refresh its usage.
 
-    Only the transition into auto-rotation: that is the point where the
-    Profile becomes a rotation candidate and its usage starts deciding
-    routing, and a Profile that has never served a request has none recorded.
-    Re-saving an already-automatic Profile must not spend a request."""
-    if after is None or not getattr(after, "automatic", False):
-        return False
-    return before is None or not getattr(before, "automatic", False)
+    The transition INTO being a rotation candidate — which needs `enabled` and
+    `automatic` together, not either alone. Keying on `automatic` by itself
+    missed the common case: turning auto-rotation on for a Profile that was
+    switched off did nothing, because priming refuses to ping a disabled
+    Profile, and switching it on later did not re-trigger. The card then stayed
+    blank until the account happened to serve a request.
+
+    Re-saving a Profile that was already a candidate must not spend a request."""
+    return _is_rotation_candidate(after) and not _is_rotation_candidate(before)
 
 
 def _record_ping(profile, result: dict) -> None:
@@ -1122,7 +1175,7 @@ def _record_ping(profile, result: dict) -> None:
     from .gateway import _filter_openai_headers
     from .proxy import filter_response_headers
 
-    from .observation import UsageSnapshot
+    from .observation import AuthInvalid, QuotaExhausted, UsageSnapshot
 
     headers = result.get("headers") or {}
     status = result.get("status")
@@ -1141,13 +1194,23 @@ def _record_ping(profile, result: dict) -> None:
         else:
             observation = classify_anthropic(status, filter_response_headers(headers), now)
 
-        # A probe may only IMPROVE what is known about a Profile, never
-        # condemn it. Anything other than a usage reading — a 401, a 429, an
-        # unclassifiable response — is discarded here, because a probe that
-        # can mark a Profile AUTH_INVALID turns any bug in the probe itself
-        # (a mis-resolved credential, a transient failure) into a healthy
-        # account being taken out of rotation. Real traffic decides that.
-        if not isinstance(observation, UsageSnapshot):
+        # Only AUTHORITATIVE observations are recorded. A probe is a real
+        # request with a properly resolved credential, so what it learns about
+        # the ACCOUNT is as true as anything real traffic learns: a usage
+        # reading, a rejected credential, an exhausted quota.
+        #
+        # Everything else is discarded: an unclassifiable response, a 5xx, or
+        # a short rate-limit says something about this one small request or
+        # about the provider right now, not about the account. A single probe
+        # is weak evidence for those, and acting on it would take a healthy
+        # account out of rotation over a blip.
+        #
+        # (This deliberately allows AuthInvalid, which an earlier version did
+        # not. That restriction existed because the probe was mis-resolving
+        # credentials and manufacturing false 401s — the resolution bug is
+        # fixed, so suppressing the result now just hides a genuinely dead
+        # credential from the Dashboard.)
+        if not isinstance(observation, (UsageSnapshot, AuthInvalid, QuotaExhausted)):
             return
 
         with _gateway._lock:
@@ -1367,11 +1430,8 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
             pass
 
 
-def find_free_loopback_port(preferred: int = DEFAULT_PORT) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        try:
-            probe.bind((LOOPBACK_HOST, preferred))
-            return preferred
-        except OSError:
-            probe.bind((LOOPBACK_HOST, 0))
-            return probe.getsockname()[1]
+# Deliberately no find_free_loopback_port() here. It existed, was never called,
+# and falling back to an arbitrary port would have been wrong for this daemon:
+# DEFAULT_PORT is recorded in Claude Code's settings and in the desktop app's
+# inference profile, so moving the daemon silently would point both at nothing.
+# A port already in use is a conflict to report, not one to route around.

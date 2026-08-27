@@ -160,6 +160,10 @@
   .btn svg { width: 13px; height: 13px; }
   .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   .btn.danger { background: var(--bad-soft); color: var(--bad); border-color: var(--bad-border); }
+  /* For an action that is reversible but still discards something the person
+     set — softer than .danger, clearly not neutral. Uses the same warn tokens
+     as the rest of the UI, so it follows the light/dark theme. */
+  .btn.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-border); }
   .btn.btn-disabled { opacity: .45; cursor: not-allowed; pointer-events: none; }
 
   .panel-title { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
@@ -356,6 +360,11 @@
              animation: fade-up 400ms ease-out both; margin-bottom: 16px; }
   .section.danger { border-color: var(--bad-border); }
   .section-head { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  /* Opt-in, NOT applied to every head: most heads stack a title above a
+     subtitle, and flexing those would put them side by side. */
+  .section-head.with-actions { display: flex; align-items: center;
+                               justify-content: space-between; gap: 12px; }
+  .section-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .section-title { font-size: var(--fs-name); font-weight: 700; }
   .section-sub { font-size: var(--fs-body); color: var(--text-faint); margin-top: 2px; }
   .section-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
@@ -428,7 +437,11 @@
   .type-card.sel[data-type-card="codex"] { border-color: var(--codex-border); background: var(--codex-soft); }
   .type-card.sel[data-type-card="codex"] .type-icon { color: var(--codex); }
   .model-map-table { width: 100%; border-collapse: collapse; font-size: var(--fs-micro); margin-top: 4px; }
-  .model-map-table th, .model-map-table td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border-soft); color: var(--text-dim); }
+  .model-map-table th, .model-map-table td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border-soft); color: var(--text-dim); }
+  /* The Claude model name is the label for its row — it was rendering at
+     micro size in dimmed text, which made the thing you read first the
+     hardest thing to read. */
+  .model-map-table td:first-child { color: var(--text); font-size: var(--fs-body); font-weight: 600; }
   .model-map-table th { color: var(--text-faint); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
   .model-map-table td.mono { color: var(--text); }
   .model-map-table tr:last-child td { border-bottom: none; }
@@ -1135,6 +1148,32 @@
       </div>
     </div>
 
+    <div class="section" id="modelParitySection" style="display:none">
+      <div class="section-head with-actions">
+        <div class="section-title" data-i18n="settings.parity.title">Models parity</div>
+        <div class="section-actions">
+          <div class="btn warn" id="parityResetBtn" data-i18n="settings.parity.reset">Reset to defaults</div>
+        </div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="settings.parity.desc">Which Codex model and reasoning effort each Claude model maps to. Applies to codex profiles left on Automatic; a profile with its own override keeps using that.</div>
+        <table class="model-map-table" id="parityTable">
+          <thead><tr>
+            <th data-i18n="modal.add_profile.codex_mapping_col_claude">Claude model</th>
+            <th data-i18n="modal.add_profile.codex_mapping_col_openai">OpenAI/Codex model</th>
+            <th data-i18n="modal.add_profile.codex_mapping_col_effort">Reasoning effort</th>
+          </tr></thead>
+          <tbody id="parityRows"></tbody>
+        </table>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-sub" data-i18n="settings.parity.cost_note">Higher tiers and higher effort cost more of a Codex plan's quota.</div>
+          </div>
+          <div class="btn primary" id="paritySaveBtn" data-i18n="settings.parity.save">Save</div>
+        </div>
+      </div>
+    </div>
+
     <div class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.daemon.title">Daemon</div>
@@ -1429,6 +1468,17 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
+            <code id="cmd-desktop">claude-unlimited desktop</code>
+            <div class="copy-btn" data-copy-target="cmd-desktop">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.desktop">Sets up the Claude desktop app to send its inference through your pool, then launches it. Quit the app first — it loads this configuration at startup. Undo with --revert.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
             <code id="cmd-status">claude-unlimited status</code>
             <div class="copy-btn" data-copy-target="cmd-status">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -1512,6 +1562,55 @@
           </div>
           <div class="field-sub" data-i18n="help.cmd.purge">Removes Claude Unlimited and everything it created.</div>
         </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.desktop.title">Using the Claude desktop app</div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="help.desktop.intro">The desktop app can send its inference through Claude Unlimited instead of straight to Anthropic. The app calls this third-party inference mode. Its own chat still talks to claude.ai and is unaffected — only Claude Code sessions inside the app go through your pool.</div>
+
+        <div class="divider"></div>
+        <div class="field-label" data-i18n="help.desktop.auto_title">Automatic (recommended)</div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-desktop2">claude-unlimited desktop</code>
+            <div class="copy-btn" data-copy-target="cmd-desktop2">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.desktop.auto_desc">Quit the Claude desktop app first, then run this. It creates an inference profile named "Claude Unlimited", points it at this daemon, makes it the active one, and starts the app. Existing profiles are left alone, and the previous configuration is backed up.</div>
+        </div>
+
+        <div class="field-sub"><b data-i18n="help.desktop.warn_title">Restarts the app</b> — <span data-i18n="help.desktop.warn_body">If Claude is open, this asks it to quit, waits for it to close, then reopens it. Save your work first.</span></div>
+
+        <div class="divider"></div>
+        <div class="field-label" data-i18n="help.desktop.manual_title">Manual, if you prefer to see every step</div>
+        <div class="field-sub" data-i18n="help.desktop.step1"><b>1.</b> In the Claude desktop app, open the menu: Help &gt; Troubleshooting &gt; Enable developer mode. The app restarts.</div>
+        <div class="field-sub" data-i18n="help.desktop.step2"><b>2.</b> Open the menu: Developer &gt; Configure Third-Party Inference.</div>
+        <div class="field-sub" data-i18n="help.desktop.step3"><b>3.</b> Fill in only these fields — leave everything else at its default:</div>
+        <table class="model-map-table">
+          <thead><tr>
+            <th data-i18n="help.desktop.col_field">Field</th>
+            <th data-i18n="help.desktop.col_value">Set it to</th>
+          </tr></thead>
+          <tbody>
+            <tr><td data-i18n="help.desktop.f_connection">Connection</td><td class="mono">Gateway</td></tr>
+            <tr><td data-i18n="help.desktop.f_kind">Credential kind</td><td class="mono">Static API key</td></tr>
+            <tr><td data-i18n="help.desktop.f_url">Gateway base URL</td><td class="mono" id="help_desktop_url">http://127.0.0.1:4317</td></tr>
+            <tr><td data-i18n="help.desktop.f_key">Gateway API key</td><td data-i18n="help.desktop.f_key_value">your local token, from Settings &gt; Network</td></tr>
+            <tr><td data-i18n="help.desktop.f_scheme">Gateway auth scheme</td><td class="mono">bearer</td></tr>
+          </tbody>
+        </table>
+        <div class="field-sub" data-i18n="help.desktop.step4"><b>4.</b> Give the configuration a name, apply it, and let the app restart.</div>
+
+        <div class="divider"></div>
+        <div class="field-sub" data-i18n="help.desktop.note_signin"><b>Note:</b> third-party mode runs from a separate app profile with its own session, so you may be asked to sign in again. Your normal Claude setup is not affected.</div>
+        <div class="field-sub" data-i18n="help.desktop.note_profile"><b>Note:</b> enable at least one profile here first, or the app's "Test connection" fails with "No eligible Profile available" — which looks like a configuration error but is not.</div>
+        <div class="field-sub" data-i18n="help.desktop.note_revert">To undo everything and put the app back as it was, run <span class="mono">claude-unlimited desktop --revert</span>.</div>
       </div>
     </div>
 

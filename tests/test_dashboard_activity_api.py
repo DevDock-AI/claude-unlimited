@@ -105,3 +105,24 @@ def test_activity_export_downloads_full_json_with_disposition_header(running_ser
         body = json.loads(resp.read())
     assert len(body["events"]) == 1
     assert body["events"][0]["text"] == "an event"
+
+
+def test_a_nonsense_limit_falls_back_instead_of_500ing(running_server):
+    """A query string is user input — a typo in a pasted URL, a stale
+    bookmark. int(qs["limit"][0]) raised straight out of the handler, so
+    ?limit=abc answered 500 rather than ignoring a value it cannot use."""
+    base, _ = running_server
+    import claude_unlimited.activity as activity
+    activity.record("config", "something happened")
+
+    for bad in ("abc", "", "1e5", "0", "-4"):
+        with urllib.request.urlopen(f"{base}/api/activity?limit={bad}", timeout=2) as resp:
+            assert resp.status == 200
+            assert json.loads(resp.read())["events"]
+
+
+def test_a_nonsense_days_on_the_usage_summary_falls_back_too(running_server):
+    base, _ = running_server
+    for bad in ("abc", "", "999999999999999999999999"):
+        with urllib.request.urlopen(f"{base}/api/usage/summary?days={bad}", timeout=2) as resp:
+            assert resp.status == 200

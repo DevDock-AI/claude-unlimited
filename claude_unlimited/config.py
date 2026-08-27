@@ -10,6 +10,30 @@ from typing import List, Optional
 APP_DIR = Path.home() / ".claude-unlimited"
 CONFIG_FILE = APP_DIR / "config.json"
 
+# The isolated per-account login directories. Defined here, once, because two
+# modules need to agree on them: cli.py CREATES them during `add-account` /
+# `add-codex-account`, and profiles.py REFUSES any Profile naming a directory
+# outside them — delete_profile() removes codex_home recursively, so an
+# unconstrained value is a request to delete a directory of someone's
+# choosing. Two independent derivations of the same path would let those two
+# disagree, which is exactly how the check would end up validating nothing.
+_CLAUDE_ACCOUNTS_LEAF = "claude-accounts"
+_CODEX_ACCOUNTS_LEAF = "codex-accounts"
+CLAUDE_ACCOUNTS_DIR = APP_DIR / _CLAUDE_ACCOUNTS_LEAF
+CODEX_ACCOUNTS_DIR = APP_DIR / _CODEX_ACCOUNTS_LEAF
+
+
+def accounts_roots() -> tuple:
+    """(claude, codex) resolved against APP_DIR **at call time**.
+
+    The constants above are bound at import, which is what cli.py wants. The
+    validator wants the live value instead, so that redirecting APP_DIR — as
+    every test does — redirects what it will accept too. Otherwise the check
+    would validate against the real home directory during a test run, which
+    is both wrong and the sort of thing that quietly starts touching real
+    files."""
+    return (APP_DIR / _CLAUDE_ACCOUNTS_LEAF, APP_DIR / _CODEX_ACCOUNTS_LEAF)
+
 # Guards the whole load_pool() -> mutate -> save_pool() cycle at the call
 # sites (profiles.py), not just the I/O inside this module. The daemon runs
 # one thread per connection, so without it two concurrent writes to
@@ -72,6 +96,11 @@ class Settings:
     notify_rotated: bool = False
     notify_quota_reset: bool = False
     notify_needs_attention: bool = True
+    # Claude model id -> {"model": str, "effort": str}. Only rows that differ
+    # from openai_models.py's built-in table are stored: keeping a full copy
+    # would freeze this config against the shipped lineup, so a retired model
+    # would be pinned forever and a newly added tier would never appear.
+    model_parity: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -135,6 +164,7 @@ def load_pool() -> Pool:
         notify_rotated=bool(settings_data.get("notify_rotated", False)),
         notify_quota_reset=bool(settings_data.get("notify_quota_reset", False)),
         notify_needs_attention=bool(settings_data.get("notify_needs_attention", True)),
+        model_parity=settings_data.get("model_parity") or {},
     )
 
     return Pool(
@@ -163,22 +193,71 @@ def save_pool(pool: Pool) -> None:
 _SETTINGS_FIELDS = {
     "update_mode", "language", "notifications_enabled", "notify_update_available",
     "notify_approaching_threshold", "notify_rotated", "notify_quota_reset", "notify_needs_attention",
+    "model_parity",
 }
 
 
-def update_settings(**changes) -> Settings:
+def _validated_model_parity(raw) -> dict:
+    """Validates a parity override map, rejecting the whole payload rather
+    than silently dropping a bad row — a mapping that half-applied would be
+    worse than one that refused."""
+    from .openai_models import VALID_REASONING_EFFORTS
+
+    if not isinstance(raw, dict):
+        raise ValueError("model_parity must be an object")
+    if len(raw) > 64:
+        raise ValueError("model_parity has too many entries")
+
+    cleaned: dict = {}
+    for claude_id, row in raw.items():
+        if not isinstance(claude_id, str) or not claude_id.strip():
+            raise ValueError("model_parity keys must be non-empty model ids")
+        if not isinstance(row, dict):
+            raise ValueError(f"model_parity[{claude_id}] must be an object")
+        entry = {}
+        model = row.get("model")
+        if model is not None:
+            # Left free-form on purpose: a Profile override already accepts an
+            # arbitrary model id, and pinning one this build has not heard of
+            # is legitimate. The fallback ladder handles a rejected model.
+            if not isinstance(model, str) or not model.strip() or len(model) > 128:
+                raise ValueError(f"model_parity[{claude_id}].model must be a short non-empty string")
+            entry["model"] = model.strip()
+        effort = row.get("effort")
+        if effort is not None:
+            if effort not in VALID_REASONING_EFFORTS:
+                raise ValueError(
+                    f"model_parity[{claude_id}].effort must be one of {list(VALID_REASONING_EFFORTS)}")
+            entry["effort"] = effort
+        if entry:
+            cleaned[claude_id.strip()] = entry
+    return cleaned
+
+
+def validated_settings_changes(changes: dict) -> dict:
+    """Validates a settings payload. Shared by PATCH /api/settings and by
+    bundle import, so an imported bundle cannot set something the API would
+    have refused."""
     unknown = set(changes) - _SETTINGS_FIELDS
     if unknown:
         raise ValueError(f"Cannot change settings fields: {sorted(unknown)}")
+    changes = dict(changes)
     if "update_mode" in changes and changes["update_mode"] not in UPDATE_MODES:
         raise ValueError(f"update_mode must be one of {UPDATE_MODES}")
+    if "model_parity" in changes:
+        changes["model_parity"] = _validated_model_parity(changes["model_parity"])
     if "language" in changes:
-        from . import i18n  # local import: keeps config.py's only I/O dependency (locales/) lazy
+        from . import i18n
 
         if changes["language"] not in i18n.list_locales():
             raise ValueError(f"language must be one of {i18n.list_locales()}")
+    return changes
 
-    pool = load_pool()
-    pool.settings = replace(pool.settings, **changes)
-    save_pool(pool)
-    return pool.settings
+
+def update_settings(**changes) -> Settings:
+    changes = validated_settings_changes(changes)
+    with CONFIG_LOCK:
+        pool = load_pool()
+        pool.settings = replace(pool.settings, **changes)
+        save_pool(pool)
+        return pool.settings

@@ -193,14 +193,7 @@ async function setLanguage(code, { persist } = { persist: true }) {
   // Same treatment as updateModeSelect above — these are wired at module
   // load, before loadLocales() resolves, so their labels start out as raw
   // i18n keys until this runs.
-  ['f_codex_model', 'pd_codex_model'].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el && el._cuRenderValue) { el._cuOptions = CODEX_MODEL_OPTIONS(); el._cuRenderValue(); }
-  });
-  ['f_codex_reasoning', 'pd_codex_reasoning'].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el && el._cuRenderValue) { el._cuOptions = CODEX_REASONING_OPTIONS(); el._cuRenderValue(); }
-  });
+  refreshCodexSelectOptions();
   // The model-help text is set via JS (not data-i18n), so applyTranslations()
   // never touches it — re-derive it here.
   updateCodexModelHelp('f');
@@ -219,6 +212,20 @@ async function setLanguage(code, { persist } = { persist: true }) {
 // ---- helpers ----
 
 let _csrfRecoveryStarted = false;
+
+// Re-renders every select whose options come from the served model catalogue
+// or from translated labels. Called after a language change and after the
+// catalogue arrives, so neither leaves a select showing stale content.
+function refreshCodexSelectOptions() {
+  ['f_codex_model', 'pd_codex_model'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el && el._cuRenderValue) { el._cuOptions = CODEX_MODEL_OPTIONS(); el._cuRenderValue(); }
+  });
+  ['f_codex_reasoning', 'pd_codex_reasoning'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el && el._cuRenderValue) { el._cuOptions = CODEX_REASONING_OPTIONS(); el._cuRenderValue(); }
+  });
+}
 
 async function api(path, opts = {}) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
@@ -1289,8 +1296,16 @@ function openProfileKebabMenu(anchorBtn, profileId) {
       if (action === 'fetch_info') {
         showToast('info', t('toast.fetch_info_running'), profile.name, { duration: 4000 });
         try {
-          await api(`/api/profiles/${profileId}/refresh`, { method: 'POST', body: '{}' });
-          showToast('success', t('toast.fetch_info_ok'), profile.name);
+          const res = await api(`/api/profiles/${profileId}/refresh`, { method: 'POST', body: '{}' });
+          if (res.ok) {
+            showToast('success', t('toast.fetch_info_ok'), profile.name);
+          } else {
+            // The request reached the account and the account refused it —
+            // saying "fetched" here is how a dead credential looked like a
+            // broken button.
+            showToast('error', t('toast.fetch_info_failed'),
+              res.status === 401 ? t('toast.fetch_info_auth') : `HTTP ${res.status}`);
+          }
         } catch (err) {
           showToast('error', t('toast.fetch_info_failed'), err.message);
         }
@@ -2116,12 +2131,20 @@ function renderUpdateState(state) {
   if (state.current_version) installed.textContent = state.current_version;
   const available = state.available;
   if (available) latest.textContent = available.version;
-  else if (state.checked_at && state.current_version) latest.textContent = state.current_version;
+  // Only mirror the installed version into "latest" when a check actually
+  // proved they match. With no releases published there is no latest release
+  // to name, and echoing the installed one there would assert exactly that.
+  else if (state.checked_at && state.current_version && state.action !== 'no_releases') {
+    latest.textContent = state.current_version;
+  }
 
   let key = 'settings.updates.never_checked';
   if (state.error) key = null;
   else if (available && state.action === 'downloaded') key = 'settings.updates.downloaded';
   else if (available) key = 'settings.updates.available';
+  // Checked, found nothing, but the repository has published no releases at
+  // all — which is not the same as being up to date, and must not say so.
+  else if (state.action === 'no_releases') key = 'settings.updates.no_releases';
   else if (state.checked_at) key = 'settings.updates.up_to_date';
   sub.textContent = key ? t(key) : state.error;
   sub.style.color = state.error ? 'var(--bad)' : '';
@@ -2190,8 +2213,10 @@ async function runUpdateCheckModal() {
   const available = state.available;
   document.getElementById('updateModalLatestRow').style.display = available ? '' : 'none';
   if (!available) {
+    const nothingPublished = state.action === 'no_releases';
     _updateModalPhase('result', {
-      title: t('modal.update.up_to_date'), sub: t('modal.update.up_to_date_sub'),
+      title: t(nothingPublished ? 'modal.update.no_releases' : 'modal.update.up_to_date'),
+      sub: nothingPublished ? '' : t('modal.update.up_to_date_sub'),
     });
     return;
   }
@@ -2604,6 +2629,10 @@ function selectType(type) {
 // released over the scrim. A 'click' listener alone can't tell those apart,
 // since the browser fires 'click' on whatever element the mouse was released
 // over, so require that both mousedown and click landed on the scrim.
+// Every modal registers here, so Escape and click-outside can never disagree
+// about how a given modal closes.
+const _dismissibleModals = [];
+
 function wireScrimClickOutside(scrimEl, closeFn) {
   let downOnScrim = false;
   scrimEl.addEventListener('mousedown', (e) => {
@@ -2613,7 +2642,24 @@ function wireScrimClickOutside(scrimEl, closeFn) {
     if (downOnScrim && e.target === scrimEl) closeFn();
     downOnScrim = false;
   });
+  _dismissibleModals.push({ scrimEl, closeFn });
 }
+
+// Escape closes the open modal. Without this the only ways out are the close
+// button and clicking the backdrop, so anyone working from the keyboard is
+// stuck in the dialog. Closes ONE modal per press — the last opened — so a
+// confirm layered over a detail view does not dismiss both at once.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  for (let i = _dismissibleModals.length - 1; i >= 0; i--) {
+    const { scrimEl, closeFn } = _dismissibleModals[i];
+    if (scrimEl.classList.contains('open')) {
+      closeFn();
+      e.stopPropagation();
+      return;
+    }
+  }
+});
 
 function openModal() {
   document.getElementById('scrim').classList.add('open');
@@ -2906,7 +2952,61 @@ async function applyImport() {
 
 let _currentView = 'overview';
 
-function switchView(view) {
+// ---- routing ----
+// Each view owns one path. The daemon serves the dashboard for exactly these,
+// so a refresh or a pasted link lands where it should instead of always
+// reopening Overview.
+const VIEW_ROUTES = {
+  overview: '/',
+  profiles: '/profiles',
+  activity: '/activity',
+  settings: '/settings',
+  help: '/help',
+};
+const ROUTE_VIEWS = Object.fromEntries(
+  Object.entries(VIEW_ROUTES).map(([view, path]) => [path, view]));
+
+// A view may register how its filters serialise, so the router never needs to
+// know what any given view's state means — which is what stops it becoming a
+// second place where each view's filter shape is defined.
+const _viewState = {};
+function registerViewState(view, { toQuery, fromQuery }) {
+  _viewState[view] = { toQuery, fromQuery };
+}
+
+function viewFromLocation() {
+  // Trailing slash normalised the same way the daemon does it. Without this
+  // the daemon serves the Dashboard for "/settings/" while the page renders
+  // Overview — the URL says one thing and you get another.
+  const path = window.location.pathname.replace(/\/+$/, '') || '/';
+  return ROUTE_VIEWS[path] || 'overview';
+}
+
+function urlForView(view) {
+  const path = VIEW_ROUTES[view] || '/';
+  const state = _viewState[view];
+  if (!state) return path;
+  const params = new URLSearchParams();
+  const q = state.toQuery() || {};
+  // Defaults are omitted by toQuery(); anything empty is dropped here too so a
+  // pristine view has a clean URL rather than a wall of empty parameters.
+  for (const [k, v] of Object.entries(q)) {
+    if (v !== undefined && v !== null && v !== '') params.set(k, String(v));
+  }
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
+// Filter changes use replaceState: pushing one history entry per keystroke
+// would make the Back button useless.
+function syncUrl({ replace = true } = {}) {
+  const url = urlForView(_currentView);
+  if (url !== window.location.pathname + window.location.search) {
+    window.history[replace ? 'replaceState' : 'pushState']({ view: _currentView }, '', url);
+  }
+}
+
+function switchView(view, { history = 'push' } = {}) {
   closeKebabMenu();
   closeAllSelectPops();
   _currentView = view;
@@ -2918,8 +3018,21 @@ function switchView(view) {
   if (view === 'overview') { loadStatus().then(() => loadProfiles()); loadProjectUsage(); loadUsageSummary(); loadActivityPreview(); }
   if (view === 'profiles') loadProfilesTable();
   if (view === 'activity') { renderActivityFilters(); loadActivity(); }
-  if (view === 'settings') loadSettings();
+  if (view === 'settings') { loadSettings(); loadModelParity(); }
+
+  // 'none' is for restoring from the URL on load or on popstate — writing
+  // history there would either duplicate the entry or fight the Back button.
+  if (history !== 'none') syncUrl({ replace: history === 'replace' });
 }
+
+window.addEventListener('popstate', () => {
+  const view = viewFromLocation();
+  const state = _viewState[view];
+  if (state) {
+    state.fromQuery(Object.fromEntries(new URLSearchParams(window.location.search)));
+  }
+  switchView(view, { history: 'none' });
+});
 
 // ---- live-update poll — refreshes whichever view is on screen every
 // second; setLiveHtml (top of file) keeps unchanged content from flickering.
@@ -2964,6 +3077,8 @@ document.querySelectorAll('.rail-item').forEach((el) => {
 
 setupUpdateModeSelect();
 document.getElementById('resetBtn').addEventListener('click', resetAllProfiles);
+document.getElementById('paritySaveBtn').addEventListener('click', saveModelParity);
+document.getElementById('parityResetBtn').addEventListener('click', resetModelParity);
 document.getElementById('notifMasterToggle').addEventListener('click', toggleNotificationsMaster);
 document.getElementById('autostartToggle').addEventListener('click', toggleAutostart);
 document.getElementById('regenTokenBtn').addEventListener('click', regeneratePlaceholderToken);
@@ -3109,26 +3224,112 @@ function updateCodexModelHelp(prefix) {
     : esc(t('modal.add_profile.codex_model_help_auto'));
 }
 
+// ---- Models parity (Settings) ----
+// The row set comes from /api/codex/model-map, never from a list written into
+// the page: the same table was hardcoded in index.html once and went stale the
+// first time the mapping changed.
+let _parityRows = [];
+
+// Only rows that differ from the shipped defaults are sent. Storing a full
+// copy would freeze this config against the lineup, so a retired model would
+// stay pinned and a newly added tier would never appear.
+function collectParity() {
+  const out = {};
+  for (const row of _parityRows) {
+    const model = document.getElementById(`parity_model_${row.claude_model}`);
+    const effort = document.getElementById(`parity_effort_${row.claude_model}`);
+    if (!model || !effort) continue;
+    const entry = {};
+    if (model.dataset.value && model.dataset.value !== row.default_model) entry.model = model.dataset.value;
+    if (effort.dataset.value && effort.dataset.value !== row.default_effort) entry.effort = effort.dataset.value;
+    if (Object.keys(entry).length) out[row.claude_model] = entry;
+  }
+  return out;
+}
+
+function parityModelOptions(row) {
+  const opts = CODEX_MODEL_OPTIONS().filter((o) => o.value !== '');
+  // Preserve a saved model this build has never heard of, so opening Settings
+  // does not silently rewrite a deliberate pin.
+  if (row.openai_model && !opts.some((o) => o.value === row.openai_model)) {
+    opts.unshift({ value: row.openai_model, label: row.openai_model });
+  }
+  return opts;
+}
+
+async function loadModelParity() {
+  const section = document.getElementById('modelParitySection');
+  const body = document.getElementById('parityRows');
+  if (!section || !body) return;
+  let data;
+  try {
+    data = await api('/api/codex/model-map');
+  } catch (e) {
+    section.style.display = 'none';
+    return;
+  }
+  _parityRows = data.mapping || [];
+  _selectableModels = data.selectable_models || _selectableModels;
+  _reasoningEfforts = data.reasoning_efforts || _reasoningEfforts;
+  refreshCodexSelectOptions();
+  section.style.display = '';
+  body.innerHTML = _parityRows.map((r) => `
+    <tr>
+      <td>${esc(r.claude_label)}</td>
+      <td><div class="select-input" id="parity_model_${esc(r.claude_model)}" data-value="${esc(r.openai_model)}">
+            <span class="select-value"></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </div></td>
+      <td><div class="select-input" id="parity_effort_${esc(r.claude_model)}" data-value="${esc(r.reasoning_effort)}">
+            <span class="select-value"></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </div></td>
+    </tr>`).join('');
+
+  for (const r of _parityRows) {
+    setupSelectInput(document.getElementById(`parity_model_${r.claude_model}`), parityModelOptions(r), () => {});
+    setupSelectInput(document.getElementById(`parity_effort_${r.claude_model}`),
+      CODEX_REASONING_OPTIONS().filter((o) => o.value !== ''), () => {});
+  }
+}
+
+async function saveModelParity() {
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ model_parity: collectParity() }) });
+    showToast('success', t('toast.parity_saved'), t('toast.parity_saved_sub'));
+    await loadModelParity();
+  } catch (e) {
+    showToast('error', t('toast.parity_failed'), e.message);
+  }
+}
+
+async function resetModelParity() {
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ model_parity: {} }) });
+    showToast('success', t('toast.parity_reset'), '');
+    await loadModelParity();
+  } catch (e) {
+    showToast('error', t('toast.parity_failed'), e.message);
+  }
+}
+
+// Populated from /api/codex/model-map. NEVER hardcode model ids here: the
+// same table was written into index.html once and went stale the first time
+// the lineup changed. A test asserts no model id appears literally in this
+// file.
+let _selectableModels = [];
+let _reasoningEfforts = [];
 const CODEX_MODEL_OPTIONS = () => [
   { value: '', label: t('modal.add_profile.automatic_option') },
-  { value: 'gpt-5.6-sol', label: 'gpt-5.6-sol' },
-  { value: 'gpt-5.6-terra', label: 'gpt-5.6-terra' },
-  { value: 'gpt-5.6-luna', label: 'gpt-5.6-luna' },
-  { value: 'gpt-5.5', label: 'gpt-5.5' },
-  { value: 'gpt-5.2', label: 'gpt-5.2' },
+  ..._selectableModels.map((m) => ({ value: m, label: m })),
 ];
 // A flat union of every model's reasoning-effort levels, not gated by the
-// model select above (gpt-5.6-luna tops out at "max", gpt-5.5/gpt-5.2 at
-// "xhigh"). Picking a level a model doesn't support falls back through the
-// backend's own mapping, like any other automatic default.
+// model select above — the cheaper tiers and the older ids stop short of the
+// highest levels. Picking a level a model doesn't support falls back through
+// the backend's own mapping, like any other automatic default.
 const CODEX_REASONING_OPTIONS = () => [
   { value: '', label: t('modal.add_profile.automatic_option') },
-  { value: 'low', label: 'low' },
-  { value: 'medium', label: 'medium' },
-  { value: 'high', label: 'high' },
-  { value: 'xhigh', label: 'xhigh' },
-  { value: 'max', label: 'max' },
-  { value: 'ultra', label: 'ultra' },
+  ..._reasoningEfforts.map((e) => ({ value: e, label: e })),
 ];
 setupSelectInput(document.getElementById('f_codex_model'), CODEX_MODEL_OPTIONS(), () => updateCodexModelHelp('f'));
 setupSelectInput(document.getElementById('f_codex_reasoning'), CODEX_REASONING_OPTIONS(), () => {});
@@ -3255,8 +3456,26 @@ loadLocales().then(() => {
   loadStatus().then(() => loadProfiles());
   loadProjectUsage();
   loadUsageSummary();
+  // Restore whatever the URL asks for instead of always opening Overview.
+  // After loadLocales so the restored view renders with real labels, and with
+  // history 'none' so restoring does not itself add a history entry.
+  // Fetch the model catalogue at boot, not only when Settings opens: the
+  // profile modals build their dropdowns from it too.
+  loadModelParity();
+  const booted = viewFromLocation();
+  const bootedState = _viewState[booted];
+  if (bootedState) {
+    bootedState.fromQuery(Object.fromEntries(new URLSearchParams(window.location.search)));
+  }
+  if (booted !== 'overview') switchView(booted, { history: 'none' });
+  // Inside the .then for the same reason as the restored view above: this
+  // renders through t(), and t() falls back to the raw key name when the
+  // strings have not arrived yet. Called outside, it raced loadLocales() and
+  // any event less than a minute old painted a literal "activity.moments_ago"
+  // in the Activity log — the one row a person is most likely to be looking
+  // at, since they just caused it.
+  loadActivityPreview();
 });
-loadActivityPreview();
 checkConnection();
 // Self-scheduling rather than a fixed interval: the cadence changes to a
 // fast retry while the daemon is down so recovery is near-instant.
