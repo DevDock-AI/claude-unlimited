@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import activity, connectors, oauth_credential, secret_store
+from . import config as config_module
 from .config import CONFIG_LOCK, Pool, Profile, load_pool, save_pool
 
 # Derived from connectors.py, so a kind's name is registered in exactly one
@@ -58,6 +59,86 @@ def _validate(name: str, kind: str, base_url: Optional[str], auth_mode: str, tag
             )
     if tag_color is not None and tag_color not in _TAG_COLORS:
         raise ValidationError(f"Unknown tag_color; must be one of {_TAG_COLORS}.")
+
+
+# Directories a Profile is allowed to name. Both are created by cli.py under
+# this tool's own app directory, and delete_profile() removes codex_home
+# outright — so an unconstrained value here is a request to recursively
+# delete a directory of someone's choosing. The roots come from config.py so
+# the code that CREATES them and the code that VALIDATES them cannot drift.
+def _validate_isolated_dir(value, field: str, root) -> None:
+    from pathlib import Path
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field} must be a non-empty path, or null.")
+    # resolve() both sides: a symlink or a ".." segment must not be able to
+    # escape the root, and the root itself may be a symlink on some setups.
+    try:
+        candidate = Path(value).expanduser().resolve()
+        resolved_root = root.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValidationError(f"{field} is not a usable path: {exc}") from None
+    if candidate != resolved_root and resolved_root not in candidate.parents:
+        raise ValidationError(f"{field} must be inside {root}.")
+
+
+def _validate_field_types(**changes) -> None:
+    """Type- and range-checks every field a caller may set.
+
+    This is not defensive nicety. `config.py`'s load_pool() coerces on read —
+    `int(p["priority"])`, `float(p["switch_threshold"])` — so a value that is
+    merely SAVED without checking becomes an exception on the next load, and
+    load_pool() is called by every API handler, the proxy path, and the very
+    request that would fix it. One bad PATCH could leave the daemon unable to
+    start until someone hand-edited config.json.
+    """
+    from .openai_models import VALID_REASONING_EFFORTS
+
+    def _num(key, *, kind, minimum=None, maximum=None, allow_none=False):
+        if key not in changes:
+            return
+        value = changes[key]
+        if value is None:
+            if allow_none:
+                return
+            raise ValidationError(f"{key} cannot be null.")
+        # bool is an int subclass; accepting True as a priority of 1 would be
+        # a silent, confusing success.
+        if isinstance(value, bool) or not isinstance(value, kind):
+            wanted = ("a number" if isinstance(kind, tuple)
+                      else {"int": "a whole number", "str": "text"}.get(kind.__name__, kind.__name__))
+            raise ValidationError(f"{key} must be {wanted}, got {type(value).__name__}.")
+        if minimum is not None and value < minimum:
+            raise ValidationError(f"{key} must be at least {minimum}.")
+        if maximum is not None and value > maximum:
+            raise ValidationError(f"{key} must be at most {maximum}.")
+
+    _num("priority", kind=int, minimum=1)
+    _num("switch_threshold", kind=(int, float), minimum=0, maximum=100)
+    _num("token_threshold", kind=int, minimum=0, allow_none=True)
+    _num("monthly_budget_cap", kind=(int, float), minimum=0, allow_none=True)
+
+    for key in ("enabled", "automatic"):
+        if key in changes and not isinstance(changes[key], bool):
+            raise ValidationError(f"{key} must be true or false.")
+
+    for key in ("name", "kind", "auth_mode"):
+        if key in changes and not isinstance(changes[key], str):
+            raise ValidationError(f"{key} must be a string.")
+
+    for key in ("base_url", "default_model", "tag_color", "plan", "codex_model"):
+        if key in changes and changes[key] is not None and not isinstance(changes[key], str):
+            raise ValidationError(f"{key} must be a string, or null.")
+
+    effort = changes.get("codex_reasoning_effort")
+    if effort is not None and effort not in VALID_REASONING_EFFORTS:
+        raise ValidationError(
+            f"codex_reasoning_effort must be one of {list(VALID_REASONING_EFFORTS)}.")
+
+    claude_root, codex_root = config_module.accounts_roots()
+    _validate_isolated_dir(changes.get("claude_config_dir"), "claude_config_dir", claude_root)
+    _validate_isolated_dir(changes.get("codex_home"), "codex_home", codex_root)
 
 
 def list_profiles() -> list[Profile]:
@@ -153,6 +234,18 @@ def create_profile(
     credential_already_encoded: bool = False,
 ) -> Profile:
     _validate(name, kind, base_url, auth_mode, tag_color)
+    # Same reachable-from-HTTP surface as update_profile: POST /api/profiles
+    # hands this a decoded JSON body. `priority` is excluded because None is
+    # legitimate here and means "compute the next free slot" just below.
+    _validate_field_types(
+        switch_threshold=switch_threshold, token_threshold=token_threshold,
+        monthly_budget_cap=monthly_budget_cap, automatic=automatic,
+        default_model=default_model, tag_color=tag_color, plan=plan,
+        codex_model=codex_model, codex_reasoning_effort=codex_reasoning_effort,
+        claude_config_dir=claude_config_dir, codex_home=codex_home,
+    )
+    if priority is not None:
+        _validate_field_types(priority=priority)
     if not credential or len(credential.strip()) < 8:
         raise ValidationError("Credential looks too short — paste the complete token/key.")
     if priority is None:
@@ -281,6 +374,7 @@ def update_profile(profile_id: str, **changes) -> Profile:
     unknown = set(changes) - allowed
     if unknown:
         raise ValidationError(f"Cannot change fields: {sorted(unknown)}")
+    _validate_field_types(**changes)
 
     with CONFIG_LOCK:
         pool = load_pool()
@@ -324,13 +418,36 @@ def delete_profile(profile_id: str) -> None:
     # an orphaned Keychain entry is harmless, whereas a config row
     # referencing a missing secret is not.
     secret_store.delete_token(profile_id)
-    if existing.codex_home:
-        # Holds only the auth.json from the one-time `codex login`
-        # handshake; the live credential lives in secret_store. Safe to
-        # remove outright.
-        import shutil as _shutil
-        _shutil.rmtree(existing.codex_home, ignore_errors=True)
+    _remove_isolated_login_artifacts(existing)
     activity.record("config", f"{existing.name} removed")
+
+
+def _remove_isolated_login_artifacts(p: Profile) -> None:
+    """Removes the per-account login directories a Profile owned, and the
+    Keychain entry Claude Code wrote inside its isolated one.
+
+    Both `add-account` and `add-codex-account` create a directory holding a
+    LIVE refresh token — `.credentials.json` (or a directory-derived Keychain
+    entry) for Claude, `auth.json` for Codex. Only `codex_home` used to be
+    cleaned up here, so removing a Claude account from the Dashboard left its
+    refresh token on disk and in the Keychain with nothing referencing it. Only
+    `purge` cleaned those, which is not where most accounts get removed.
+
+    Best-effort throughout: the Profile is already gone from config by this
+    point, and failing to tidy up must not turn a completed delete into an
+    error. Both paths are validated to live under this tool's own accounts
+    roots when they are set (see _validate_isolated_dir)."""
+    import shutil as _shutil
+
+    for directory in (p.codex_home, p.claude_config_dir):
+        if directory:
+            _shutil.rmtree(directory, ignore_errors=True)
+    if p.claude_config_dir:
+        try:
+            from . import anthropic_oauth
+            anthropic_oauth.remove_isolated_logins([p.claude_config_dir])
+        except Exception:
+            pass
 
 
 def reset_all_profiles() -> int:
@@ -340,9 +457,15 @@ def reset_all_profiles() -> int:
     with CONFIG_LOCK:
         pool = load_pool()
         count = len(pool.profiles)
+        removed = list(pool.profiles)
         for p in pool.profiles:
             secret_store.delete_token(p.id)
         pool.profiles = []
         save_pool(pool)
+    # Same cleanup delete_profile does, for the same reason: each isolated
+    # login directory holds a live refresh token, and "remove everything"
+    # that leaves credentials behind has not removed everything.
+    for p in removed:
+        _remove_isolated_login_artifacts(p)
     activity.record("config", f"All {count} profile(s) removed (reset)")
     return count

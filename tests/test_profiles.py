@@ -100,20 +100,23 @@ def test_create_rejects_unknown_kind(fake_store):
         profiles.create_profile(name="X", kind="gateway", credential="sk-ant-12345678")
 
 
-def test_upsert_codex_profile_creates_new(fake_store):
+def test_upsert_codex_profile_creates_new(fake_store, tmp_path):
     import claude_unlimited.openai_credential as openai_credential
 
+    # A real one, under the isolated-accounts root: delete_profile() rmtree's
+    # codex_home, so anything outside that root is refused on the way in.
+    codex_home = str(tmp_path / "codex-accounts" / "abc123")
     encoded = openai_credential.encode(openai_credential.StoredOpenAICredential(
         access_token="tok-a", refresh_token="ref-a", account_id="acct-1", id_token="idtok"))
     profile, reused = profiles.upsert_codex_profile(
-        name="My ChatGPT", account_id="acct-1", encoded_credential=encoded, plan="plus", codex_home="/tmp/codex-home-1")
+        name="My ChatGPT", account_id="acct-1", encoded_credential=encoded, plan="plus", codex_home=codex_home)
 
     assert reused is False
     assert profile.kind == "codex"
     assert profile.auth_mode == "chatgpt_subscription"
     assert profile.account_uuid == "acct-1"  # reused field, holds the OpenAI account_id
     assert profile.plan == "plus"
-    assert profile.codex_home == "/tmp/codex-home-1"
+    assert profile.codex_home == codex_home
     # Stored exactly as passed, not re-wrapped in oauth_credential's shape, so
     # openai_credential.decode() can read it straight back.
     assert openai_credential.decode(fake_store.get_token(profile.id)).access_token == "tok-a"
@@ -227,3 +230,140 @@ def test_deleting_the_last_profile_by_priority_needs_no_renumbering(fake_store):
     p2 = profiles.create_profile(name="B", kind="api", credential="sk-ant-22222222", priority=2)
     profiles.delete_profile(p2.id)
     assert [p.priority for p in profiles.list_profiles()] == [1]
+
+
+# --- input validation: a bad value must never reach config.json -------------
+#
+# load_pool() COERCES on read — int(priority), float(switch_threshold) — so a
+# value that is merely saved without checking becomes an exception on the next
+# load. load_pool() is called by every API handler and the proxy path, so one
+# unchecked PATCH could leave the daemon unable to serve anything until
+# someone hand-edited config.json. These are reachable from
+# PATCH /api/profiles/<id>, which passes the decoded JSON body straight in.
+
+
+def _a_profile(fake_store):
+    return profiles.create_profile(name="X", kind="api", credential="sk-ant-12345678")
+
+
+@pytest.mark.parametrize("changes", [
+    {"priority": None},
+    {"priority": "abc"},
+    {"priority": 0},
+    {"switch_threshold": "abc"},
+    {"switch_threshold": 101},
+    {"switch_threshold": -1},
+    {"token_threshold": "5000"},      # loads fine, then crashes on int >= str
+    {"monthly_budget_cap": "10"},
+    {"enabled": "false"},             # truthy string silently ENABLES
+    {"automatic": 1},
+    {"name": 42},
+    {"codex_reasoning_effort": "turbo"},
+])
+def test_update_profile_refuses_a_value_that_would_break_the_next_load(fake_store, changes):
+    p = _a_profile(fake_store)
+    with pytest.raises(profiles.ValidationError):
+        profiles.update_profile(p.id, **changes)
+
+    # And the stored config is still loadable, which is the property that
+    # actually matters.
+    assert profiles.list_profiles()[0].id == p.id
+
+
+def test_update_profile_still_accepts_the_real_values_the_dashboard_sends(fake_store):
+    p = _a_profile(fake_store)
+    updated = profiles.update_profile(
+        p.id, priority=3, switch_threshold=80.5, enabled=False, automatic=True,
+        token_threshold=5000, monthly_budget_cap=25.0, name="Renamed")
+    assert (updated.priority, updated.switch_threshold) == (3, 80.5)
+    assert updated.enabled is False and updated.automatic is True
+    assert (updated.token_threshold, updated.monthly_budget_cap) == (5000, 25.0)
+    # Ints where a float is expected are normal JSON and must keep working.
+    assert profiles.update_profile(p.id, switch_threshold=90).switch_threshold == 90
+
+
+def test_codex_home_cannot_be_pointed_outside_the_isolated_accounts_root(fake_store, tmp_path):
+    """delete_profile() does rmtree(codex_home). Without this check, a PATCH
+    could aim that at any directory and a later delete would erase it."""
+    p = _a_profile(fake_store)
+    for hostile in ("/Users", str(tmp_path / "Documents"),
+                    str(tmp_path / "codex-accounts" / ".." / "Documents")):
+        with pytest.raises(profiles.ValidationError):
+            profiles.update_profile(p.id, codex_home=hostile)
+
+    inside = str(tmp_path / "codex-accounts" / "deadbeef")
+    assert profiles.update_profile(p.id, codex_home=inside).codex_home == inside
+
+
+def test_claude_config_dir_is_constrained_the_same_way(fake_store, tmp_path):
+    p = _a_profile(fake_store)
+    with pytest.raises(profiles.ValidationError):
+        profiles.update_profile(p.id, claude_config_dir=str(tmp_path / "elsewhere"))
+    ok = str(tmp_path / "claude-accounts" / "cafe")
+    assert profiles.update_profile(p.id, claude_config_dir=ok).claude_config_dir == ok
+
+
+def test_create_profile_refuses_the_same_bad_values(fake_store):
+    with pytest.raises(profiles.ValidationError):
+        profiles.create_profile(name="X", kind="api", credential="sk-ant-12345678",
+                                switch_threshold="abc")
+    with pytest.raises(profiles.ValidationError):
+        profiles.create_profile(name="X", kind="api", credential="sk-ant-12345678",
+                                codex_home="/tmp/anywhere")
+
+
+# --- deleting an account must not leave its credentials behind -------------
+
+
+def test_delete_removes_both_isolated_login_directories(fake_store, tmp_path, monkeypatch):
+    """Each holds a LIVE refresh token. Only codex_home used to be removed, so
+    deleting a Claude account from the Dashboard left its credential on disk
+    forever — only `purge` ever cleaned those up."""
+    claude_dir = tmp_path / "claude-accounts" / "aaa"
+    codex_dir = tmp_path / "codex-accounts" / "bbb"
+    for d in (claude_dir, codex_dir):
+        d.mkdir(parents=True)
+    (claude_dir / ".credentials.json").write_text('{"refresh_token": "live"}')
+    (codex_dir / "auth.json").write_text('{"refresh_token": "live"}')
+
+    p = profiles.create_profile(name="X", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="u1", claude_config_dir=str(claude_dir))
+    p = profiles.update_profile(p.id, codex_home=str(codex_dir))
+
+    keychain = []
+    monkeypatch.setattr("claude_unlimited.anthropic_oauth.remove_isolated_logins",
+                        lambda dirs: keychain.extend(dirs) or len(dirs))
+
+    profiles.delete_profile(p.id)
+
+    assert not claude_dir.exists(), "the Claude login directory survived the delete"
+    assert not codex_dir.exists()
+    assert keychain == [str(claude_dir)], "the derived Keychain entry was not removed"
+
+
+def test_reset_all_profiles_cleans_up_the_same_way(fake_store, tmp_path, monkeypatch):
+    """"Remove everything" that leaves credentials behind has not removed
+    everything."""
+    claude_dir = tmp_path / "claude-accounts" / "ccc"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / ".credentials.json").write_text('{"refresh_token": "live"}')
+    profiles.create_profile(name="X", kind="oauth", credential="sk-ant-12345678",
+                            account_uuid="u1", claude_config_dir=str(claude_dir))
+
+    keychain = []
+    monkeypatch.setattr("claude_unlimited.anthropic_oauth.remove_isolated_logins",
+                        lambda dirs: keychain.extend(dirs) or len(dirs))
+
+    assert profiles.reset_all_profiles() == 1
+    assert not claude_dir.exists()
+    assert keychain == [str(claude_dir)]
+
+
+def test_delete_still_succeeds_when_the_directory_is_already_gone(fake_store, tmp_path):
+    """The Profile is out of config by this point; tidying up failing must not
+    turn a completed delete into an error."""
+    p = profiles.create_profile(name="X", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="u1",
+                                claude_config_dir=str(tmp_path / "claude-accounts" / "never-made"))
+    profiles.delete_profile(p.id)
+    assert profiles.list_profiles() == []
