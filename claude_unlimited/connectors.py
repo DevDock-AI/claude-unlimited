@@ -19,12 +19,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
-def _codex_models() -> list[tuple[str, str]]:
+def _codex_models(parity: Optional[dict] = None) -> list[tuple[str, str]]:
     # Imported lazily so this registry stays a plain declaration that any
     # module can read without pulling in a connector's implementation.
     from . import openai_models
 
-    return openai_models.advertised_models()
+    return openai_models.advertised_models(parity)
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ CONNECTORS: dict[str, ConnectorSpec] = {
 }
 
 
-def models_listing(kind: str) -> Optional[list[tuple[str, str]]]:
+def models_listing(kind: str, parity: Optional[dict] = None) -> Optional[list[tuple[str, str]]]:
     """(model_id, display_name) pairs this kind answers GET /v1/models with,
     or None when it should be relayed to the real upstream instead.
 
@@ -78,7 +78,7 @@ def models_listing(kind: str) -> Optional[list[tuple[str, str]]]:
     offer" is answered by the registry rather than an `if p.kind ==` chain at
     the call site."""
     provider = get(kind).models_provider
-    return provider() if provider is not None else None
+    return provider(parity) if provider is not None else None
 
 
 def get(kind: str) -> ConnectorSpec:

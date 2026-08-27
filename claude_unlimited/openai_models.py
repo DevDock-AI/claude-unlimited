@@ -51,32 +51,59 @@ _FAMILY_FALLBACKS: list[tuple[str, OpenAIModelTarget]] = [
 
 
 def map_model(requested_claude_model: Optional[str], *, override_model: Optional[str] = None,
-              override_reasoning_effort: Optional[str] = None) -> OpenAIModelTarget:
+              override_reasoning_effort: Optional[str] = None,
+              parity: Optional[dict] = None) -> OpenAIModelTarget:
     """Resolves what to send to OpenAI for a given incoming Claude model id.
 
-    A per-Profile override (Profile.codex_model / codex_reasoning_effort)
-    wins over the automatic mapping. The two are independent, so overriding
-    only the model keeps the mapping's reasoning-effort default, and vice
-    versa."""
+    Precedence, narrowest first: a per-Profile override
+    (Profile.codex_model / codex_reasoning_effort) beats the user's parity
+    map, which beats the built-in table. Model and effort are independent at
+    every level, so overriding only the model keeps the effort this model
+    would otherwise have used."""
+    mapped = _resolve(requested_claude_model, parity)
     if override_model is not None:
-        base = OpenAIModelTarget(override_model, override_reasoning_effort or _DEFAULT_TARGET.reasoning_effort)
+        # Effort falls back to the effort for THIS model, not the global
+        # default. Taking _DEFAULT_TARGET's "medium" here meant a Haiku
+        # request whose Profile overrode only the model ran at medium instead
+        # of low — and effort is what Codex quota is actually spent on
+        # (docs/adr/0007), so that was a silent overspend.
+        base = OpenAIModelTarget(override_model, override_reasoning_effort or mapped.reasoning_effort)
     else:
-        base = _resolve(requested_claude_model)
+        base = mapped
     if override_reasoning_effort is not None:
         base = OpenAIModelTarget(base.model, override_reasoning_effort)
     return base
 
 
-def _resolve(requested_claude_model: Optional[str]) -> OpenAIModelTarget:
+def _resolve(requested_claude_model: Optional[str],
+             parity: Optional[dict] = None) -> OpenAIModelTarget:
     if not requested_claude_model:
-        return _DEFAULT_TARGET
+        return _apply_parity(_DEFAULT_TARGET, parity, None)
     if requested_claude_model in _MODEL_MAP:
-        return _MODEL_MAP[requested_claude_model]
+        return _apply_parity(_MODEL_MAP[requested_claude_model], parity, requested_claude_model)
     lowered = requested_claude_model.lower()
     for prefix, target in _FAMILY_FALLBACKS:
         if prefix in lowered:
-            return target
-    return _DEFAULT_TARGET
+            # Keyed on the canonical id the family resolves to, so an override
+            # for "claude-opus-5" also covers a dated Opus id.
+            canonical = next((c for c, t in _MODEL_MAP.items() if t == target), None)
+            return _apply_parity(target, parity, canonical)
+    return _apply_parity(_DEFAULT_TARGET, parity, None)
+
+
+def _apply_parity(target: OpenAIModelTarget, parity: Optional[dict],
+                  claude_id: Optional[str]) -> OpenAIModelTarget:
+    """Overlays a user-configured row onto the built-in mapping.
+
+    Model and effort are independent, so overriding one keeps the shipped
+    default for the other — the same rule the per-Profile overrides follow."""
+    if not parity or not claude_id:
+        return target
+    row = parity.get(claude_id)
+    if not isinstance(row, dict):
+        return target
+    return OpenAIModelTarget(row.get("model") or target.model,
+                             row.get("effort") or target.reasoning_effort)
 
 
 # Display names for the OpenAI models this mapping can target. Only used to
@@ -119,7 +146,7 @@ _CLAUDE_DISPLAY_NAMES: dict[str, str] = {
 }
 
 
-def automatic_mapping() -> list[dict[str, str]]:
+def automatic_mapping(parity: Optional[dict] = None) -> list[dict]:
     """The mapping table the Dashboard shows when a codex Profile is left on
     automatic.
 
@@ -127,18 +154,43 @@ def automatic_mapping() -> list[dict[str, str]]:
     restated there once and silently went stale the first time the mapping
     changed — the modal kept advertising a model and effort the bridge had
     stopped using."""
-    return [
-        {
+    rows = []
+    for claude_id, target in _MODEL_MAP.items():
+        effective = _apply_parity(target, parity, claude_id)
+        rows.append({
             "claude_model": claude_id,
             "claude_label": _CLAUDE_DISPLAY_NAMES.get(claude_id, claude_id),
-            "openai_model": target.model,
-            "reasoning_effort": target.reasoning_effort,
-        }
-        for claude_id, target in _MODEL_MAP.items()
-    ]
+            "openai_model": effective.model,
+            "reasoning_effort": effective.reasoning_effort,
+            "default_model": target.model,
+            "default_effort": target.reasoning_effort,
+            "overridden": effective != target,
+        })
+    return rows
 
 
-def advertised_models() -> list[tuple[str, str]]:
+def selectable_models() -> list[str]:
+    """Every OpenAI model id the Dashboard may offer in a dropdown.
+
+    Served rather than restated in the page: the mapping table was hardcoded
+    in index.html once and went stale the first time the lineup changed, and a
+    second hardcoded copy in app.js would fail the same way."""
+    seen = list(_MODEL_LADDER)
+    for target in _MODEL_MAP.values():
+        if target.model not in seen:
+            seen.append(target.model)
+    for extra in _LEGACY_SELECTABLE:
+        if extra not in seen:
+            seen.append(extra)
+    return seen
+
+
+# Older ids that remain selectable for a Profile pinned to one, even though
+# nothing maps to them by default.
+_LEGACY_SELECTABLE: tuple[str, ...] = ("gpt-5.5", "gpt-5.2")
+
+
+def advertised_models(parity: Optional[dict] = None) -> list[tuple[str, str]]:
     """(model_id, display_name) pairs for the Anthropic-shaped /v1/models
     listing a codex Profile answers with, newest-capability-first.
 
@@ -152,6 +204,7 @@ def advertised_models() -> list[tuple[str, str]]:
     mapping."""
     out: list[tuple[str, str]] = []
     for claude_id, target in _MODEL_MAP.items():
+        target = _apply_parity(target, parity, claude_id)
         backing = _OPENAI_DISPLAY_NAMES.get(target.model, target.model)
         out.append((claude_id, f"{backing} · {target.reasoning_effort} reasoning"))
     return out

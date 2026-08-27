@@ -3,6 +3,7 @@ from claude_unlimited.openai_models import (
     _MODEL_MAP,
     OpenAIModelTarget,
     automatic_mapping,
+    advertised_models,
     fallback_models,
     map_model,
 )
@@ -40,8 +41,11 @@ def test_family_prefix_fallback_for_an_unrecognized_but_familiar_id():
 def test_per_profile_model_override_wins_outright():
     target = map_model("claude-haiku-4-5-20251001", override_model="gpt-5.2")
     assert target.model == "gpt-5.2"
-    # Reasoning effort keeps the mapping's own default when only the model is overridden.
-    assert target.reasoning_effort == "medium"
+    # Effort falls back to the effort for THIS model ("low" for Haiku), not a
+    # global default. It used to take the global "medium", which quietly ran
+    # Haiku requests at a higher effort than their tier — and effort is what
+    # Codex quota is spent on (docs/adr/0007).
+    assert target.reasoning_effort == "low"
 
 
 def test_per_profile_reasoning_effort_override_alone_keeps_the_mapped_model():
@@ -93,7 +97,55 @@ def test_the_dashboard_does_not_restate_the_mapping():
     # /api/codex/model-map now; a literal model id back in the page means the
     # duplicate has returned.
     from pathlib import Path
-    page = (Path(__file__).resolve().parent.parent
-            / "claude_unlimited" / "static" / "index.html").read_text(encoding="utf-8")
-    for target in {t.model for t in _MODEL_MAP.values()}:
-        assert target not in page, f"{target} is hardcoded in index.html again"
+    static = Path(__file__).resolve().parent.parent / "claude_unlimited" / "static"
+    # app.js as well as index.html: the option lists there hardcoded the same
+    # ids, which is the same drift bug one file over.
+    for filename in ("index.html", "app.js"):
+        page = (static / filename).read_text(encoding="utf-8")
+        for target in {t.model for t in _MODEL_MAP.values()}:
+            assert target not in page, f"{target} is hardcoded in {filename} again"
+
+
+def test_parity_override_applies_to_the_mapping():
+    parity = {"claude-opus-5": {"model": "gpt-5.6-sol", "effort": "max"}}
+    assert map_model("claude-opus-5", parity=parity) == OpenAIModelTarget("gpt-5.6-sol", "max")
+
+
+def test_a_parity_row_may_override_only_one_field():
+    parity = {"claude-opus-5": {"effort": "low"}}
+    t = map_model("claude-opus-5", parity=parity)
+    assert t.model == _MODEL_MAP["claude-opus-5"].model  # shipped default kept
+    assert t.reasoning_effort == "low"
+
+
+def test_a_profile_override_still_beats_the_parity_map():
+    # Narrower wins: the Profile setting is more specific than a global table.
+    parity = {"claude-opus-5": {"model": "gpt-5.6-sol"}}
+    t = map_model("claude-opus-5", override_model="gpt-5.6-luna", parity=parity)
+    assert t.model == "gpt-5.6-luna"
+
+
+def test_parity_reaches_a_dated_model_id_through_the_family_fallback():
+    parity = {"claude-opus-5": {"effort": "minimal"}}
+    assert map_model("claude-opus-4-1-20260101", parity=parity).reasoning_effort == "minimal"
+
+
+def test_untouched_rows_follow_the_shipped_defaults():
+    parity = {"claude-opus-5": {"effort": "low"}}
+    assert map_model("claude-sonnet-5", parity=parity) == _MODEL_MAP["claude-sonnet-5"]
+
+
+def test_advertised_models_reflect_parity():
+    # The /model picker must not advertise one thing while the bridge runs
+    # another — that is the drift class this work exists to remove.
+    parity = {"claude-opus-5": {"model": "gpt-5.6-sol", "effort": "max"}}
+    labels = dict(advertised_models(parity))
+    assert "Sol" in labels["claude-opus-5"] and "max" in labels["claude-opus-5"]
+
+
+def test_automatic_mapping_marks_overridden_rows():
+    rows = {r["claude_model"]: r for r in automatic_mapping({"claude-opus-5": {"effort": "max"}})}
+    assert rows["claude-opus-5"]["overridden"] is True
+    assert rows["claude-opus-5"]["reasoning_effort"] == "max"
+    assert rows["claude-opus-5"]["default_effort"] == _MODEL_MAP["claude-opus-5"].reasoning_effort
+    assert rows["claude-sonnet-5"]["overridden"] is False
