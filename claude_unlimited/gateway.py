@@ -209,6 +209,16 @@ class Gateway:
 
     _USED_NOW_GRACE_SECONDS = 900.0  # 15 minutes — see the class docstring
     _REFRESH_CHECK_COOLDOWN_SECONDS = 60.0
+    # Recovery attempts on a Profile that is ALREADY needs-re-auth get their
+    # own, much longer interval.
+    #
+    # They used to share the 60s one, which meant a stuck account asked the
+    # token endpoint to refresh a dead credential 1,440 times a day. That is
+    # what earned the 429s, and it fed itself: rate limited -> still
+    # AUTH_INVALID -> ask again in 60s. A preventive refresh (token genuinely
+    # near expiry) stays responsive; a recovery poll does not need to be, and
+    # ten minutes still self-heals long before anyone notices.
+    _REAUTH_RECOVERY_COOLDOWN_SECONDS = 600.0
     # A 429 from the OAuth token endpoint means back off hard. Retrying a
     # rate-limited endpoint every 60s only re-triggers the same limiter and
     # never lets it clear.
@@ -217,12 +227,20 @@ class Gateway:
     # this ceiling. A flat interval never lets a persistently rate-limited
     # endpoint recover: it just keeps arriving at the same rate forever.
     _RATE_LIMIT_BACKOFF_CEILING_SECONDS = 6 * 60 * 60.0
-    # After this many consecutive rate-limited refreshes, stop trying on our
-    # own. At that point the endpoint has refused for hours and only a real
-    # re-authentication will help, so continuing to ask is pure noise against
-    # someone else's rate limiter. Cleared by a success, or by the credential
-    # being replaced (`claude-unlimited reauth`, re-import, re-paste).
-    _MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES = 6
+    # After this many consecutive rate-limited refreshes, say so once — the
+    # endpoint has been refusing for hours and a re-authentication is probably
+    # needed. It does NOT stop trying.
+    #
+    # It used to. That was a deadlock: the streak is only cleared by a
+    # SUCCESSFUL refresh, and the give-up check returned before ever attempting
+    # one, so nothing could clear it and no retry ever happened. The only exits
+    # were a manual re-auth or a daemon restart — which meant a daemon left
+    # running, exactly as intended, was the case that could never recover. An
+    # account sat given-up for seven hours and then expired.
+    #
+    # The escalating backoff is the real protection: at the ceiling this is at
+    # most four attempts a day, which is not noise against anyone's limiter.
+    _RATE_LIMITED_REFRESHES_BEFORE_WARNING = 6
 
     def __init__(self, transport: Callable = real_send):
         self._lock = threading.Lock()
@@ -265,6 +283,14 @@ class Gateway:
         # Consecutive rate-limited refreshes per Profile, driving the
         # escalating backoff and the give-up threshold above.
         self._refresh_rate_limited_streak: dict[str, int] = {}
+        # Guards the check-then-act on the two dicts above, and marks which
+        # Profiles have a refresh in flight. Its own lock, not self._lock:
+        # _maybe_refresh_credential runs OUTSIDE self._lock (the request path)
+        # while _maybe_check_oauth_credential runs inside it (the sync path),
+        # so self._lock cannot serialise them — and holding self._lock across
+        # a network call would stall every request anyway.
+        self._refresh_lock = threading.Lock()
+        self._refresh_in_progress: set = set()
         persisted = runtime_state.load()
         self._persisted_profiles: dict = persisted["profiles"]
         self._current_profile_id = persisted["current_profile_id"]
@@ -757,7 +783,9 @@ class Gateway:
         # shared throttle either way — see its own docstring for why that
         # must never be bypassed.
         try:
-            refreshed = self._try_refresh(p.id, cred.refresh_token)
+            refreshed = self._try_refresh(
+                p.id, cred.refresh_token,
+                cooldown=self._REAUTH_RECOVERY_COOLDOWN_SECONDS if was_auth_invalid else None)
         except oauth_login.OAuthLoginError as exc:
             if was_auth_invalid:
                 activity.record("error", f"{p.name} — automatic recovery attempt failed", meta=str(exc)[:200])
@@ -1028,12 +1056,11 @@ class Gateway:
         for it. _try_refresh still re-checks, since it is what sets the clock
         and is reachable by other paths; this is a cheap pre-filter, never the
         authority."""
-        if self._refresh_rate_limited_streak.get(profile_id, 0) >= self._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES:
-            return False
         not_before = self._refresh_check_not_before.get(profile_id)
         return not_before is None or time.monotonic() >= not_before
 
-    def _try_refresh(self, profile_id: str, refresh_token: str) -> Optional["oauth_login.LoginTokens"]:
+    def _try_refresh(self, profile_id: str, refresh_token: str, *,
+                      cooldown: Optional[float] = None) -> Optional["oauth_login.LoginTokens"]:
         """The ONE place that actually calls oauth_login.refresh_access_token
         — shared by _maybe_refresh_credential (the per-request path, called
         from inside handle() for whichever Profile choose() just picked) and
@@ -1051,12 +1078,25 @@ class Gateway:
         oauth_login.OAuthLoginError, unchanged, for a real (non-throttled)
         failure so each caller can decide how to log/react to that."""
         now = time.monotonic()
-        if self._refresh_rate_limited_streak.get(profile_id, 0) >= self._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES:
-            return None  # given up: re-authentication is the only way back
-        not_before = self._refresh_check_not_before.get(profile_id)
-        if not_before is not None and now < not_before:
-            return None
-        self._refresh_check_not_before[profile_id] = now + self._REFRESH_CHECK_COOLDOWN_SECONDS
+        # Claim the slot atomically. Anthropic ROTATES the refresh token on
+        # use, so two threads refreshing the same Profile at once send the same
+        # token: one succeeds and consumes it, the other replays a token that
+        # no longer exists. That earns 429s from the token endpoint and can
+        # invalidate the grant outright — which is exactly how an account that
+        # was refreshing fine ends up needing a manual re-auth.
+        #
+        # The check and the write have to happen together. Reading not_before,
+        # deciding, and then writing it is a check-then-act that both threads
+        # can pass.
+        with self._refresh_lock:
+            if profile_id in self._refresh_in_progress:
+                return None   # another thread is already refreshing this one
+            not_before = self._refresh_check_not_before.get(profile_id)
+            if not_before is not None and now < not_before:
+                return None
+            self._refresh_check_not_before[profile_id] = now + (
+                cooldown if cooldown is not None else self._REFRESH_CHECK_COOLDOWN_SECONDS)
+            self._refresh_in_progress.add(profile_id)
         try:
             tokens = oauth_login.refresh_access_token(refresh_token)
         except oauth_login.OAuthLoginError as exc:
@@ -1071,10 +1111,18 @@ class Gateway:
                 wait = min(self._RATE_LIMIT_BACKOFF_SECONDS * (2 ** (streak - 1)),
                             self._RATE_LIMIT_BACKOFF_CEILING_SECONDS)
                 self._refresh_check_not_before[profile_id] = now + wait
-                if streak >= self._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES:
-                    activity.record("error", "Automatic token refresh gave up",
-                                     meta=f"{profile_id}: rate limited {streak} times in a row — re-authenticate to recover")
+                if streak == self._RATE_LIMITED_REFRESHES_BEFORE_WARNING:
+                    # Once, on the crossing — not on every attempt after it,
+                    # which would fill the Activity log with the same line.
+                    activity.record(
+                        "error", "Automatic token refresh keeps being rate limited",
+                        meta=(f"{profile_id}: {streak} times in a row. Still retrying, now every "
+                              f"{int(self._RATE_LIMIT_BACKOFF_CEILING_SECONDS // 3600)}h — "
+                              "`claude-unlimited reauth` recovers it immediately."))
             raise
+        finally:
+            with self._refresh_lock:
+                self._refresh_in_progress.discard(profile_id)
         self._refresh_rate_limited_streak.pop(profile_id, None)
         return tokens
 

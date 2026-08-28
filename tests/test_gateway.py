@@ -1,3 +1,4 @@
+import time
 import time as real_time
 from datetime import datetime, timedelta, timezone
 
@@ -1001,35 +1002,6 @@ def test_rate_limited_refresh_backs_off_further_each_time(pool_env, monkeypatch)
     assert waits[-1] <= Gateway._RATE_LIMIT_BACKOFF_CEILING_SECONDS
 
 
-def test_refresh_gives_up_after_repeated_rate_limits(pool_env, monkeypatch):
-    """Once the endpoint has refused for hours, only re-authentication helps.
-    Continuing to ask is noise against someone else's rate limiter."""
-    import claude_unlimited.gateway as gw_mod
-    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
-                                      automatic=True, enabled=True, account_uuid="u")]))
-    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
-
-    calls = []
-
-    def always_rate_limited(_token):
-        calls.append(1)
-        raise gw_mod.oauth_login.OAuthLoginError("rate limited", status_code=429)
-
-    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token", always_rate_limited)
-    now = [1000.0]
-    monkeypatch.setattr(gw_mod.time, "monotonic", lambda: now[0])
-
-    for _ in range(20):
-        try:
-            gw._try_refresh("a", "refresh-tok")
-        except gw_mod.oauth_login.OAuthLoginError:
-            pass
-        now[0] = gw._refresh_check_not_before.get("a", now[0]) + 1
-
-    assert len(calls) == Gateway._MAX_CONSECUTIVE_RATE_LIMITED_REFRESHES, len(calls)
-    assert gw._try_refresh("a", "refresh-tok") is None  # stays given up
-
-
 def test_a_successful_refresh_clears_the_rate_limit_streak(pool_env, monkeypatch):
     import claude_unlimited.gateway as gw_mod
     save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
@@ -1298,3 +1270,113 @@ def test_the_sync_loop_does_not_read_the_keychain_on_every_poll(pool_env, monkey
 
     assert len(reads) == after_first, (
         f"the keychain was read {len(reads) - after_first} more times across 20 polls")
+
+
+def test_repeated_rate_limits_back_off_but_never_stop_retrying(pool_env, monkeypatch):
+    """This used to give up permanently, and that was a deadlock.
+
+    The streak is cleared only by a SUCCESSFUL refresh, and the give-up check
+    returned before ever attempting one — so nothing could clear it and no
+    retry ever happened again. The only exits were a manual re-auth or a daemon
+    restart, which made a daemon left running the one case that could never
+    recover. A real account sat given-up for seven hours and then expired.
+
+    The escalating backoff is the protection: at the ceiling this is about four
+    attempts a day, which is not noise against anyone's limiter."""
+    import claude_unlimited.gateway as gw_mod
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport")))
+
+    calls = []
+
+    def always_rate_limited(_token):
+        calls.append(1)
+        raise gw_mod.oauth_login.OAuthLoginError("rate limited", status_code=429)
+
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token", always_rate_limited)
+    now = [1000.0]
+    monkeypatch.setattr(gw_mod.time, "monotonic", lambda: now[0])
+
+    waits = []
+    for _ in range(20):
+        try:
+            gw._try_refresh("a", "refresh-tok")
+        except gw_mod.oauth_login.OAuthLoginError:
+            pass
+        deadline = gw._refresh_check_not_before.get("a", now[0])
+        waits.append(deadline - now[0])
+        now[0] = deadline + 1
+
+    # Every single attempt was made — none were refused by a permanent wall.
+    assert len(calls) == 20, len(calls)
+    # The wait escalates and then holds at the ceiling, rather than stopping.
+    assert waits[0] < waits[3] <= Gateway._RATE_LIMIT_BACKOFF_CEILING_SECONDS
+    assert waits[-1] == Gateway._RATE_LIMIT_BACKOFF_CEILING_SECONDS
+
+
+def test_the_backoff_ceiling_keeps_retries_to_roughly_four_a_day(pool_env):
+    """The number that has to stay defensible: this is what replaces the
+    permanent give-up as the protection against hammering the endpoint."""
+    per_day = 24 * 3600 / Gateway._RATE_LIMIT_BACKOFF_CEILING_SECONDS
+    assert per_day <= 6, per_day
+
+
+def test_a_stuck_account_does_not_hammer_the_token_endpoint(pool_env, monkeypatch):
+    """This is what earned the 429s.
+
+    A Profile that is already needs-re-auth bypasses the expiry check so it can
+    self-heal — but it shared the 60s refresh cooldown, so it asked the token
+    endpoint to refresh a dead credential 1,440 times a day. Anthropic rate
+    limited it, which kept it needs-re-auth, which made it ask again in 60s.
+
+    A recovery poll does not need to be fast. A preventive refresh does, and
+    keeps the short interval."""
+    import claude_unlimited.gateway as gw_mod
+
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    stored = gw_mod.oauth_credential.encode(gw_mod.oauth_credential.StoredOAuthCredential(
+        access_token="dead", refresh_token="r", expires_at=None))
+    monkeypatch.setattr(gw_mod, "secret_store", FakeSecretStore({"a": stored}))
+    # NOT a 429: that path overwrites the cooldown with its own escalating
+    # backoff, which would measure the wrong thing entirely.
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token",
+                        lambda token: (_ for _ in ()).throw(
+                            gw_mod.oauth_login.OAuthLoginError("server error", status_code=500)))
+
+    gw = Gateway(transport=lambda req: fake_response(200))
+    gw.runtime_snapshot()
+    gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    now = [1000.0]
+    monkeypatch.setattr(gw_mod.time, "monotonic", lambda: now[0])
+    gw._refresh_check_not_before.clear()
+
+    gw.runtime_snapshot()                      # one recovery attempt
+    wait = gw._refresh_check_not_before["a"] - now[0]
+
+    # Ten minutes, not one. At 60s this was ~1440 calls a day to a rate-limited
+    # endpoint; the whole point is that a stuck account backs off.
+    assert wait >= Gateway._REAUTH_RECOVERY_COOLDOWN_SECONDS
+    assert 24 * 3600 / wait <= 150, f"{24 * 3600 / wait:.0f} attempts a day is still hammering"
+
+
+def test_a_preventive_refresh_stays_responsive(pool_env, monkeypatch):
+    """The long interval is for recovery only. A healthy token that is genuinely
+    near expiry must still be refreshed promptly."""
+    import claude_unlimited.gateway as gw_mod
+
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    now = [1000.0]
+    monkeypatch.setattr(gw_mod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token",
+                        lambda token: (_ for _ in ()).throw(
+                            gw_mod.oauth_login.OAuthLoginError("nope", status_code=500)))
+    gw = Gateway(transport=lambda req: fake_response(200))
+    try:
+        gw._try_refresh("a", "r")
+    except gw_mod.oauth_login.OAuthLoginError:
+        pass
+    assert gw._refresh_check_not_before["a"] - now[0] == Gateway._REFRESH_CHECK_COOLDOWN_SECONDS
