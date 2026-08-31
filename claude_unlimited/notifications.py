@@ -73,8 +73,11 @@ def send_windows_notification(title: str, message: str) -> None:
         "Show($toast);"
     )
     try:
+        # CREATE_NO_WINDOW: the daemon runs without a console, so PowerShell
+        # would otherwise flash a console window for every notification sent.
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                        capture_output=True, timeout=5, check=False)
+                        capture_output=True, timeout=5, check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         pass
 

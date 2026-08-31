@@ -149,3 +149,24 @@ def test_start_requires_installed():
     with patch.object(backend, "is_installed", return_value=False):
         with pytest.raises(backend.DaemonInstallerError):
             backend.start()
+
+
+def test_console_programs_are_launched_without_a_window():
+    """The daemon runs hidden (no console), so every console program it launches
+    — schtasks/tasklist/taskkill, fired once a second by the Dashboard's status
+    poll — must pass CREATE_NO_WINDOW, or Windows allocates a new console window
+    for each one (the "console flashing once a second" bug). This is invisible on
+    macOS/Linux, where CREATE_NO_WINDOW does not exist and _NO_WINDOW is 0, so
+    guard the flag explicitly rather than relying on a real Windows run to catch
+    a regression."""
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen.update(kwargs)
+        return _ok()
+
+    with patch.object(backend.subprocess, "run", side_effect=fake_run):
+        backend.is_installed()   # runs `schtasks /query` through _run
+
+    assert "creationflags" in seen
+    assert seen["creationflags"] == backend._NO_WINDOW

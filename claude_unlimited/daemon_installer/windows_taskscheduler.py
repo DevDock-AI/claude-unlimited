@@ -31,8 +31,17 @@ class DaemonInstallerError(RuntimeError):
     pass
 
 
+# schtasks/tasklist/taskkill are console programs, and a process that has no
+# console of its own — which the daemon is, being started hidden — gets a NEW
+# console window allocated for each one it runs. The Dashboard polls status
+# once a second, so without this flag the desktop flashes a console window
+# every second for as long as the Dashboard is open.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _run(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(list(args), capture_output=True, text=True)
+    return subprocess.run(list(args), capture_output=True, text=True,
+                          creationflags=_NO_WINDOW)
 
 
 def install(port: int) -> None:
@@ -120,16 +129,21 @@ def _detached_restart() -> None:
     pid = _read_pid()
     script = (
         "import subprocess, time\n"
+        # Same reason as _run's flag: this helper is detached and console-less,
+        # so each console program it runs would otherwise pop a window.
+        "NW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)\n"
         f"pid = {pid!r}\n"
         "if pid:\n"
-        "    subprocess.run(['taskkill', '/pid', str(pid), '/f'], capture_output=True)\n"
+        "    subprocess.run(['taskkill', '/pid', str(pid), '/f'], capture_output=True,\n"
+        "                   creationflags=NW)\n"
         "    for _ in range(60):\n"
         "        r = subprocess.run(['tasklist', '/fi', 'PID eq ' + str(pid), '/nh'],\n"
-        "                           capture_output=True, text=True)\n"
+        "                           capture_output=True, text=True, creationflags=NW)\n"
         "        if str(pid) not in r.stdout:\n"
         "            break\n"
         "        time.sleep(0.25)\n"
-        f"subprocess.run(['schtasks', '/run', '/tn', {TASK_NAME!r}], capture_output=True)\n"
+        f"subprocess.run(['schtasks', '/run', '/tn', {TASK_NAME!r}], capture_output=True,\n"
+        "               creationflags=NW)\n"
     )
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     subprocess.Popen(
