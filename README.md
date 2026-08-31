@@ -180,18 +180,26 @@ curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/in
 That checks the install, registers it to run in the background and start on login, and
 opens the dashboard at **http://127.0.0.1:4317/** — where you add your first account.
 
-That one-liner is for **macOS and Linux** (it's a bash script). On **Windows**, install
-from Python instead:
+That one-liner is for **macOS and Linux** (it's a bash script). On **Windows**, open
+**PowerShell** and run the Windows one-liner installer instead:
 
 ```powershell
-pip install --user git+https://github.com/DevDock-AI/claude-unlimited.git
-claude-unlimited doctor
-claude-unlimited install   # registers a logon task; run once from an elevated prompt
+irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex
+```
+
+That's the whole thing on a bare machine: it installs Python for you if it isn't already
+there (no admin needed), installs Claude Unlimited straight from GitHub (no `git`
+required), starts it in the background, and opens the dashboard — the same result as the
+bash one-liner. From the classic Command Prompt or the Win+R **Run** box, use:
+
+```bat
+powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex"
 ```
 
 Then `claude-unlimited code` as usual. Everything else — the dashboard, rotation, the
 desktop-app command — works the same; credentials are stored with Windows DPAPI instead
-of the Keychain.
+of the Keychain. Run the installer from an **Administrator** PowerShell if you also want
+the daemon to start automatically at logon.
 
 Don't want it starting on login? Turn it off in **Settings → Daemon**, or run
 `claude-unlimited uninstall`. It keeps running either way until you stop it.
