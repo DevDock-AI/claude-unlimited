@@ -1,3 +1,4 @@
+import os
 import pytest
 
 import claude_unlimited.cli as cli
@@ -96,7 +97,7 @@ def test_code_with_profile_flag_fetches_a_session_token_not_the_placeholder_toke
     assert cli.code(4317, [], profile_arg="Alice") == 0
     assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "session-tok-for-a"
     (binary, argv), = code_env
-    assert binary == "claude"
+    assert os.path.basename(binary) == "claude"
     assert argv[0] == "claude"
 
 

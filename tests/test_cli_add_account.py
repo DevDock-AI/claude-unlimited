@@ -1,3 +1,4 @@
+import os
 import pytest
 
 import claude_unlimited.anthropic_oauth as anthropic_oauth
@@ -55,7 +56,7 @@ def test_add_account_full_flow_uses_an_isolated_config_dir(env, monkeypatch, tmp
     captured = {}
 
     def fake_run(cmd, **kwargs):
-        assert cmd == ["claude", "auth", "login"]  # never "logout", never "status" — no other command needed
+        assert [os.path.basename(cmd[0]), *cmd[1:]] == ["claude", "auth", "login"]  # never "logout", never "status" — no other command needed
         captured["env"] = kwargs.get("env")
         return _FakeCompletedProcess(0)
 

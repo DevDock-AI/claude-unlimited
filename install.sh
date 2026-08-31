@@ -37,6 +37,19 @@ if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)';
   exit 1
 fi
 
+# Debian/Ubuntu ship python3 WITHOUT venv/ensurepip — `python3 -m venv` then
+# fails halfway through this script. Check up front with an actionable message
+# rather than aborting mid-install after files are already copied.
+if ! python3 -c 'import ensurepip, venv' >/dev/null 2>&1; then
+  echo "Python's venv/ensurepip module is missing — on Debian/Ubuntu install it with:" >&2
+  echo "  sudo apt install python3-venv" >&2
+  exit 1
+fi
+
+# curl is used for the health probe near the end; warn (don't abort) if absent
+# so the install still completes on a minimal server without it.
+command -v curl >/dev/null 2>&1 || echo "NOTE: curl not found — skipping the post-install dashboard health check."
+
 if [ -n "$CLONED" ]; then
   echo "Downloading Claude Unlimited…"
   git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$SOURCE_DIR" --quiet

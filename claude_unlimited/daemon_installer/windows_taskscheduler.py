@@ -71,14 +71,28 @@ def is_installed() -> bool:
 
 def _read_pid() -> int | None:
     try:
-        return int(PID_FILE.read_text().strip())
+        return int(PID_FILE.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
 
 
+def _tasklist_line(pid: int) -> str:
+    return _run("tasklist", "/fi", f"PID eq {pid}", "/nh").stdout
+
+
 def _pid_is_alive(pid: int) -> bool:
-    result = _run("tasklist", "/fi", f"PID eq {pid}", "/nh")
-    return str(pid) in result.stdout
+    return str(pid) in _tasklist_line(pid)
+
+
+def _pid_is_ours(pid: int) -> bool:
+    """A live pid whose image is a Python interpreter. Windows recycles pids
+    aggressively, and our pidfile is stale after every unclean stop, so before
+    force-killing we confirm the pid is at least a python process — never
+    `taskkill /f` an unrelated program that happened to inherit the number.
+    (tasklist has no command line without /v; the image check is the cheap,
+    safe floor.)"""
+    line = _tasklist_line(pid).lower()
+    return str(pid) in line and ("python.exe" in line or "pythonw.exe" in line)
 
 
 def status() -> dict:
@@ -92,16 +106,37 @@ def status() -> dict:
 def start() -> None:
     if not is_installed():
         raise DaemonInstallerError("Not installed — run `claude-unlimited install` first.")
-    _stop_running_instance()  # atomic-ish stop-then-start, matching launchd's kickstart -k
-    result = _run("schtasks", "/run", "/tn", TASK_NAME)
-    if result.returncode != 0:
-        raise DaemonInstallerError(f"schtasks /run failed: {(result.stderr or result.stdout).strip()}")
+    # The caller may BE the daemon (Dashboard "Restart", auto-update). If this
+    # process ran taskkill-on-itself then `schtasks /run`, the /run line would
+    # never execute — the daemon would kill itself and stay dead. Unlike
+    # launchd/systemd (external supervisors), schtasks is just a CLI we invoke,
+    # so the restart has to be carried by a helper that OUTLIVES this process.
+    _detached_restart()
 
 
-def _stop_running_instance() -> None:
+def _detached_restart() -> None:
+    """Spawn a detached process that kills the old instance, waits for it to
+    exit, then starts the task — surviving the death of whoever called start()."""
     pid = _read_pid()
-    if pid is not None and _pid_is_alive(pid):
-        _run("taskkill", "/pid", str(pid), "/f")
+    script = (
+        "import subprocess, time\n"
+        f"pid = {pid!r}\n"
+        "if pid:\n"
+        "    subprocess.run(['taskkill', '/pid', str(pid), '/f'], capture_output=True)\n"
+        "    for _ in range(60):\n"
+        "        r = subprocess.run(['tasklist', '/fi', 'PID eq ' + str(pid), '/nh'],\n"
+        "                           capture_output=True, text=True)\n"
+        "        if str(pid) not in r.stdout:\n"
+        "            break\n"
+        "        time.sleep(0.25)\n"
+        f"subprocess.run(['schtasks', '/run', '/tn', {TASK_NAME!r}], capture_output=True)\n"
+    )
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        creationflags=flags,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 
 def stop() -> None:
@@ -110,6 +145,10 @@ def stop() -> None:
     pid = _read_pid()
     if pid is None or not _pid_is_alive(pid):
         raise DaemonInstallerError("Task is registered but no running instance was found (pidfile stale or missing).")
+    if not _pid_is_ours(pid):
+        raise DaemonInstallerError(
+            f"Pid {pid} from the pidfile is not one of our daemon processes (a recycled pid). "
+            "Refusing to kill it.")
     result = _run("taskkill", "/pid", str(pid), "/f")
     if result.returncode != 0:
         raise DaemonInstallerError(f"taskkill failed: {(result.stderr or result.stdout).strip()}")

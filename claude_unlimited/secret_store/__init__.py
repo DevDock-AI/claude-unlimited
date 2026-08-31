@@ -15,12 +15,18 @@ _SYSTEM = platform.system()
 
 if _SYSTEM == "Darwin":
     from .macos_keychain import delete_token, get_token, has_token, set_token
+    # Human-readable name of the loaded backend, so callers (doctor) report the
+    # truth instead of hardcoding one platform's name — that message claimed
+    # "macOS Keychain" on every OS.
+    BACKEND_NAME = "macOS Keychain"
 elif _SYSTEM == "Linux":
     # UNVERIFIED — see linux_secretservice.py's module docstring.
     from .linux_secretservice import delete_token, get_token, has_token, set_token
+    BACKEND_NAME = "Linux Secret Service (libsecret)"
 elif _SYSTEM == "Windows":
     # UNVERIFIED — see windows_dpapi.py's module docstring.
     from .windows_dpapi import delete_token, get_token, has_token, set_token
+    BACKEND_NAME = "Windows DPAPI"
 else:
     raise RuntimeError(
         f"No secret-store backend for {_SYSTEM!r}. Claude Unlimited supports "
@@ -29,4 +35,4 @@ else:
         "to add one."
     )
 
-__all__ = ["set_token", "get_token", "delete_token", "has_token"]
+__all__ = ["set_token", "get_token", "delete_token", "has_token", "BACKEND_NAME"]

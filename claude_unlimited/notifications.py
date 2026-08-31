@@ -79,12 +79,20 @@ def send_windows_notification(title: str, message: str) -> None:
         pass
 
 
+def send(title: str, message: str) -> None:
+    """Fire a desktop notification on whatever platform this is. Each backend
+    self-guards on sys.platform, so calling all three sends exactly one. This
+    is the single dispatch point — the "test notification" button must use it,
+    not one platform's sender, or it silently does nothing off that platform."""
+    send_macos_notification(title, message)
+    send_linux_notification(title, message)
+    send_windows_notification(title, message)
+
+
 def notify_if_enabled(category: str, title: str, message: str, settings: Settings) -> None:
     field = CATEGORY_TO_SETTINGS_FIELD.get(category)
     if field is None:
         raise ValueError(f"Unknown notification category {category!r}.")
     if not settings.notifications_enabled or not getattr(settings, field):
         return
-    send_macos_notification(title, message)
-    send_linux_notification(title, message)
-    send_windows_notification(title, message)
+    send(title, message)

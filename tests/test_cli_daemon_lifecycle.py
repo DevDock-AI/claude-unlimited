@@ -1,5 +1,6 @@
 import errno
 
+import os
 import pytest
 
 import claude_unlimited.cli as cli
@@ -85,7 +86,7 @@ def test_code_when_daemon_already_running_execs_claude_directly(monkeypatch):
     # A --settings status-line hint may be prepended (see cli._status_line_args);
     # what matters is that claude is exec'd with the user's own args intact.
     (binary, argv), = exec_calls
-    assert binary == "claude"
+    assert os.path.basename(binary) == "claude"  # resolved path, argv[0] stays the bare name
     assert argv[0] == "claude" and argv[-2:] == ["--model", "opus"]
     assert cli.os.environ["ANTHROPIC_BASE_URL"] == f"http://{cli.LOOPBACK_HOST}:{cli.DEFAULT_PORT}"
     assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-123"
@@ -111,7 +112,7 @@ def test_code_starts_daemon_when_not_running(monkeypatch):
 
     assert spawn_calls == [cli.DEFAULT_PORT]
     (binary, argv), = exec_calls
-    assert binary == "claude"
+    assert os.path.basename(binary) == "claude"
     assert argv[0] == "claude"
 
 

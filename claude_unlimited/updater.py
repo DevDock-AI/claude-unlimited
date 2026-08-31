@@ -45,7 +45,12 @@ CLONE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git"
 INSTALL_ROOT = Path.home() / ".local" / "share" / "claude-unlimited"
 APP_DIR = INSTALL_ROOT / "app"
 PREVIOUS_APP_DIR = INSTALL_ROOT / "app.previous"
-VENV_PYTHON = INSTALL_ROOT / "venv" / "bin" / "python"
+# A venv puts its interpreter under Scripts\python.exe on Windows and bin/python
+# elsewhere. Hardcoding the POSIX layout made every self-update fail on Windows
+# with a "re-run install.sh" message (a bash script Windows can't run).
+import os as _os
+VENV_PYTHON = INSTALL_ROOT / "venv" / ("Scripts" if _os.name == "nt" else "bin") / (
+    "python.exe" if _os.name == "nt" else "python")
 
 NETWORK_TIMEOUT_SECONDS = 20
 SUBPROCESS_TIMEOUT_SECONDS = 300

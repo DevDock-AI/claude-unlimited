@@ -81,7 +81,7 @@ def read_claude_code_credentials(config_dir: Optional[Path] = None) -> ImportedC
         isolated_path = config_dir / ".credentials.json"
         if isolated_path.exists():
             try:
-                raw = json.loads(isolated_path.read_text())
+                raw = json.loads(isolated_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise CredentialImportError(f"Could not read {isolated_path}: {exc}") from exc
             return _credentials_from_raw(raw, str(isolated_path))
@@ -105,7 +105,7 @@ def read_claude_code_credentials(config_dir: Optional[Path] = None) -> ImportedC
     raw = None
     if DEFAULT_CREDENTIALS_PATH.exists():
         try:
-            raw = json.loads(DEFAULT_CREDENTIALS_PATH.read_text())
+            raw = json.loads(DEFAULT_CREDENTIALS_PATH.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise CredentialImportError(f"Could not read {DEFAULT_CREDENTIALS_PATH}: {exc}") from exc
     elif platform.system() == "Darwin":

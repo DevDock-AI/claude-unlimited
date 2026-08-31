@@ -37,6 +37,35 @@ from . import profiles as profile_repo
 from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, ensure_app_dir, load_pool
 from .daemon import DEFAULT_PORT, LOOPBACK_HOST, run_foreground
 
+# The escalation ladder for stopping a process. SIGKILL is Unix-only — even
+# naming `signal.SIGKILL` raises AttributeError on Windows — so it is included
+# only where it exists. On macOS/Linux this stays (SIGTERM, SIGKILL) exactly as
+# before; on Windows it is (SIGTERM,), where os.kill maps SIGTERM to
+# TerminateProcess.
+_STOP_SIGNALS = tuple(
+    s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGKILL", None))
+    if s is not None
+)
+
+
+def _resolve_launcher(name: str) -> str:
+    """Full path to an external CLI, honoring Windows PATHEXT (.cmd/.exe), or
+    the bare name if not found. `shutil.which` already does PATHEXT resolution;
+    passing the resolved path (not the bare name) to subprocess is what makes a
+    non-.exe launcher work at all on Windows."""
+    return shutil.which(name) or name
+
+
+def _run_tool(argv: list, **kw):
+    """subprocess.run for an external CLI that may be a Windows `.cmd`/`.bat`
+    shim (npm installs Claude Code and Codex as `.cmd`). CreateProcess resolves
+    only `.exe` and ignores PATHEXT, so a shim must be routed through `cmd /c`.
+    On POSIX this is a plain resolved-path run."""
+    exe = _resolve_launcher(argv[0])
+    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
+        return subprocess.run(["cmd", "/c", exe, *argv[1:]], **kw)
+    return subprocess.run([exe, *argv[1:]], **kw)
+
 
 def _probe_health(host: str, port: int, timeout: float = 1.0) -> bool:
     """True only if something at host:port answers like this daemon's
@@ -91,9 +120,9 @@ def doctor() -> int:
     print(f"Python: OK — {sys.version.split()[0]}")
 
     try:
-        import claude_unlimited.secret_store  # noqa: F401
+        import claude_unlimited.secret_store as _ss
 
-        print("Secret store: OK — macOS Keychain backend loaded")
+        print(f"Secret store: OK — {_ss.BACKEND_NAME} backend loaded")
     except Exception as exc:
         print(f"Secret store: MISSING — {exc}")
         ok = False
@@ -198,12 +227,22 @@ def _spawn_background_daemon(port: int) -> None:
     `claude-unlimited install` is what provides real persistence."""
     log_dir = Path.home() / ".claude-unlimited" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    out_log = open(log_dir / "daemon.out.log", "a")
-    err_log = open(log_dir / "daemon.err.log", "a")
+    out_log = open(log_dir / "daemon.out.log", "a", encoding="utf-8")
+    err_log = open(log_dir / "daemon.err.log", "a", encoding="utf-8")
+    # Detach so the daemon outlives this launcher. `start_new_session` is a
+    # POSIX setsid; on Windows CPython silently ignores it, leaving the daemon
+    # tied to the console — it dies when the terminal closes and catches the
+    # terminal's Ctrl-C. Windows needs explicit creation flags instead.
+    detach_kwargs = {}
+    if os.name == "nt":
+        detach_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        detach_kwargs["start_new_session"] = True
     subprocess.Popen(
         [sys.executable, "-m", "claude_unlimited", "start", "--port", str(port)],
         stdout=out_log, stderr=err_log, stdin=subprocess.DEVNULL,
-        start_new_session=True,
+        **detach_kwargs,
     )
 
 
@@ -336,7 +375,7 @@ def _user_already_has_a_status_line() -> bool:
     ]
     for f in candidates:
         try:
-            if "statusLine" in json.loads(f.read_text()):
+            if "statusLine" in json.loads(f.read_text(encoding="utf-8")):
                 return True
         except (OSError, json.JSONDecodeError):
             continue
@@ -364,7 +403,7 @@ def _settings_files_pinning_routing() -> list:
     conflicting = []
     for f in candidates:
         try:
-            env = (json.loads(f.read_text()) or {}).get("env") or {}
+            env = (json.loads(f.read_text(encoding="utf-8")) or {}).get("env") or {}
         except (OSError, json.JSONDecodeError, AttributeError):
             continue
         hits = [k for k in _ROUTING_ENV_KEYS if k in env]
@@ -497,12 +536,12 @@ def _stop_running_daemon(port: int, timeout: float = 8.0) -> None:
     pid_file = Path.home() / ".claude-unlimited" / "daemon.pid"
     pid = None
     try:
-        pid = int(pid_file.read_text().strip())
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         pass
 
     if pid:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        for sig in _STOP_SIGNALS:
             try:
                 os.kill(pid, sig)
             except (ProcessLookupError, PermissionError):
@@ -528,7 +567,7 @@ def _stop_running_daemon(port: int, timeout: float = 8.0) -> None:
             if stray == os.getpid() or not _is_our_daemon(stray):
                 continue
             print(f"Stopping a detached daemon still holding port {port} (pid {stray})…")
-            for sig in (signal.SIGTERM, signal.SIGKILL):
+            for sig in _STOP_SIGNALS:
                 try:
                     os.kill(stray, sig)
                 except (ProcessLookupError, PermissionError, OSError):
@@ -1049,7 +1088,16 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
     # stdout's buffer (whenever stdout isn't a TTY) would vanish.
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execvp("claude", ["claude", *_status_line_args(port, claude_args), *claude_args])
+    argv = ["claude", *_status_line_args(port, claude_args), *claude_args]
+    if os.name == "nt":
+        # Windows has no real exec: os.execvp spawns a child and exits the
+        # parent, so the shell regains the console while claude's TUI is still
+        # attached — interleaved, broken I/O. And a `.cmd` shim can't be
+        # exec'd at all. Run it as a child, wait, and return its exit code.
+        return _run_tool(argv).returncode
+    # POSIX: replace this process image outright — the TUI takes over the
+    # terminal and there is no lingering parent. Never returns on success.
+    os.execvp(_resolve_launcher("claude"), argv)
     return 0  # unreachable: execvp replaces this process on success
 
 
@@ -1159,7 +1207,7 @@ def add_account() -> int:
     print("into `claude` on this machine.\n")
 
     login_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
-    login_proc = subprocess.run(["claude", "auth", "login"], env=login_env)
+    login_proc = _run_tool(["claude", "auth", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`claude auth login` did not complete successfully.", file=sys.stderr)
         return 1
@@ -1224,9 +1272,13 @@ def add_codex_account() -> int:
     print("Opening your browser to log into the ChatGPT/Codex account you want to add — this uses")
     print("an isolated CODEX_HOME, so it will NOT affect any other Codex login on this machine.\n")
 
-    login_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""),
-                 "CODEX_HOME": str(config_dir)}
-    login_proc = subprocess.run(["codex", "login"], env=login_env)
+    # Full environment plus the CODEX_HOME override — matching the Claude login
+    # flow. A stripped {PATH,HOME} env broke the browser handshake off macOS:
+    # Linux `codex login` needs DISPLAY/WAYLAND_DISPLAY/DBUS to open a browser,
+    # and Windows needs USERPROFILE/APPDATA/SystemRoot for TLS. CODEX_HOME is
+    # what isolates the login; nothing else needs stripping.
+    login_env = {**os.environ, "CODEX_HOME": str(config_dir)}
+    login_proc = _run_tool(["codex", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`codex login` did not complete successfully.", file=sys.stderr)
         return 1
@@ -1236,7 +1288,7 @@ def add_codex_account() -> int:
 
     auth_json_path = config_dir / "auth.json"
     try:
-        auth_data = json.loads(auth_json_path.read_text())
+        auth_data = json.loads(auth_json_path.read_text(encoding="utf-8"))
         tokens = auth_data["tokens"]
         access_token = tokens["access_token"]
         account_id = tokens["account_id"]
@@ -1378,7 +1430,7 @@ def reauth(port: int) -> int:
     print("into `claude` on this machine.\n")
 
     login_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
-    login_proc = subprocess.run(["claude", "auth", "login"], env=login_env)
+    login_proc = _run_tool(["claude", "auth", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`claude auth login` did not complete successfully.", file=sys.stderr)
         return 1

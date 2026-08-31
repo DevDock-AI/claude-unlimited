@@ -868,7 +868,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/notifications/test":
-            notifications.send_macos_notification(
+            # send(), not send_macos_notification — the latter is a no-op off
+            # macOS, so the test button reported success while doing nothing on
+            # Linux and Windows.
+            notifications.send(
                 "Claude Unlimited", "This is a test notification — if you can see this, notifications are working.")
             self._send_json(200, {"sent": True})
             return
@@ -1066,6 +1069,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class _WindowsExclusiveHTTPServer(ThreadingHTTPServer):
+    """Windows-only: bind with SO_EXCLUSIVEADDRUSE so no other process can bind
+    our port alongside us. Never instantiated off Windows (the socket option
+    does not exist there); referencing the class is harmless."""
+
+    def server_bind(self):
+        import socket as _socket
+
+        opt = getattr(_socket, "SO_EXCLUSIVEADDRUSE", None)
+        if opt is not None:
+            self.socket.setsockopt(_socket.SOL_SOCKET, opt, 1)
+        super().server_bind()
+
+
 def make_server(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError(
@@ -1080,7 +1097,17 @@ def make_server(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> Threadin
     # later write — the real ~/.claude-unlimited/runtime_state.json.
     global _gateway
     _gateway = Gateway()
-    server = ThreadingHTTPServer((host, port), _DashboardHandler)
+    # On Windows, SO_REUSEADDR does NOT mean "reuse a TIME_WAIT port" as it does
+    # on POSIX — it lets a SECOND socket bind a port already in active use,
+    # which is a hijack risk (another local process could bind 4317 alongside
+    # us and race for the placeholder token) and also defeats the EADDRINUSE
+    # conflict detection the CLI relies on. The correct Windows flag is
+    # SO_EXCLUSIVEADDRUSE. On POSIX we keep the stdlib default (reuse on).
+    if os.name == "nt":
+        _WindowsExclusiveHTTPServer.allow_reuse_address = False
+        server = _WindowsExclusiveHTTPServer((host, port), _DashboardHandler)
+    else:
+        server = ThreadingHTTPServer((host, port), _DashboardHandler)
     _assert_bound_to_loopback(server)
     return server
 

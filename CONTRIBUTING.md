@@ -33,7 +33,30 @@ Three backends exist today behind each interface (see `docs/adr/0002-*.md` for w
 - **Daemon install/auto-start** (`claude_unlimited/daemon_installer/`) — macOS `launchd` (verified), Linux `systemd --user` (unverified), Windows Task Scheduler (`schtasks`, unverified).
 - **Desktop notifications** (`claude_unlimited/notifications.py`) — macOS `osascript` (verified), Linux `notify-send` (unverified), Windows PowerShell toast (unverified).
 
-"Unverified" means: real, reviewed, individually unit-tested code (mocking the subprocess/ctypes calls) that has never run against a real Secret Service provider, `systemd --user` session, DPAPI call, or Task Scheduler task — there's no Linux or Windows machine in this project's development environment. **If you're the first person running this on Linux or Windows: that's the real smoke test.** Run `claude-unlimited doctor`, `install`, `add-account`, and a full Profile add/remove/export cycle, and report back (or send a fix) for whatever doesn't match its module's docstring — that's specifically what CONTRIBUTING.md asks for before calling a backend verified.
+"Unverified" means: real, reviewed, individually unit-tested code (mocking the subprocess/ctypes calls) that has never run against a real Secret Service provider, `systemd --user` session, DPAPI call, or Task Scheduler task — there's no Linux or Windows machine in this project's development environment. **If you're the first person running this on Linux or Windows: that's the real smoke test.**
+
+### Smoke-test checklist (run on a real Linux / Windows box)
+
+Do these in order; each line is something a static review can't confirm. Report (or fix) anything that doesn't match.
+
+**Both platforms**
+1. `claude-unlimited doctor` — secret store names *this* platform's backend (not "macOS Keychain"), notifications line is right, no traceback.
+2. `claude-unlimited add-account` — the browser opens (this is the env/`.cmd`-shim path); the account appears in the dashboard afterwards.
+3. Add an API key in the dashboard, then **remove** it — its credential is gone from the OS store (not just the config row).
+4. `claude-unlimited code` — a real `claude` session starts and routes through the pool (check the Activity log); on Windows the shell doesn't fight the TUI for the console.
+5. Dashboard → **Send test notification** — an actual toast/notification appears (not just a "sent" toast).
+6. Settings → **Restart** the daemon, and let an update install if one's available — the daemon comes back (this is the self-restart path).
+7. `claude-unlimited uninstall` — the service/unit/task is gone and doesn't error on next login.
+
+**Linux specifically**
+8. After `install`, log out and back in — the daemon is still running (`loginctl show-user $USER --property=Linger` should say `Linger=yes`).
+9. On a **non-systemd** box (WSL2 without `systemd=true`): `install` fails with a clear message, not a traceback, and `doctor`/`status` still work afterward.
+10. Re-run `install --port <new>` — the daemon actually moves to the new port.
+
+**Windows specifically**
+11. `pip install`, then `claude-unlimited install` from an **elevated** prompt — the logon task is created; confirm it runs unelevated (`/rl limited`).
+12. Close the terminal you ran `claude-unlimited code` from — the background daemon keeps running (detached), and Ctrl-C in that terminal didn't kill it.
+13. Whichever `claude` you have (native `.exe` or npm `.cmd`) — `code` and `add-account` both launch it.
 
 ## Translations
 
