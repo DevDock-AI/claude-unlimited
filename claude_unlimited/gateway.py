@@ -24,7 +24,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 
 from . import activity, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_tracking
@@ -337,6 +337,12 @@ class Gateway:
                     self._notify_token_budget_exhausted(p, tokens_by_profile, pool)
                 persisted = self._persisted_profiles.get(p.id)
                 now_utc = datetime.now(timezone.utc)
+                # Carry any rate-limit refresh backoff across the restart BEFORE
+                # anything below can trigger a refresh (the ELIGIBLE preventive
+                # check at the end of this branch, or a later recovery poll for
+                # an AUTH_INVALID Profile) — otherwise a rate-limited account
+                # re-pokes the token endpoint the instant the daemon comes back.
+                self._restore_refresh_backoff(p.id, persisted, now_utc)
                 restored = {
                     **_restorable_usage_fields(persisted, now=now_utc),
                     **_restorable_state_fields(persisted, now=now_utc),
@@ -1047,6 +1053,38 @@ class Gateway:
         return GatewayResult(status=404, headers={"content-type": "application/json"},
                               body_chunks=iter([payload]), profile_id=profile.id)
 
+    def _restore_refresh_backoff(self, profile_id: str, persisted: Optional[dict],
+                                  now_utc: datetime) -> None:
+        """Carry a rate-limit refresh backoff across a restart. The needs-re-auth
+        STATE already survives a restart (see _restorable_state_fields); the
+        "backed off — don't re-poke the token endpoint until T" timer did not,
+        because it lives on the monotonic clock, which every process starts
+        fresh. So a rate-limited account re-hit the endpoint the instant the
+        daemon came back, and frequent restarts (auto-update, a crash loop)
+        could keep it rate-limited indefinitely — the same failure mode as
+        repeated manual restarts.
+
+        The deadline is persisted as WALL-CLOCK time (monotonic is meaningless
+        in another process) and converted back to this process's monotonic clock
+        here. Never raises: a malformed or missing entry restores nothing,
+        exactly like a first run."""
+        if not persisted:
+            return
+        streak = persisted.get("refresh_rate_limited_streak")
+        if isinstance(streak, int) and streak > 0:
+            # Restore the streak even when the deadline has already elapsed, so
+            # the NEXT rate-limited refresh keeps escalating from where it left
+            # off rather than restarting the backoff at its base interval.
+            self._refresh_rate_limited_streak[profile_id] = streak
+        raw = persisted.get("refresh_backoff_until")
+        if isinstance(raw, str) and raw:
+            try:
+                remaining = (datetime.fromisoformat(raw) - now_utc).total_seconds()
+            except (ValueError, TypeError):
+                return
+            if remaining > 0:
+                self._refresh_check_not_before[profile_id] = time.monotonic() + remaining
+
     def _refresh_attempt_due(self, profile_id: str) -> bool:
         """Whether a refresh attempt for this Profile could do anything right
         now — the same conditions _try_refresh checks before acting.
@@ -1285,6 +1323,22 @@ class Gateway:
         so any failure here is swallowed, not raised."""
         with self._lock:
             current_profile_id = self._current_profile_id
+            # A rate-limit refresh backoff is worth carrying across a restart —
+            # see _restore_refresh_backoff. The deadline lives on the monotonic
+            # clock, so translate it to wall-clock here; only a Profile with an
+            # active rate-limited streak is persisted, so the ordinary 60s
+            # refresh throttle never leaks into the persisted state.
+            now_monotonic = time.monotonic()
+            now_utc = datetime.now(timezone.utc)
+            backoff: dict[str, tuple] = {}
+            for pid in self._runtime:
+                streak = self._refresh_rate_limited_streak.get(pid, 0)
+                until = None
+                if streak > 0:
+                    not_before = self._refresh_check_not_before.get(pid)
+                    if not_before is not None and not_before - now_monotonic > 0:
+                        until = (now_utc + timedelta(seconds=not_before - now_monotonic)).isoformat()
+                backoff[pid] = (until, streak if streak > 0 else None)
             profiles = {
                 pid: {
                     "last_usage_percent": rt.last_usage_percent,
@@ -1298,6 +1352,11 @@ class Gateway:
                     # for which states survive and which are re-derived.
                     "state": rt.state.value if hasattr(rt.state, "value") else str(rt.state),
                     "cooldown_until": rt.cooldown_until.isoformat() if rt.cooldown_until else None,
+                    # See _restore_refresh_backoff: keeps a rate-limited account
+                    # from re-poking the token endpoint the moment the daemon
+                    # restarts.
+                    "refresh_backoff_until": backoff[pid][0],
+                    "refresh_rate_limited_streak": backoff[pid][1],
                 }
                 for pid, rt in self._runtime.items()
             }
