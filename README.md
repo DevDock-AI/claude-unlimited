@@ -171,35 +171,31 @@ This is the part worth being explicit about:
 
 ## Install
 
-One line. Nothing else to set up:
+Pick your system, copy the **one line**, paste, done. It installs everything it needs
+(even Python, if you don't have it), starts in the background, and opens the dashboard at
+**http://127.0.0.1:4317/** — where you add your first account.
+
+**🍎 macOS & 🐧 Linux** — paste into a terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash
 ```
 
-That checks the install, registers it to run in the background and start on login, and
-opens the dashboard at **http://127.0.0.1:4317/** — where you add your first account.
-
-That one-liner is for **macOS and Linux** (it's a bash script). On **Windows**, open
-**PowerShell** and run the Windows one-liner installer instead:
-
-```powershell
-irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex
-```
-
-That's the whole thing on a bare machine: it installs Python for you if it isn't already
-there (no admin needed), installs Claude Unlimited straight from GitHub (no `git`
-required), starts it in the background, and opens the dashboard — the same result as the
-bash one-liner. From the classic Command Prompt or the Win+R **Run** box, use:
+**🪟 Windows** — press **Win + R** (or open **Command Prompt**), paste, press Enter:
 
 ```bat
 powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex"
 ```
 
-Then `claude-unlimited code` as usual. Everything else — the dashboard, rotation, the
-desktop-app command — works the same; credentials are stored with Windows DPAPI instead
-of the Keychain. Run the installer from an **Administrator** PowerShell if you also want
-the daemon to start automatically at logon.
+**🪟 Windows, already in PowerShell?** — paste this shorter version instead:
+
+```powershell
+irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex
+```
+
+Then run `claude-unlimited code` and you're routed. On Windows, run the installer from an
+**Administrator** PowerShell if you also want it to start automatically at logon;
+credentials are stored with Windows DPAPI instead of the Keychain.
 
 Don't want it starting on login? Turn it off in **Settings → Daemon**, or run
 `claude-unlimited uninstall`. It keeps running either way until you stop it.
