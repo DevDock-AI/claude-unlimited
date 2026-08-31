@@ -116,3 +116,84 @@ def test_updater_venv_python_matches_the_platform_layout():
     else:
         assert updater.VENV_PYTHON.parent.name == "bin"
         assert updater.VENV_PYTHON.name == "python"
+
+
+def test_login_import_error_names_this_platforms_location(monkeypatch):
+    """The "no login" error used to name "macOS Keychain" on every OS, sending
+    Windows and Linux users hunting for something that does not exist there.
+    Each platform must describe where ITS login actually lives, and say that
+    the CLI has to have been signed in first."""
+    from claude_unlimited import anthropic_oauth
+
+    seen = {}
+    for system, expected in (("Darwin", "Keychain"), ("Windows", ".credentials.json"),
+                             ("Linux", ".credentials.json")):
+        monkeypatch.setattr(anthropic_oauth.platform, "system", lambda s=system: s)
+        message = anthropic_oauth.no_default_login_message()
+        seen[system] = message
+        assert expected in message
+        # the prerequisite is the actual fix: nothing works until the CLI logs in
+        assert "/login" in message and "at least once" in message
+
+    assert "Keychain" not in seen["Windows"], seen["Windows"]
+    assert "Keychain" not in seen["Linux"], seen["Linux"]
+    assert "Windows PC" in seen["Windows"] and "Mac" in seen["Darwin"]
+    assert "Linux machine" in seen["Linux"]
+
+
+def test_login_import_error_names_a_cli_that_actually_exists(monkeypatch, tmp_path):
+    """"Run `claude`" is a dead end for desktop-app users: the app ships its own
+    copy of the CLI inside its userData directory and puts nothing on PATH. The
+    message must name the bundled binary, newest version first."""
+    from claude_unlimited import anthropic_oauth
+
+    monkeypatch.setattr(anthropic_oauth.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(anthropic_oauth.shutil, "which", lambda _name: None)
+    # home too, or this machine's own ~/.local/bin install answers instead
+    monkeypatch.setattr(anthropic_oauth.Path, "home", staticmethod(lambda: tmp_path / "home"))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    for version in ("2.1.247", "2.1.9", "1.0.0"):
+        exe = tmp_path / "Claude" / "claude-code" / version / "claude.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("", encoding="utf-8")
+
+    # 2.1.247 > 2.1.9 only if the version is compared numerically, not as text.
+    assert "2.1.247" in anthropic_oauth.claude_cli_command()
+    assert "2.1.247" in anthropic_oauth.no_default_login_message()
+
+    # ...and when the CLI is genuinely absent, say so instead of naming nothing.
+    monkeypatch.setenv("APPDATA", str(tmp_path / "empty"))
+    assert anthropic_oauth.claude_cli_command() == ""
+    assert "not installed" in anthropic_oauth.no_default_login_message()
+
+
+def test_login_import_error_prefers_a_cli_on_path(monkeypatch):
+    """When `claude` IS on PATH, keep the short instruction."""
+    from claude_unlimited import anthropic_oauth
+
+    monkeypatch.setattr(anthropic_oauth.shutil, "which", lambda _name: "/usr/local/bin/claude")
+    assert anthropic_oauth.claude_cli_command() == "claude"
+    assert "Run `claude` in a terminal" in anthropic_oauth.no_default_login_message()
+
+
+def test_login_import_error_finds_a_natively_installed_cli(monkeypatch, tmp_path):
+    """Claude Code's own installer writes to ~/.local/bin and updates PATH, but a
+    terminal opened before that still cannot resolve `claude` - so a real install
+    must be found there before falling back to the desktop app's older bundle."""
+    from claude_unlimited import anthropic_oauth
+
+    monkeypatch.setattr(anthropic_oauth.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(anthropic_oauth.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(anthropic_oauth.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    bundled = tmp_path / "Roaming" / "Claude" / "claude-code" / "2.1.247" / "claude.exe"
+    bundled.parent.mkdir(parents=True)
+    bundled.write_text("", encoding="utf-8")
+    assert "2.1.247" in anthropic_oauth.claude_cli_command()   # only the bundle exists
+
+    native = tmp_path / ".local" / "bin" / "claude.exe"
+    native.parent.mkdir(parents=True)
+    native.write_text("", encoding="utf-8")
+    command = anthropic_oauth.claude_cli_command()
+    assert ".local" in command and "2.1.247" not in command    # the real install wins

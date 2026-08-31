@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
+import shutil
 import subprocess
 import urllib.error
 import urllib.request
@@ -55,6 +57,116 @@ def _credentials_from_raw(raw: dict, source: str) -> ImportedCredentials:
         refresh_token=data.get("refreshToken"),
         expires_at=data.get("expiresAt"),
         subscription_type=data.get("subscriptionType"),
+    )
+
+
+def _bundled_claude_cli() -> Optional[Path]:
+    """The Claude Code CLI that ships INSIDE the Claude desktop app, if present.
+
+    The app installs its own copy under its userData directory and puts nothing
+    on PATH, so a machine can have a perfectly working CLI while `claude` is an
+    unknown command - which is exactly the state someone is in when they reach
+    this error from the desktop app."""
+
+    system = platform.system()
+    if system == "Windows":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "Claude"
+        exe = "claude.exe"
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Application Support" / "Claude"
+        exe = "claude"
+    else:
+        base = Path.home() / ".config" / "Claude"
+        exe = "claude"
+
+    def version_key(path: Path):
+        # Newest version wins; unparsable names sort last rather than crash.
+        parts = []
+        for chunk in path.parent.name.split("."):
+            parts.append(int(chunk) if chunk.isdigit() else -1)
+        return parts
+
+    try:
+        found = [p for p in (base / "claude-code").glob(f"*/{exe}") if p.is_file()]
+    except OSError:
+        return None
+    return max(found, key=version_key) if found else None
+
+
+def _installed_claude_cli() -> Optional[Path]:
+    """The CLI put there by Claude Code's own installer, if PATH is stale.
+
+    Its native installer writes to ~/.local/bin and adds that directory to
+    PATH - but a terminal opened before that runs with the old environment, so
+    the binary is present while `claude` is still an unknown command."""
+
+    exe = "claude.exe" if platform.system() == "Windows" else "claude"
+    candidate = Path.home() / ".local" / "bin" / exe
+    return candidate if candidate.is_file() else None
+
+
+def claude_cli_command() -> str:
+    """How to invoke the Claude Code CLI on THIS machine, as runnable text.
+
+    Ordered by how the person would want to run it: what PATH already resolves,
+    then a real install PATH has not caught up with, and only then the copy
+    bundled inside the desktop app (oldest and least expected)."""
+
+    if shutil.which("claude"):
+        return "claude"
+    for finder in (_installed_claude_cli, _bundled_claude_cli):
+        found = finder()
+        if found is not None:
+            # Quoted: these paths routinely contain spaces.
+            return f'"{found}"'
+    return ""
+
+
+def no_default_login_message() -> str:
+    """Why "Import current login" found nothing, in terms that fit THIS OS.
+
+    This flow reads the session Claude Code itself stored, so it can only work
+    once Claude Code has been signed in on this machine — that prerequisite is
+    the first thing to say. Where the session lives is then platform-specific,
+    and naming the macOS Keychain on Windows or Linux (as this message used to,
+    on every OS) sends people hunting for something that does not exist there.
+    See secret_store.BACKEND_NAME for the same per-platform honesty."""
+
+    system = platform.system()
+    if system == "Darwin":
+        where = (
+            f"neither {DEFAULT_CREDENTIALS_PATH} nor the login Keychain "
+            f"(service {MACOS_KEYCHAIN_SERVICE!r}) holds one"
+        )
+    else:
+        # Everywhere else Claude Code keeps the session in that file alone -
+        # there is no Keychain equivalent to fall back on.
+        where = f"{DEFAULT_CREDENTIALS_PATH} does not exist"
+
+    platform_name = {"Darwin": "this Mac", "Windows": "this Windows PC",
+                     "Linux": "this Linux machine"}.get(system, "this machine")
+
+    cli = claude_cli_command()
+    if cli == "claude":
+        how = "Run `claude` in a terminal and complete `/login` (or run `claude setup-token`)."
+    elif cli:
+        how = (
+            "The Claude desktop app ships the CLI but does not put it on PATH, so run it by "
+            f"full path in a terminal - {cli} - and complete `/login`."
+        )
+    else:
+        how = (
+            "The Claude Code CLI is not installed on this machine - install it "
+            "(https://docs.claude.com/en/docs/claude-code) and complete `/login` first."
+        )
+
+    return (
+        f"No Claude Code login found on {platform_name} — {where}. "
+        "This imports the login the Claude Code CLI saves for itself, so that CLI has to have "
+        f"been signed in on this machine at least once. {how} "
+        "Being signed into the Claude desktop app is NOT enough on its own - the app keeps its "
+        "own session and writes no CLI credential. "
+        "You can also paste a token manually instead."
     )
 
 
@@ -112,11 +224,7 @@ def read_claude_code_credentials(config_dir: Optional[Path] = None) -> ImportedC
         raw = _read_macos_keychain_credentials()
 
     if raw is None:
-        raise CredentialImportError(
-            "No Claude Code login found — neither ~/.claude/.credentials.json nor "
-            f"macOS Keychain service {MACOS_KEYCHAIN_SERVICE!r} has one. Run `claude /login` "
-            "or `claude setup-token` first, or paste a token manually instead."
-        )
+        raise CredentialImportError(no_default_login_message())
 
     return _credentials_from_raw(raw, "default session")
 
