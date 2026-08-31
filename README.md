@@ -197,6 +197,13 @@ Then run `claude-unlimited code` and you're routed. On Windows, run the installe
 **Administrator** PowerShell if you also want it to start automatically at logon;
 credentials are stored with Windows DPAPI instead of the Keychain.
 
+> **Which platform is this best on?** Claude Unlimited is developed and tested on
+> **macOS**, so that's the most battle-hardened path. **Windows and Linux are best-effort:**
+> every OS-specific piece (credential storage, the background service, the installer) is
+> implemented and covered by tests, and it *should* work fine — but it hasn't had the same
+> real-world mileage, so treat it as "should be fine, not guaranteed." If anything's off,
+> please [open an issue](https://github.com/DevDock-AI/claude-unlimited/issues).
+
 Don't want it starting on login? Turn it off in **Settings → Daemon**, or run
 `claude-unlimited uninstall`. It keeps running either way until you stop it.
 
