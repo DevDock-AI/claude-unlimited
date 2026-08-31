@@ -734,10 +734,95 @@ CLAUDE_APP_BUNDLE_ID = "com.anthropic.claudefordesktop"
 #
 # Schema below is not guessed — it was read back out of the app after
 # configuring it by hand through Developer > Configure Third-Party Inference.
+# Where the app keeps each profile's userData, per OS. Windows is NOT
+# symmetrical with macOS and the difference is not a guess - it was read off a
+# configured Windows 11 install: the normal profile lives in Roaming, the 3p
+# profile in Local. On Windows the app is also shipped as an MSIX package, so
+# its writes to %APPDATA% are redirected into the package's LocalCache; that
+# redirection is transparent in both directions (verified by writing a probe
+# file into %APPDATA%\Claude and seeing it appear in the package view), which
+# is why writing to the plain paths below reaches the packaged app.
 CLAUDE_APP_SUPPORT = Path.home() / "Library" / "Application Support"
-CLAUDE_1P_DIR = CLAUDE_APP_SUPPORT / "Claude"
-CLAUDE_3P_DIR = CLAUDE_APP_SUPPORT / "Claude-3p"
+
+
+def _desktop_userdata_dirs():
+    if sys.platform == "darwin":
+        return CLAUDE_APP_SUPPORT / "Claude", CLAUDE_APP_SUPPORT / "Claude-3p"
+    if sys.platform == "win32":
+        roaming = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        return roaming / "Claude", local / "Claude-3p"
+    # Linux: the app's layout there has not been verified, and desktop() refuses
+    # before these are used. Named anyway so nothing has to guard against None.
+    config = Path.home() / ".config"
+    return config / "Claude", config / "Claude-3p"
+
+
+CLAUDE_1P_DIR, CLAUDE_3P_DIR = _desktop_userdata_dirs()
 CU_CONFIG_NAME = "Claude Unlimited"
+
+# Windows: the desktop app and the Claude Code CLI are BOTH called claude.exe,
+# so the app's processes are recognised by where they run from - never by name
+# alone, or `desktop` would try to quit the person's terminal session.
+_WINDOWS_APP_PATH_MARKERS = (r"\windowsapps\claude_", r"\anthropicclaude" "\\",
+                            r"\app\claude.exe")
+_WINDOWS_NOT_THE_APP = ("claude-code", r"\.local" "\\" "bin" "\\")
+
+
+def _powershell(script: str, timeout: float = 20.0) -> str:
+    """Runs a PowerShell snippet, returning stdout ('' on any failure).
+
+    Windows has no pgrep/osascript; process paths and the Start-menu launch
+    identity both come from here."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _windows_app_pids():
+    """PIDs of the desktop app, excluding the identically-named CLI."""
+    out = _powershell(
+        "Get-CimInstance Win32_Process -Filter \"Name='Claude.exe'\" | "
+        "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }")
+    pids = []
+    for line in out.splitlines():
+        pid, _, path = line.partition("|")
+        path = path.strip().lower()
+        if not pid.strip().isdigit() or not path:
+            continue
+        if any(bad in path for bad in _WINDOWS_NOT_THE_APP):
+            continue
+        if any(marker in path for marker in _WINDOWS_APP_PATH_MARKERS):
+            pids.append(int(pid))
+    return pids
+
+
+def _windows_launch_target():
+    """How to start the app: its Start-menu identity, else an executable.
+
+    An MSIX/Store package cannot be launched by running its .exe out of the
+    protected WindowsApps directory - it has to go through the AppsFolder
+    identity, which is what the Start menu itself uses."""
+    aumid = _powershell(
+        "$a = Get-StartApps | Where-Object { $_.AppID -like 'Claude_*!*' } | "
+        "Select-Object -First 1 -ExpandProperty AppID; if ($a) { $a }")
+    if aumid:
+        return ("aumid", aumid.splitlines()[0].strip())
+
+    # Non-packaged installs (the plain .exe installer) live in the usual spots.
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    candidates = [local / "AnthropicClaude" / "Claude.exe",
+                  local / "Programs" / "Claude" / "Claude.exe",
+                  Path(os.environ.get("PROGRAMFILES") or "C:/Program Files") / "Claude" / "Claude.exe"]
+    candidates.extend(sorted(local.glob("AnthropicClaude/app-*/Claude.exe"), reverse=True))
+    for exe in candidates:
+        if exe.is_file():
+            return ("exe", str(exe))
+    return None
 
 
 def _desktop_app_running() -> bool:
@@ -745,6 +830,8 @@ def _desktop_app_running() -> bool:
 
     It loads this configuration at startup and rewrites parts of it on exit,
     so configuring a running instance is either ignored or clobbered."""
+    if sys.platform == "win32":
+        return bool(_windows_app_pids())
     try:
         result = subprocess.run(["pgrep", "-f", "Claude.app/Contents/MacOS/Claude"],
                                 capture_output=True, text=True, timeout=5)
@@ -764,6 +851,25 @@ def _quit_desktop_app(timeout: float = 20.0) -> bool:
     Returns False if it is still running when the timeout expires, so the
     caller can stop rather than write a configuration the app is about to
     overwrite."""
+    if sys.platform == "win32":
+        pids = _windows_app_pids()
+        if not pids:
+            return True
+        # CloseMainWindow posts WM_CLOSE - the same thing clicking the window's
+        # X does - so the app runs its normal shutdown. Deliberately NOT
+        # taskkill /F, which would skip the config rewrite this waits for.
+        _powershell(
+            "Get-Process -Id {} -ErrorAction SilentlyContinue | "
+            "ForEach-Object {{ $_.CloseMainWindow() | Out-Null }}".format(
+                ",".join(str(pid) for pid in pids)))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not _desktop_app_running():
+                time.sleep(1.0)   # let its exit-writes land
+                return True
+            time.sleep(0.4)
+        return not _desktop_app_running()
+
     try:
         subprocess.run(["osascript", "-e", 'tell application id "%s" to quit' % CLAUDE_APP_BUNDLE_ID],
                         capture_output=True, text=True, timeout=15)
@@ -779,6 +885,47 @@ def _quit_desktop_app(timeout: float = 20.0) -> bool:
             return True
         time.sleep(0.4)
     return not _desktop_app_running()
+
+
+def _desktop_app_installed() -> bool:
+    """Whether the desktop app is installed at all."""
+    if sys.platform == "darwin":
+        return Path("/Applications/Claude.app").exists()
+    if sys.platform == "win32":
+        return _windows_launch_target() is not None
+    return False
+
+
+def _launch_desktop_app():
+    """Starts the app. Returns (ok, error_message)."""
+    if sys.platform == "win32":
+        target = _windows_launch_target()
+        if target is None:
+            return False, "the app is installed but could not be located to launch"
+        kind, value = target
+        # explorer.exe is the documented way to launch by AppsFolder identity,
+        # and it reports success regardless of what it launched - so the app is
+        # confirmed by looking for its process rather than by an exit code.
+        cmd = ["explorer.exe", "shell:AppsFolder\\" + value] if kind == "aumid" else [value]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if _desktop_app_running():
+                return True, ""
+            time.sleep(0.5)
+        return False, "it did not start within 20 seconds"
+
+    try:
+        result = subprocess.run(["open", "-b", CLAUDE_APP_BUNDLE_ID],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        return False, "`open` failed: " + (result.stderr or result.stdout).strip()
+    return True, ""
 
 
 def _desktop_paths(base: Path) -> dict:
@@ -893,13 +1040,15 @@ def desktop(port: int) -> int:
     ready on launch rather than needing a form filled in by hand."""
     _banner()
 
-    if sys.platform != "darwin":
-        print("`desktop` is macOS-only for now: the app's config layout has only been "
-              "verified there.", file=sys.stderr)
+    if sys.platform not in ("darwin", "win32"):
+        print("`desktop` is supported on macOS and Windows: the app's config layout has "
+              "only been verified there.", file=sys.stderr)
         return 1
 
-    if not Path("/Applications/Claude.app").exists():
-        print("Claude desktop app not found at /Applications/Claude.app.", file=sys.stderr)
+    if not _desktop_app_installed():
+        where = ("/Applications/Claude.app" if sys.platform == "darwin"
+                 else "the Start menu or the usual install locations")
+        print(f"Claude desktop app not found ({where}).", file=sys.stderr)
         print("Install it from https://claude.ai/download, or use `claude-unlimited code` "
               "for the terminal.", file=sys.stderr)
         return 1
@@ -914,8 +1063,9 @@ def desktop(port: int) -> int:
             print("", file=sys.stderr)
             print("Claude is still running. It may be showing a dialog, or waiting on "
                   "unsaved work.", file=sys.stderr)
-            print("Quit it yourself (Cmd-Q) and run this again — configuring it while it "
-                  "runs would be overwritten when it exits.", file=sys.stderr)
+            quit_hint = "Cmd-Q" if sys.platform == "darwin" else "close its window"
+            print(f"Quit it yourself ({quit_hint}) and run this again — configuring it "
+                  "while it runs would be overwritten when it exits.", file=sys.stderr)
             return 1
         print("Stopped.")
 
@@ -935,14 +1085,9 @@ def desktop(port: int) -> int:
           f"{_pool_base_url(port)}")
     print("(previous configuration backed up — `claude-unlimited desktop --revert` undoes this)")
 
-    try:
-        result = subprocess.run(["open", "-b", CLAUDE_APP_BUNDLE_ID],
-                                capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"Could not launch the app: {exc}", file=sys.stderr)
-        return 1
-    if result.returncode != 0:
-        print(f"`open` failed: {(result.stderr or result.stdout).strip()}", file=sys.stderr)
+    launched, why = _launch_desktop_app()
+    if not launched:
+        print(f"Could not launch the app: {why}", file=sys.stderr)
         return 1
 
     print("")
@@ -950,6 +1095,18 @@ def desktop(port: int) -> int:
     print("Claude Code sessions inside the app now route through the pool; the app's own")
     print("chat talks to claude.ai and is unaffected. Watch the Activity page to confirm.")
     return 0
+
+
+def _desktop_dir_named(name: str):
+    """Maps a backup folder name back to the profile directory it came from.
+
+    Not `CLAUDE_APP_SUPPORT / name`: on Windows the two profiles live under
+    different roots (Roaming and Local), so there is no shared parent to
+    rebuild the path from."""
+    for base in (CLAUDE_1P_DIR, CLAUDE_3P_DIR):
+        if base.name == name:
+            return base
+    return None
 
 
 def _restore_desktop_backup(backup: Path) -> int:
@@ -962,7 +1119,9 @@ def _restore_desktop_backup(backup: Path) -> int:
     for profile_dir in backup.iterdir():
         if not profile_dir.is_dir():
             continue
-        target_base = CLAUDE_APP_SUPPORT / profile_dir.name
+        target_base = _desktop_dir_named(profile_dir.name)
+        if target_base is None:
+            continue
         for item in profile_dir.rglob("*.json"):
             target = target_base / item.relative_to(profile_dir)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -999,8 +1158,12 @@ def _revert_desktop_config_for_purge() -> None:
             print("Desktop app: still running, so its configuration was left "
                   "pointing at Claude Unlimited.", file=sys.stderr)
             print(f"             Its original settings were saved to {keep} —", file=sys.stderr)
-            print("             quit Claude and copy them back into "
-                  f"{CLAUDE_APP_SUPPORT} to undo it.", file=sys.stderr)
+            # Both directories are named: on Windows they live under
+            # different roots, so one path would send people to the wrong place.
+            print(f"             quit Claude and copy '{CLAUDE_1P_DIR.name}' back into "
+                  f"{CLAUDE_1P_DIR.parent}", file=sys.stderr)
+            print(f"             and '{CLAUDE_3P_DIR.name}' into {CLAUDE_3P_DIR.parent} "
+                  "to undo it.", file=sys.stderr)
             return
 
     try:
