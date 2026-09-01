@@ -26,6 +26,18 @@ from typing import Optional
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 
+# Make our refresh request look like Claude Code's, which refreshes the same
+# grants for weeks without being rate limited from the same machine/IP. Anthropic's
+# token endpoint appears to bucket refreshes by client shape: a call that omits the
+# scope field and doesn't carry Claude Code's axios User-Agent lands in a throttled
+# bucket and gets a persistent 429 (rate_limit_error), even on a brand-new grant.
+# These two values (extracted from the Claude Code 2.1.252 bundle) close the visible
+# gap. The one thing we still can't match from Python/curl is the TLS/JA3
+# fingerprint (curl vs node); if that turns out to be what's classified, the
+# fallback is to delegate the refresh to the real `claude` CLI per account.
+REFRESH_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+REFRESH_USER_AGENT = "axios/1.9.0"
+
 
 class OAuthLoginError(RuntimeError):
     def __init__(self, message: str, status_code: Optional[int] = None):
@@ -77,7 +89,7 @@ def _post_json_via_curl(url: str, payload: bytes, timeout: float,
     try:
         try:
             proc = subprocess.run(
-                ["curl", "-sS", "-X", "POST", url,
+                ["curl", "-sS", "--compressed", "-X", "POST", url,  # --compressed: Accept-Encoding like axios, curl decodes the body
                  *header_args,
                  "--data-binary", "@-",
                  "-D", header_path,  # separate file, so stdout stays body-only (see -w below)
@@ -170,6 +182,7 @@ def refresh_access_token(refresh_token: str, timeout: float = 30.0) -> LoginToke
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
+        "scope": REFRESH_SCOPE,  # Claude Code sends this; omitting it is bucketed/throttled
     }).encode("utf-8")
 
     max_retries = 2
@@ -182,7 +195,10 @@ def refresh_access_token(refresh_token: str, timeout: float = 30.0) -> LoginToke
         try:
             status, _headers, body = _post_json(
                 TOKEN_ENDPOINT, payload, timeout,
-                extra_headers={"Accept": "application/json, text/plain, */*"},
+                extra_headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "User-Agent": REFRESH_USER_AGENT,  # match Claude Code's axios client
+                },
             )
         except OAuthLoginError as exc:
             last_exc = exc

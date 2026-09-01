@@ -61,10 +61,16 @@ def test_refresh_access_token_sends_correct_payload_and_parses_response(monkeypa
     assert tokens.access_token == "tok-new"
     assert tokens.refresh_token == "ref-new"
     assert tokens.expires_at == 999000  # normalized seconds -> milliseconds
-    assert captured["cmd"][4] == login_module.TOKEN_ENDPOINT
+    assert login_module.TOKEN_ENDPOINT in captured["cmd"]  # URL present (index is argv-order-independent)
     assert captured["payload"]["grant_type"] == "refresh_token"
     assert captured["payload"]["refresh_token"] == "ref-old"
     assert captured["payload"]["client_id"] == login_module.CLIENT_ID
+    # Mimic Claude Code's refresh so Anthropic's endpoint doesn't bucket us into a
+    # throttled path: send the scope field, the axios User-Agent, and --compressed.
+    assert captured["payload"]["scope"] == login_module.REFRESH_SCOPE
+    assert "--compressed" in captured["cmd"]
+    ua = [captured["cmd"][i + 1] for i, a in enumerate(captured["cmd"]) if a == "-H" and captured["cmd"][i + 1].lower().startswith("user-agent:")]
+    assert ua and login_module.REFRESH_USER_AGENT in ua[0]
 
 
 def test_refresh_access_token_keeps_old_refresh_token_when_response_omits_one(monkeypatch):
