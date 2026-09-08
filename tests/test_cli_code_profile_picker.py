@@ -76,6 +76,11 @@ def test_prompt_non_numeric_falls_back_to_rotated_accounts(monkeypatch, capsys):
 def code_env(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/claude")
     monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: True)
+    # code() makes two best-effort daemon calls we must never let touch a live
+    # daemon on 4317 in a test: POST /api/models/refresh, and GET /v1/models
+    # (for the /model picker labels). Stub both.
+    monkeypatch.setattr(cli, "_request_models_refresh", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **kw: {})
     execs = []
     monkeypatch.setattr(cli.os, "execvp", lambda file, args: execs.append((file, args)))
     monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)

@@ -212,6 +212,24 @@ def start(port: int) -> int:
     return 0
 
 
+def _request_models_refresh(host: str, port: int, timeout: float = 0.5) -> None:
+    """Fire-and-forget kick of POST /api/models/refresh at `code` launch.
+
+    The daemon answers immediately (the actual sha check runs in its own
+    background thread, throttled and backed off in model_catalogue), so
+    this normally costs a couple of milliseconds — and every failure is
+    swallowed, because launching `claude` must never be delayed or blocked
+    by a model-catalogue nicety. Rapid launches coalesce daemon-side: at
+    most one GitHub sha check per ~5 minutes."""
+    try:
+        req = urllib.request.Request(
+            f"http://{host}:{port}/api/models/refresh", data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+    except Exception:
+        pass
+
+
 def _fetch_placeholder_token(host: str, port: int, timeout: float = 2.0) -> str:
     with urllib.request.urlopen(f"http://{host}:{port}/api/placeholder-token", timeout=timeout) as resp:
         return json.loads(resp.read())["token"]
@@ -304,20 +322,34 @@ def _prompt_profile_choice(profiles: list):
 # _DESCRIPTION are what show in the list. The ids stay Anthropic-shaped
 # because openai_models.map_model() is keyed on them; the label is where the
 # backing model is surfaced.
+# These MUST be the same ids Claude Code uses as each tier's native default,
+# or our override lands as an EXTRA picker entry beside the native one instead
+# of replacing it (v2.1.263 showed both a relabelled Fable and a native "Fable
+# 5.1"). Read out of the 2.1.263 binary's model table: fable->claude-fable-5-1,
+# opus->claude-opus-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5. This
+# is upstream-coupled — see the "Claude Code upstream watch" note; a Claude
+# Code release that moves a tier default can reintroduce the duplicate.
 _MODEL_TIER_IDS = {
-    "FABLE": "claude-fable-5",
+    "FABLE": "claude-fable-5-1",
     "OPUS": "claude-opus-5",
     "SONNET": "claude-sonnet-5",
-    "HAIKU": "claude-haiku-4-5-20251001",
+    "HAIKU": "claude-haiku-4-5",
 }
 
+# OFFLINE FALLBACK ONLY. The live labels are derived per launch from the
+# daemon's own parity map (_fetch_parity_labels -> GET /v1/models), so they
+# always name the model that will really serve and never go stale. These
+# literals are used only when that fetch fails, and are deliberately in the
+# same `<Claude tier> | <GPT model>` shape the live path produces so the
+# picker reads identically either way.
+#
 # Pinned to a codex Profile: every request this session makes is served by
 # OpenAI, so name the real backing model outright.
 _CODEX_MODEL_LABELS = {
-    "FABLE": ("GPT-5.6 Sol", "Served by Codex · reasoning: max"),
-    "OPUS": ("GPT-5.6 Sol", "Served by Codex · reasoning: high"),
-    "SONNET": ("GPT-5.6 Terra", "Served by Codex · reasoning: medium"),
-    "HAIKU": ("GPT-5.6 Luna", "Served by Codex · reasoning: low"),
+    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Served by Codex · reasoning: high"),
+    "OPUS": ("Opus 5 | GPT-5.6 Terra", "Served by Codex · reasoning: high"),
+    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Served by Codex · reasoning: medium"),
+    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Served by Codex · reasoning: low"),
 }
 
 # Rotated across a pool that mixes providers: which provider serves a given
@@ -326,14 +358,44 @@ _CODEX_MODEL_LABELS = {
 # to stays accurate whichever one serves, and still says what is being
 # picked; a provider-neutral tier word would name no model at all.
 _MIXED_MODEL_LABELS = {
-    "FABLE": ("Fable 5 / GPT-5.6 Sol", "Whichever account is active · Codex reasoning: max"),
-    "OPUS": ("Opus 5 / GPT-5.6 Sol", "Whichever account is active · Codex reasoning: high"),
-    "SONNET": ("Sonnet 5 / GPT-5.6 Terra", "Whichever account is active · Codex reasoning: medium"),
-    "HAIKU": ("Haiku 4.5 / GPT-5.6 Luna", "Whichever account is active · Codex reasoning: low"),
+    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Whichever account is active · Codex reasoning: high"),
+    "OPUS": ("Opus 5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: high"),
+    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: medium"),
+    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Whichever account is active · Codex reasoning: low"),
 }
 
 
-def _apply_model_labels(forced_profile, enabled_profiles=None) -> None:
+def _fetch_parity_labels(host: str, port: int, token: str, timeout: float = 2.0) -> dict:
+    """`{claude_id: (name, effort)}` from the daemon's own parity list.
+
+    GET /v1/models returns exactly the `<Claude tier> | <GPT model> · <effort>`
+    display names the Models table shows, computed from the live catalogue, so
+    the picker names the model that will really serve and never goes stale (the
+    hand-kept literals said GPT-5.6 Sol long after the map moved to GPT-6
+    Astra). Best-effort: any failure returns {} and the caller falls back to
+    the offline literals. `name` keeps the full `Claude X | GPT Y` — dropping
+    the effort tail, which moves to the picker's description line."""
+    out: dict = {}
+    try:
+        req = urllib.request.Request(
+            f"http://{host}:{port}/v1/models",
+            headers={"Authorization": f"Bearer {token}", "x-api-key": token})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        for entry in data.get("data", []):
+            mid = entry.get("id")
+            disp = entry.get("display_name") or ""
+            if not mid or "|" not in disp:
+                continue
+            name, _, effort = disp.rpartition(" · ")
+            out[mid] = (name or disp, effort)
+    except Exception:
+        pass
+    return out
+
+
+def _apply_model_labels(forced_profile, enabled_profiles=None,
+                        host=None, port=None, token=None) -> None:
     """Relabel Claude Code's `/model` picker to match what will really serve.
 
     The picker is built entirely client-side from these env vars, read once
@@ -341,26 +403,41 @@ def _apply_model_labels(forced_profile, enabled_profiles=None) -> None:
     therefore fixed for the life of the process and cannot track rotation.
 
     Three cases:
-      * pinned to codex -> real GPT model names; the pin holds for the whole
-        session (a pinned request that can't be served errors rather than
-        rotating), so these stay true.
+      * pinned to codex -> the `<Claude tier> | <GPT model>` the request will
+        actually be translated to; the pin holds for the whole session (a
+        pinned request that can't be served errors rather than rotating), so
+        these stay true.
       * pinned to claude/api, or a pool with no codex Profile -> leave Claude
         Code's native labels alone.
-      * rotated across a mixed pool -> label both models a tier maps to,
-        since no single vendor name stays correct across a rotation.
+      * rotated across a mixed pool -> name both the Claude tier and the GPT
+        model it maps to, since either provider may serve a given request.
 
-    Never overrides a value already set in the environment."""
+    Live values come from the daemon's parity map when reachable, so the
+    picker matches the Models table; the module literals are the offline
+    fallback. Never overrides a value already set in the environment."""
     kind = getattr(forced_profile, "kind", None)
     if forced_profile is not None:
         labels = _CODEX_MODEL_LABELS if kind == "codex" else None
+        codex_pinned = kind == "codex"
     else:
         has_codex = any(getattr(p, "kind", None) == "codex" for p in (enabled_profiles or []))
         # An all-Claude pool never mislabels anything; leave it native.
         labels = _MIXED_MODEL_LABELS if has_codex else None
+        codex_pinned = False
     if labels is None:
         return
-    for tier, (name, description) in labels.items():
-        for suffix, value in (("", _MODEL_TIER_IDS[tier]), ("_NAME", name), ("_DESCRIPTION", description)):
+
+    live = _fetch_parity_labels(host, port, token) if (host and port and token) else {}
+    for tier, (fallback_name, fallback_desc) in labels.items():
+        tier_id = _MODEL_TIER_IDS[tier]
+        parity = live.get(tier_id)
+        if parity is not None:
+            name, effort = parity
+            lead = "Served by Codex" if codex_pinned else "Whichever account is active · Codex"
+            description = f"{lead} · reasoning: {effort}" if effort else lead
+        else:
+            name, description = fallback_name, fallback_desc
+        for suffix, value in (("", tier_id), ("_NAME", name), ("_DESCRIPTION", description)):
             os.environ.setdefault(f"ANTHROPIC_DEFAULT_{tier}_MODEL{suffix}", value)
 
 
@@ -1205,6 +1282,10 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
     if not _ensure_daemon(port):
         return 1
 
+    # A daemon can run for weeks while providers ship models mid-day; a
+    # session launch is the moment fresh names/prices actually matter.
+    _request_models_refresh(LOOPBACK_HOST, port)
+
     # Picking a specific Profile pins THIS terminal session to it (see
     # session_tokens.py and gateway.py's forced_profile_id); other
     # concurrent sessions keep rotating normally. The picker only appears
@@ -1241,7 +1322,18 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
         return 1
 
     os.environ.update(_routing_env(port, token=token))
-    _apply_model_labels(forced_profile, enabled_profiles)
+    # Lets Claude Code fetch GET /v1/models from the pool. NOTE this alone does
+    # NOT surface our parity labels: v2.1.263's picker treats discovery as an
+    # availability filter over its OWN hard-coded model table and renders the
+    # built-in display_name for any id it recognises (all of ours), discarding
+    # the `<Claude> | <GPT>` display_name we send. The picker labels are set by
+    # _apply_model_labels below (the ANTHROPIC_DEFAULT_*_MODEL_NAME path, which
+    # the same table DOES honour). We still enable discovery: it is harmless and
+    # forward-compatible for any id the built-in table lacks. setdefault so a
+    # user who exports 0 can opt out.
+    os.environ.setdefault("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
+    _apply_model_labels(forced_profile, enabled_profiles,
+                        host=LOOPBACK_HOST, port=port, token=token)
     if forced_profile is not None:
         print(f"Routing through Claude Unlimited at {LOOPBACK_HOST}:{port}, pinned to {forced_profile.name} "
               f"— launching claude…\n")

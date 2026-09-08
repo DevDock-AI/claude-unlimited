@@ -646,6 +646,65 @@ def test_force_active_overrides_a_draining_profile_past_its_threshold(pool_env):
     assert gw.runtime_snapshot()["a"].state == gateway_module.ProfileState.ELIGIBLE
 
 
+def test_a_leaked_in_flight_slot_self_heals_and_stops_pinning_used_now(pool_env, monkeypatch):
+    # A request whose body never drains (client walked away, upstream hung)
+    # leaves its Profile in _in_flight forever. Without a bound that pins "Used
+    # now" and wedges is_idle indefinitely — actually observed as a Profile
+    # stuck "Used now" 20+ minutes after its last request. in_flight_ids() and
+    # seconds_since_last_activity() must ignore a slot older than the cap.
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True)]))
+    fake_now = [1000.0]
+    monkeypatch.setattr(gateway_module.time, "monotonic", lambda: fake_now[0])
+    gw = Gateway(transport=lambda req: fake_response(200))
+
+    with gw._lock:
+        gw._in_flight.add("a")
+        gw._in_flight_since["a"] = fake_now[0]  # a request starts and never drains
+
+    assert "a" in gw.in_flight_ids()          # while fresh, correctly "Used now"
+    assert gw.seconds_since_last_activity() == 0.0
+    assert not gw.is_idle(60)
+
+    fake_now[0] += Gateway._IN_FLIGHT_MAX_SECONDS + 1  # long past any real request
+    assert "a" not in gw.in_flight_ids()      # the leaked slot stops counting
+    assert gw.is_idle(60)                      # ...and no longer wedges the idle check
+
+
+def test_force_active_clears_the_previous_profiles_used_now(pool_env):
+    # A profile that just served shows "Used now" for its grace window. Taking
+    # over with a DIFFERENT profile is an explicit "I'm on this one now", so the
+    # one moved away from must stop showing "Used now" immediately rather than
+    # lingering for the rest of the 15-minute grace (the reported bug: switching
+    # to Codex left the old account stuck on "Used now").
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="codex", priority=2, automatic=True, enabled=True),
+    ]))
+    gw = Gateway(transport=lambda req: fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1",
+                                                            "anthropic-ratelimit-unified-5h-reset": "1787191800"}))
+    r = gw.handle("POST", "/v1/messages", {}, b"{}")  # "a" serves...
+    list(r.body_chunks)  # ...drain so it moves to the grace window ("Used now")
+    assert "a" in gw.in_flight_ids()
+
+    assert gw.force_active("b") is True
+    assert "a" not in gw.in_flight_ids()  # cleared on takeover, not lingering
+
+
+def test_force_active_keeps_used_now_when_a_request_is_genuinely_in_flight(pool_env):
+    # The grace clear must NOT drop a profile that has a request actually
+    # streaming right now (e.g. another pinned terminal) — only the idle grace.
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="codex", priority=2, automatic=True, enabled=True),
+    ]))
+    gw = Gateway(transport=lambda req: fake_response(200))
+    gw._current_profile_id = "a"
+    gw._in_flight.add("a")  # a real request is being served on "a" right now
+
+    assert gw.force_active("b") is True
+    assert "a" in gw.in_flight_ids()  # still genuinely in use, stays lit
+
+
 def test_force_active_returns_false_for_a_disabled_profile(pool_env):
     save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=False)]))
     gw = Gateway(transport=lambda req: fake_response(200))

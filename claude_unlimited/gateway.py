@@ -208,6 +208,13 @@ class Gateway:
     dropped, not restored — see _sync_snapshot()."""
 
     _USED_NOW_GRACE_SECONDS = 900.0  # 15 minutes — see the class docstring
+    # Upper bound on how long a single in-flight request can keep a Profile
+    # "Used now". A real streaming request finishes in seconds to a couple of
+    # minutes; anything still marked in-flight past this is a leaked/hung slot
+    # (a client that walked away, an upstream that never closed), so stop
+    # counting it rather than pinning the indicator — and the idle check — on
+    # forever. Generous enough never to drop a genuinely-live request.
+    _IN_FLIGHT_MAX_SECONDS = 300.0  # 5 minutes
     _REFRESH_CHECK_COOLDOWN_SECONDS = 60.0
     # Recovery attempts on a Profile that is ALREADY needs-re-auth get their
     # own, much longer interval.
@@ -258,6 +265,15 @@ class Gateway:
         # once — e.g. two concurrent `claude-unlimited code --profile`
         # terminals pinned to different Profiles.
         self._in_flight: set[str] = set()
+        # Monotonic time each Profile's current in-flight streak began. A
+        # request that never drains — a client that abandons the stream, or an
+        # upstream connection that hangs open — would otherwise leave its
+        # Profile in _in_flight forever, pinning "Used now" and wedging the
+        # idle check (both symptoms actually observed: a Profile stuck "Used
+        # now" 20+ minutes after its last request, long past the grace window).
+        # in_flight_ids() ignores an entry older than _IN_FLIGHT_MAX_SECONDS so
+        # such a slot self-heals; no legitimate single request runs that long.
+        self._in_flight_since: dict[str, float] = {}
         # Last time (monotonic) each Profile's in-flight request finished.
         # Without this, "Used now" is only ever true for the literal
         # duration of one request/response cycle — for a quick non-streaming
@@ -586,6 +602,7 @@ class Gateway:
             # sessions each pinned to a different one).
             with self._lock:
                 self._in_flight.add(profile.id)
+                self._in_flight_since.setdefault(profile.id, time.monotonic())
 
             try:
                 resp: UpstreamResponse = self._transport(upstream_req)
@@ -883,6 +900,7 @@ class Gateway:
 
         with self._lock:
             self._in_flight.add(profile.id)
+            self._in_flight_since.setdefault(profile.id, time.monotonic())
 
         try:
             result = openai_bridge.run(profile, credential, body,
@@ -1254,7 +1272,16 @@ class Gateway:
                 return False
             self._runtime[profile_id] = replace(rt, state=ProfileState.ELIGIBLE,
                                                   cooldown_until=None, resets_at=None)
+            previous_profile_id = self._current_profile_id
             self._current_profile_id = profile_id
+            # Take Over is an explicit "I'm on THIS one now" — clear the
+            # profile it moved away from so it doesn't keep showing "Used now"
+            # for the rest of its grace window (in_flight_ids()), exactly as a
+            # rotation switch does (handle()'s _last_active.pop). A profile with
+            # a request GENUINELY still in flight (another pinned terminal)
+            # stays lit via self._in_flight — this only drops the idle grace.
+            if previous_profile_id and previous_profile_id != profile_id:
+                self._last_active.pop(previous_profile_id, None)
         self._persist()
         activity.record("rotation", f"{profile.name} manually taken over",
                          meta="overrides rotation/threshold")
@@ -1415,6 +1442,7 @@ class Gateway:
         "Used now" pill vanish instantly instead of fading out like the
         others."""
         self._in_flight.discard(profile_id)
+        self._in_flight_since.pop(profile_id, None)
         self._last_active[profile_id] = time.monotonic()
 
     def _wrap_with_in_flight_clear(self, chunks, profile_id: str):
@@ -1441,13 +1469,18 @@ class Gateway:
         """How long since any Profile last served a request, or None if this
         process has served none yet. Counts a request that is in flight right
         now as zero."""
+        now = time.monotonic()
         with self._lock:
-            if self._in_flight:
+            # A slot older than the cap is a leaked/hung request, not live use;
+            # ignore it here too so it can't wedge is_idle (and the updater)
+            # forever — the same bound in_flight_ids() applies.
+            if any(now - self._in_flight_since.get(pid, now) < self._IN_FLIGHT_MAX_SECONDS
+                   for pid in self._in_flight):
                 return 0.0
             if not self._last_active:
                 return None
             latest = max(self._last_active.values())
-        return max(0.0, time.monotonic() - latest)
+        return max(0.0, now - latest)
 
     def is_idle(self, minimum_idle_seconds: float) -> bool:
         """True when nothing has used the pool for at least that long.
@@ -1471,7 +1504,11 @@ class Gateway:
         with self._lock:
             recent = {pid for pid, ts in self._last_active.items()
                       if now - ts < self._USED_NOW_GRACE_SECONDS}
-            return self._in_flight | recent
+            # A slot older than the cap is a leaked/hung request, not live use;
+            # drop it so it can't pin "Used now" (and is_idle) indefinitely.
+            live = {pid for pid in self._in_flight
+                    if now - self._in_flight_since.get(pid, now) < self._IN_FLIGHT_MAX_SECONDS}
+            return live | recent
 
     def runtime_snapshot(self) -> dict[str, ProfileRuntime]:
         """Read-only view of live per-Profile Rotation state, synced against
