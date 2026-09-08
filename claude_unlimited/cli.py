@@ -1724,7 +1724,10 @@ def reauth(port: int) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="claude-unlimited", add_help=True)
+    parser = argparse.ArgumentParser(
+        prog="claude-unlimited", add_help=True,
+        epilog="Also available as `cu` — every command works under both names "
+               "(e.g. `cu code`, `cu status`, `cu doctor`).")
     sub = parser.add_subparsers(dest="cmd")
     start_p = sub.add_parser("start", help="run the daemon in the foreground")
     start_p.add_argument("--port", type=int, default=DEFAULT_PORT)

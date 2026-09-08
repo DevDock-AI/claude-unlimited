@@ -325,6 +325,9 @@ Starts the daemon if it isn't running and launches `claude` routed through your 
 more than one account it asks which to use — or pick **Rotated accounts** to let it manage
 itself.
 
+> **Tip:** `cu` is a shorthand for `claude-unlimited` — every command works under both names
+> (`cu code`, `cu status`, `cu doctor`, …). An existing install gains `cu` after an update.
+
 ```bash
 claude-unlimited code --profile "Personal Max"   # pin this session to one account
 claude-unlimited code --model opus               # any extra args pass through to claude
@@ -510,6 +513,8 @@ push access, is honest. That's a deliberate, documented limit.
 Every command is daemon lifecycle or account authentication. **Everything else — accounts,
 thresholds, priority, budget caps, export/import — lives in the dashboard.** The same list
 is in the dashboard under **Help**.
+
+Every command below also works under the short alias **`cu`** — e.g. `cu code`, `cu status`.
 
 <details open>
 <summary><b>Getting started</b></summary>

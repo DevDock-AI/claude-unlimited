@@ -289,7 +289,7 @@
   "nav.help": "Ajutor",
   "rail.support": "Susține acest proiect",
   "support.label": "Susține",
-  "help.subtitle": "Toate comenzile acceptate de claude-unlimited, rulate dintr-un terminal",
+  "help.subtitle": "Toate comenzile acceptate de claude-unlimited, rulate dintr-un terminal — sau aliasul scurt cu",
   "help.getting_started.title": "Primii pași",
   "help.cmd.doctor": "Verifică instalarea, accesul la Keychain și configurația — rulează asta prima dată, și oricând ceva pare greșit.",
   "help.cmd.add_account": "Deschide browserul, te autentifică într-un cont Claude printr-o sesiune izolată de Claude Code și îl adaugă ca Profil — UUID-ul contului este mereu rezolvat automat. Nu afectează niciodată vreun cont deja autentificat în `claude` pe acest calculator, deci e sigur să-l rulezi din nou pentru fiecare cont suplimentar.",

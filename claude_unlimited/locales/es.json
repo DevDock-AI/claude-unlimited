@@ -289,7 +289,7 @@
   "nav.help": "Ayuda",
   "rail.support": "Apoyar este proyecto",
   "support.label": "Apoyar",
-  "help.subtitle": "Todos los comandos que admite claude-unlimited, ejecutados desde una terminal",
+  "help.subtitle": "Todos los comandos que admite claude-unlimited, ejecutados desde una terminal — o el alias corto cu",
   "help.getting_started.title": "Primeros pasos",
   "help.cmd.doctor": "Revisa tu instalación, el acceso al Llavero y la configuración — ejecuta esto primero, y cada vez que algo no parezca correcto.",
   "help.cmd.add_account": "Abre tu navegador, inicia sesión en una cuenta de Claude mediante una sesión aislada de Claude Code y la añade como Perfil — el UUID de la cuenta siempre se resuelve automáticamente. Nunca afecta a ninguna cuenta ya conectada a `claude` en esta máquina, así que es seguro ejecutarlo de nuevo para cada cuenta adicional.",

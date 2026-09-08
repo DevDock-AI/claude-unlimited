@@ -289,7 +289,7 @@
   "nav.help": "Help",
   "rail.support": "Support this project",
   "support.label": "Support",
-  "help.subtitle": "Every command claude-unlimited supports, run from a terminal",
+  "help.subtitle": "Every command claude-unlimited supports, run from a terminal — or the short alias cu",
   "help.getting_started.title": "Getting started",
   "help.cmd.doctor": "Checks your install, Keychain access, and configuration — run this first, and any time something seems off.",
   "help.cmd.add_account": "Opens your browser, logs into a Claude account through an isolated Claude Code session, and adds it as a Profile — the account UUID is always resolved automatically. Never affects any account already signed into `claude` on this machine, so it's safe to run again for each additional account.",

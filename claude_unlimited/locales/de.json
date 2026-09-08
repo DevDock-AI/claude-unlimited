@@ -289,7 +289,7 @@
   "nav.help": "Hilfe",
   "rail.support": "Dieses Projekt unterstützen",
   "support.label": "Unterstützen",
-  "help.subtitle": "Alle Befehle, die claude-unlimited unterstützt, ausgeführt in einem Terminal",
+  "help.subtitle": "Alle Befehle, die claude-unlimited unterstützt, ausgeführt in einem Terminal — oder das Kürzel cu",
   "help.getting_started.title": "Erste Schritte",
   "help.cmd.doctor": "Prüft deine Installation, den Schlüsselbund-Zugriff und die Konfiguration — führe dies zuerst aus, und immer wenn etwas nicht stimmt.",
   "help.cmd.add_account": "Öffnet deinen Browser, meldet dich über eine isolierte Claude-Code-Sitzung bei einem Claude-Konto an und fügt es als Profil hinzu — die Konto-UUID wird immer automatisch aufgelöst. Wirkt sich nie auf ein bereits bei `claude` angemeldetes Konto auf diesem Rechner aus, daher ist es sicher, es für jedes weitere Konto erneut auszuführen.",
