@@ -3089,6 +3089,7 @@ setupUpdateModeSelect();
 document.getElementById('resetBtn').addEventListener('click', resetAllProfiles);
 document.getElementById('paritySaveBtn').addEventListener('click', saveModelParity);
 document.getElementById('parityResetBtn').addEventListener('click', resetModelParity);
+document.getElementById('parityAddBtn').addEventListener('click', onAddParityRow);
 document.getElementById('notifMasterToggle').addEventListener('click', toggleNotificationsMaster);
 document.getElementById('autostartToggle').addEventListener('click', toggleAutostart);
 document.getElementById('regenTokenBtn').addEventListener('click', regeneratePlaceholderToken);
@@ -3238,33 +3239,93 @@ function updateCodexModelHelp(prefix) {
 // The row set comes from /api/codex/model-map, never from a list written into
 // the page: the same table was hardcoded in index.html once and went stale the
 // first time the mapping changed.
-let _parityRows = [];
+// The parity table is now an EXPLICIT, editable list: the saved rows ARE what
+// Claude Code's /model picker offers for Codex-served sessions. Rows are keyed
+// by index (not Claude id), because the Claude model of a row is itself
+// editable and rows can be added/removed. The row set and the dropdown option
+// lists still come from /api/codex/model-map, never hardcoded here.
+let _parityRows = [];   // working list: {claude_model, model, effort, claude_effort}
+let _parityMeta = { defaults: [], claude_selectable: [], claude_efforts: [] };
 
-// Only rows that differ from the shipped defaults are sent. Storing a full
-// copy would freeze this config against the lineup, so a retired model would
-// stay pinned and a newly added tier would never appear.
-function collectParity() {
-  const out = {};
-  for (const row of _parityRows) {
-    const model = document.getElementById(`parity_model_${row.claude_model}`);
-    const effort = document.getElementById(`parity_effort_${row.claude_model}`);
-    if (!model || !effort) continue;
-    const entry = {};
-    if (model.dataset.value && model.dataset.value !== row.default_model) entry.model = model.dataset.value;
-    if (effort.dataset.value && effort.dataset.value !== row.default_effort) entry.effort = effort.dataset.value;
-    if (Object.keys(entry).length) out[row.claude_model] = entry;
-  }
-  return out;
+function _claudeModelOptionsFor(current) {
+  const opts = _parityMeta.claude_selectable.map((m) => ({ value: m.id, label: m.label }));
+  if (current && !opts.some((o) => o.value === current)) opts.unshift({ value: current, label: current });
+  return opts;  // catalogue order = most expensive/capable first
+}
+function _codexModelOptionsFor(current) {
+  const opts = _selectableModels.map((m) => ({ value: m, label: m }));  // cost desc
+  if (current && !opts.some((o) => o.value === current)) opts.unshift({ value: current, label: current });
+  return opts;
+}
+function _codexEffortOptions() {
+  return _reasoningEfforts.map((e) => ({ value: e, label: e }));
+}
+function _claudeEffortOptions() {
+  return [{ value: '', label: t('modal.add_profile.automatic_option') },
+          ..._parityMeta.claude_efforts.map((e) => ({ value: e, label: e }))];
 }
 
-function parityModelOptions(row) {
-  const opts = CODEX_MODEL_OPTIONS().filter((o) => o.value !== '');
-  // Preserve a saved model this build has never heard of, so opening Settings
-  // does not silently rewrite a deliberate pin.
-  if (row.openai_model && !opts.some((o) => o.value === row.openai_model)) {
-    opts.unshift({ value: row.openai_model, label: row.openai_model });
+// The whole list, in visual order — the saved list IS the advertised set.
+function collectParity() {
+  return _parityRows
+    .filter((r) => r.claude_model)
+    .map((r) => {
+      const entry = { claude_model: r.claude_model, model: r.model, effort: r.effort };
+      if (r.claude_effort) entry.claude_effort = r.claude_effort;
+      return entry;
+    });
+}
+
+const _CHEVRON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
+
+function renderParityRows() {
+  const body = document.getElementById('parityRows');
+  if (!body) return;
+  const sel = (id, val) => `<div class="select-input" id="${id}" data-value="${esc(val || '')}"><span class="select-value"></span>${_CHEVRON}</div>`;
+  body.innerHTML = _parityRows.map((r, i) => `
+    <tr>
+      <td>${sel(`parity_claude_${i}`, r.claude_model)}</td>
+      <td>${sel(`parity_ceffort_${i}`, r.claude_effort || '')}</td>
+      <td>${sel(`parity_model_${i}`, r.model)}</td>
+      <td>${sel(`parity_effort_${i}`, r.effort)}</td>
+      <td><button class="parity-del" data-row="${i}" title="${esc(t('settings.parity.delete_row'))}" aria-label="${esc(t('settings.parity.delete_row'))}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
+      </button></td>
+    </tr>`).join('');
+  _parityRows.forEach((r, i) => {
+    setupSelectInput(document.getElementById(`parity_claude_${i}`), _claudeModelOptionsFor(r.claude_model), (v) => { _parityRows[i].claude_model = v; });
+    setupSelectInput(document.getElementById(`parity_ceffort_${i}`), _claudeEffortOptions(), (v) => { _parityRows[i].claude_effort = v || null; });
+    setupSelectInput(document.getElementById(`parity_model_${i}`), _codexModelOptionsFor(r.model), (v) => { _parityRows[i].model = v; });
+    setupSelectInput(document.getElementById(`parity_effort_${i}`), _codexEffortOptions(), (v) => { _parityRows[i].effort = v; });
+  });
+  body.querySelectorAll('.parity-del').forEach((btn) => {
+    btn.addEventListener('click', () => onDeleteParityRow(Number(btn.dataset.row)));
+  });
+}
+
+function onDeleteParityRow(i) {
+  if (_parityRows.length <= 1) { showToast('error', t('settings.parity.last_row'), ''); return; }
+  _parityRows.splice(i, 1);
+  renderParityRows();
+}
+
+// Strip a trailing date stamp, matching the server's base_id() — so a saved
+// dated id (claude-fable-5-1-20260101) and its undated default are treated as
+// the same family head when seeding a new row (otherwise Save would 400 on the
+// server's duplicate-base check).
+function _baseId(id) { return (id || '').replace(/-(\d{8}|\d{4}-\d{2}-\d{2})$/, ''); }
+
+function onAddParityRow() {
+  const used = new Set(_parityRows.map((r) => _baseId(r.claude_model)));
+  let seed = (_parityMeta.defaults || []).find((d) => !used.has(_baseId(d.claude_model)));
+  if (!seed) {
+    const claude = _parityMeta.claude_selectable.find((m) => !used.has(_baseId(m.id)));
+    seed = { claude_model: claude ? claude.id : '', model: (_selectableModels[0] || ''),
+             effort: (_reasoningEfforts[0] || 'medium'), claude_effort: null };
   }
-  return opts;
+  _parityRows.push({ claude_model: seed.claude_model, model: seed.model,
+                     effort: seed.effort, claude_effort: seed.claude_effort || null });
+  renderParityRows();
 }
 
 async function loadModelParity() {
@@ -3278,29 +3339,20 @@ async function loadModelParity() {
     section.style.display = 'none';
     return;
   }
-  _parityRows = data.mapping || [];
   _selectableModels = data.selectable_models || _selectableModels;
   _reasoningEfforts = data.reasoning_efforts || _reasoningEfforts;
+  _parityMeta = {
+    defaults: data.defaults || [],
+    claude_selectable: data.claude_selectable_models || [],
+    claude_efforts: data.claude_efforts || [],
+  };
+  _parityRows = (data.mapping || []).map((r) => ({
+    claude_model: r.claude_model, model: r.openai_model,
+    effort: r.reasoning_effort, claude_effort: r.claude_effort || null,
+  }));
   refreshCodexSelectOptions();
   section.style.display = '';
-  body.innerHTML = _parityRows.map((r) => `
-    <tr>
-      <td>${esc(r.claude_label)}</td>
-      <td><div class="select-input" id="parity_model_${esc(r.claude_model)}" data-value="${esc(r.openai_model)}">
-            <span class="select-value"></span>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-          </div></td>
-      <td><div class="select-input" id="parity_effort_${esc(r.claude_model)}" data-value="${esc(r.reasoning_effort)}">
-            <span class="select-value"></span>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-          </div></td>
-    </tr>`).join('');
-
-  for (const r of _parityRows) {
-    setupSelectInput(document.getElementById(`parity_model_${r.claude_model}`), parityModelOptions(r), () => {});
-    setupSelectInput(document.getElementById(`parity_effort_${r.claude_model}`),
-      CODEX_REASONING_OPTIONS().filter((o) => o.value !== ''), () => {});
-  }
+  renderParityRows();
 }
 
 async function saveModelParity() {
@@ -3315,7 +3367,8 @@ async function saveModelParity() {
 
 async function resetModelParity() {
   try {
-    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ model_parity: {} }) });
+    // [] means "the default rows" — never "advertise nothing".
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ model_parity: [] }) });
     showToast('success', t('toast.parity_reset'), '');
     await loadModelParity();
   } catch (e) {

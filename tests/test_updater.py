@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -146,22 +147,62 @@ def _prepare(tmp_path):
     app = tmp_path / "app"
     app.mkdir()
     (app / "marker.txt").write_text("old")
-    venv = tmp_path / "venv" / "bin" / "python"
-    venv.parent.mkdir(parents=True)
-    venv.write_text("")
-    return staged, app, tmp_path / "app.previous", venv
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").write_text("")
+    # The console scripts pip regenerates on install — the aliaser links these
+    # out to bin_dir. Both names, so a real install exposes `cu` too.
+    (venv_bin / "claude-unlimited").write_text("#!/bin/sh\n")
+    (venv_bin / "cu").write_text("#!/bin/sh\n")
+    bin_dir = tmp_path / "bin"
+    return staged, app, tmp_path / "app.previous", venv_bin / "python", bin_dir
 
 
 def test_install_replaces_the_app_and_keeps_the_previous_copy(tmp_path):
-    staged, app, previous, venv = _prepare(tmp_path)
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
     updater.install_staged(staged, runner=lambda *a, **k: _completed(),
-                            app_dir=app, previous_dir=previous, venv_python=venv)
+                            app_dir=app, previous_dir=previous, venv_python=venv,
+                            bin_dir=bin_dir)
     assert (app / "marker.txt").read_text() == "new"
     assert (previous / "marker.txt").read_text() == "old"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behaviour")
+def test_install_links_both_cli_names_including_cu(tmp_path):
+    # The reported bug: `cu` never reached the user's bin dir on install/update.
+    # A successful install must link BOTH names out of the venv.
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
+    updater.install_staged(staged, runner=lambda *a, **k: _completed(),
+                            app_dir=app, previous_dir=previous, venv_python=venv,
+                            bin_dir=bin_dir)
+    for name in ("claude-unlimited", "cu"):
+        link = bin_dir / name
+        assert link.is_symlink(), name
+        assert link.resolve() == (venv.parent / name).resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behaviour")
+def test_ensure_cli_aliases_self_heals_a_missing_alias(tmp_path):
+    # An install that predates the `cu` alias has only claude-unlimited linked;
+    # the next update must add the missing one without disturbing the other.
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "claude-unlimited").write_text("#!/bin/sh\n")
+    (venv_bin / "cu").write_text("#!/bin/sh\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "claude-unlimited").symlink_to(venv_bin / "claude-unlimited")
+    assert not (bin_dir / "cu").exists()
+
+    updater.ensure_cli_aliases(venv_scripts=venv_bin, bin_dir=bin_dir)
+
+    assert (bin_dir / "cu").is_symlink()
+    assert (bin_dir / "cu").resolve() == (venv_bin / "cu").resolve()
+    assert (bin_dir / "claude-unlimited").is_symlink()  # untouched
+
+
 def test_install_rolls_back_when_the_new_version_cannot_be_imported(tmp_path):
-    staged, app, previous, venv = _prepare(tmp_path)
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
 
     def runner(cmd, **kw):
         if cmd[1:3] == ["-c", "import claude_unlimited"]:
@@ -170,12 +211,12 @@ def test_install_rolls_back_when_the_new_version_cannot_be_imported(tmp_path):
 
     with pytest.raises(UpdateError, match="could not be imported, rolled back"):
         updater.install_staged(staged, runner=runner, app_dir=app,
-                                previous_dir=previous, venv_python=venv)
+                                previous_dir=previous, venv_python=venv, bin_dir=bin_dir)
     assert (app / "marker.txt").read_text() == "old"  # the working version is back
 
 
 def test_install_rolls_back_when_pip_fails(tmp_path):
-    staged, app, previous, venv = _prepare(tmp_path)
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
     calls = []
 
     def runner(cmd, **kw):
@@ -191,7 +232,7 @@ def test_install_rolls_back_when_pip_fails(tmp_path):
 
 
 def test_install_refuses_a_tree_that_is_not_this_project(tmp_path):
-    staged, app, previous, venv = _prepare(tmp_path)
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
     (staged / "pyproject.toml").unlink()
     with pytest.raises(UpdateError, match="does not look like this project"):
         updater.install_staged(staged, runner=lambda *a, **k: _completed(),
@@ -200,7 +241,7 @@ def test_install_refuses_a_tree_that_is_not_this_project(tmp_path):
 
 
 def test_install_refuses_without_a_virtualenv(tmp_path):
-    staged, app, previous, venv = _prepare(tmp_path)
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
     venv.unlink()
     with pytest.raises(UpdateError, match="No virtual environment"):
         updater.install_staged(staged, runner=lambda *a, **k: _completed(),
@@ -509,3 +550,28 @@ def test_recording_a_no_releases_outcome_notifies_nothing_and_does_not_crash():
     assert daemon._update_state["action"] == "no_releases"
     assert daemon._update_state["available"] is None
     assert daemon._update_state["error"] is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behaviour")
+def test_ensure_cli_aliases_never_clobbers_a_foreign_cu(tmp_path):
+    # `cu` is a common personal alias / real binary name. The startup self-heal
+    # runs on every daemon start, so it must NEVER overwrite a file or symlink
+    # it didn't create — only its own stale link (one resolving into our install).
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "claude-unlimited").write_text("#!/bin/sh\n")
+    (venv_bin / "cu").write_text("#!/bin/sh\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "cu").write_text("echo the user's own cu\n")          # a real file
+    foreign = tmp_path / "somewhere-else"
+    foreign.write_text("x")
+    (bin_dir / "claude-unlimited").symlink_to(foreign)               # a foreign symlink
+
+    updater.ensure_cli_aliases(venv_scripts=venv_bin, bin_dir=bin_dir)
+
+    # The user's real `cu` file is untouched.
+    assert not (bin_dir / "cu").is_symlink()
+    assert (bin_dir / "cu").read_text() == "echo the user's own cu\n"
+    # A foreign symlink for our own name is also left alone (points outside INSTALL_ROOT).
+    assert (bin_dir / "claude-unlimited").resolve() == foreign.resolve()

@@ -2,10 +2,11 @@
 
 # Claude Unlimited
 
-### Rotate your Claude and GPT subscriptions and APIs seamlessly, right inside the Claude Code CLI
+### When one account hits its usage limit, your session doesn't.
 
-Switch between accounts automatically based on usage thresholds and limits — all of it
-configurable and visible in a local web dashboard built to be eye candy for developers.
+Claude Unlimited pools your Claude (Pro · Max), ChatGPT/Codex, and Anthropic API accounts
+into one continuous supply for Claude Code. When an account runs dry, the next one takes
+over on the very next request — same session, same context, same terminal. You keep typing.
 
 <br>
 
@@ -21,8 +22,9 @@ configurable and visible in a local web dashboard built to be eye candy for deve
 
 ### **You never notice the switch.**
 
-Rotation happens **between requests**, in the background. No logout, no prompt, no restart
-— you keep typing in the same session while the account underneath you changes.
+It happens **between requests**, in the background. No logout, no handover, no restarting
+the session — the account underneath you changes and nothing else does. Often the
+dashboard's activity log is the only place you'll find out it happened.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/DevDock-AI/claude-unlimited/actions/workflows/ci.yml/badge.svg)](https://github.com/DevDock-AI/claude-unlimited/actions/workflows/ci.yml)
@@ -271,29 +273,43 @@ Also isolated: your existing `codex` login is left alone.
 ### Which GPT model runs your Claude model
 
 Claude Code asks for a Claude model. When the request lands on a Codex account, something
-has to decide which GPT model actually answers — and how hard it thinks. That mapping is
-yours to set, in **Settings → Models parity**:
+has to decide which GPT model actually answers — and how hard it thinks. That's the
+**parity list** in **Settings → Models parity**, and it's yours to edit:
 
-| Claude model | Runs as | Reasoning effort |
-|---|---|---|
-| Claude Fable 5 | `gpt-5.6-sol` | high |
-| Claude Opus 5 | `gpt-5.6-terra` | high |
-| Claude Sonnet 5 | `gpt-5.6-terra` | medium |
-| Claude Haiku 4.5 | `gpt-5.6-luna` | low |
+| Claude model | Claude effort | Runs as (Codex) | Codex effort |
+|---|---|---|---|
+| Claude Fable 5.1 | Automatic | `gpt-6-astra` | high |
+| Claude Opus 5 | Automatic | `gpt-5.6-terra` | high |
+| Claude Sonnet 5 | Automatic | `gpt-5.6-terra` | medium |
+| Claude Haiku 4.5 | Automatic | `gpt-5.6-luna` | low |
 
-Change either column per row, or hit **Reset to defaults**. Effort runs from `minimal`
-through `low`, `medium`, `high`, `xhigh`, `max` to `ultra`.
+- **It's an editable list.** It starts with those four. Add a row with **+ Add model**,
+  remove one with the red 🗑, and **Save**. **Reset to defaults** brings the four back.
+- **The list is your model picker.** Whatever you save is exactly what `/model` offers in a
+  Codex-served `cu code` session — nothing more, nothing less. Restart the session to pick
+  up changes (the picker is read once at launch).
+- **Both sides have an effort dial.** *Codex effort* governs a request served by a Codex
+  account; *Claude effort* is applied when a Claude account serves it (`output_config.effort`
+  — leave it **Automatic** to keep Claude Code's own choice). Haiku-class and older Sonnet
+  models don't accept it, so it's simply ignored there.
+- **Dropdowns list the priciest/most-capable first**, drawn live from the model catalogue.
+- **Names and prices are live.** The lineup comes from the model catalogue refreshed at each
+  session launch, so `gpt-6-astra` / Fable 5.1 show up without a release.
 
 **Effort is the expensive dial, not model size.** A Codex plan's quota is spent on
 reasoning tokens produced, multiplied by the model's tier — not on how much context you
-send. Turning Sonnet up to `high` costs noticeably more of your weekly allowance than
+send. Turning a row up to `high` costs noticeably more of your weekly allowance than
 leaving it at `medium`; resending a long conversation costs nothing extra. That's
 measured behaviour, not a guess — see
 [`docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md`](docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).
 
-This mapping applies to Codex profiles left on **Automatic**. A profile with its own model
+The list applies to Codex profiles left on **Automatic**. A profile with its own model
 override keeps using that instead, so you can pin one account to a specific model and let
-the rest follow the table.
+the rest follow the list.
+
+> **Picker limitation:** Claude Code's `/model` picker can relabel at most its four standard
+> tiers (Fable, Opus, Sonnet, Haiku). Extra rows you add are still served and usable by id
+> (`/model <id>` or `--model <id>`), but may not appear in the picker itself.
 
 ---
 

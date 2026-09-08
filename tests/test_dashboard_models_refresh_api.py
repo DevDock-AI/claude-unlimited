@@ -74,3 +74,29 @@ def test_refresh_endpoint_still_rejects_a_bad_host_header(running_server, monkey
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         _post(f"{running_server}/api/models/refresh", headers={"Host": "evil.example"})
     assert excinfo.value.code == 400
+
+
+def _get(url, headers=None):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=2) as resp:
+        return resp.status, json.loads(resp.read())
+
+
+def test_model_map_endpoint_returns_the_wire_keys_the_dashboard_reads(running_server):
+    # app.js consumes exactly these keys; a rename on either side would ship
+    # silently without this contract test.
+    status, body = _get(f"{running_server}/api/codex/model-map")
+    assert status == 200
+    for key in ("mapping", "selectable_models", "claude_selectable_models",
+                "reasoning_efforts", "claude_efforts", "defaults"):
+        assert key in body, key
+    assert body["claude_efforts"] == ["low", "medium", "high", "xhigh", "max"]
+    # Every mapping row carries the fields the editable table binds to.
+    assert body["mapping"], "default rows must never be empty"
+    row = body["mapping"][0]
+    for field in ("claude_model", "claude_label", "openai_model", "reasoning_effort",
+                  "claude_effort", "default_model", "default_effort", "overridden"):
+        assert field in row, field
+    # claude_selectable_models are {id,label} objects; defaults are full rows.
+    assert set(body["claude_selectable_models"][0]) >= {"id", "label"}
+    assert set(body["defaults"][0]) >= {"claude_model", "model", "effort"}

@@ -21,6 +21,7 @@ from claude_unlimited.openai_models import (
     fallback_models,
     map_model,
     selectable_models,
+    selectable_claude_models,
 )
 
 TODAY = datetime.date(2026, 9, 7)
@@ -65,7 +66,7 @@ def test_effective_map_keeps_every_curated_decision_verbatim():
 
 def test_a_new_top_claude_model_gets_the_top_openai_tier():
     emap = effective_model_map(make_catalogue())
-    assert emap["claude-zenith-6"] == OpenAIModelTarget("gpt-5.6-sol", "high")
+    assert emap["claude-zenith-6"] == OpenAIModelTarget("gpt-6-astra", "high")
 
 
 def test_a_new_mid_tier_model_takes_its_conservative_neighbours_tier():
@@ -88,41 +89,69 @@ def test_without_a_catalogue_everything_falls_back_to_the_literals():
     assert selectable_models() == (list(_MODEL_LADDER) + list(_LEGACY_SELECTABLE))
     assert [r["claude_model"] for r in automatic_mapping()] == list(_MODEL_MAP)
     assert dict(advertised_models()).keys() == _MODEL_MAP.keys()
-    assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna"]
+    assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"]
 
 
-def test_selectable_models_include_the_catalogue_openai_lineup():
+def test_selectable_models_are_ordered_most_expensive_first():
     cat = make_catalogue()
     models = selectable_models(cat)
-    assert models[:3] == ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]  # ladder first
-    assert "gpt-5.9-new" in models  # a model this build never heard of
+    # Catalogue rank first: generation desc (gpt-5.9 before the 5.6s), then
+    # cost desc within a generation (sol > terra > luna).
+    assert models[:4] == ["gpt-5.9-new", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
     for legacy in _LEGACY_SELECTABLE:
         assert legacy in models
 
 
-def test_advertised_models_follow_the_catalogue_lineup():
+def test_selectable_claude_models_follow_the_catalogue_rank():
     cat = make_catalogue()
+    claude = selectable_claude_models(cat)
+    # Anthropic rank is cost desc: zenith (9e-05) leads, haiku (5e-06) trails.
+    assert [c["id"] for c in claude][0] == "claude-zenith-6"
+    assert [c["id"] for c in claude][-1] == "claude-haiku-4-5"
+    assert all(c["label"] for c in claude)
+
+
+def test_advertised_models_are_exactly_the_saved_rows():
+    cat = make_catalogue()
+    # No parity saved -> the four default family heads, in family order. A new
+    # top model (zenith) and a mid model (nova) are NOT advertised until added.
     ads = advertised_models(catalogue=cat)
     ids = [claude_id for claude_id, _ in ads]
-    assert ids[0] == "claude-zenith-6"  # most capable first, catalogue order
-    assert "claude-haiku-4-5" in ids
+    assert ids == ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
+    assert "claude-zenith-6" not in ids and "claude-nova-4" not in ids
     labels = dict(ads)
-    # `<anthropic model> | <openai model> · <effort>` — the /model picker names
-    # both the Claude tier and the OpenAI/Codex model it routes to.
-    assert labels["claude-zenith-6"] == "Claude Zenith 6 | GPT-5.6 Sol · high"
+    assert labels["claude-fable-5"] == "Claude Fable 5 | GPT-6 Astra · high"
 
 
-def test_automatic_mapping_rows_come_from_the_catalogue_with_clean_labels():
+def test_advertised_models_reflect_a_saved_list_with_claude_effort():
+    cat = make_catalogue()
+    saved = [
+        {"claude_model": "claude-fable-5", "model": "gpt-5.6-sol",
+         "effort": "high", "claude_effort": "xhigh"},
+        {"claude_model": "claude-haiku-4-5", "model": "gpt-5.6-luna",
+         "effort": "low", "claude_effort": "high"},
+    ]
+    labels = dict(advertised_models(saved, catalogue=cat))
+    ids = [cid for cid, _ in advertised_models(saved, catalogue=cat)]
+    assert ids == ["claude-fable-5", "claude-haiku-4-5"]  # exactly the saved rows, in order
+    # fable accepts output_config.effort -> surfaced; codex effort stays last segment.
+    assert labels["claude-fable-5"] == "Claude Fable 5 (effort xhigh) | GPT-5.6 Sol · high"
+    # haiku rejects it (gate returns None) -> no effort annotation even if set.
+    assert labels["claude-haiku-4-5"] == "Claude Haiku 4.5 | GPT-5.6 Luna · low"
+
+
+def test_automatic_mapping_rows_come_from_the_saved_list():
     rows = {r["claude_model"]: r for r in automatic_mapping(catalogue=make_catalogue())}
-    assert rows["claude-zenith-6"]["claude_label"] == "Claude Zenith 6"
+    # Defaults only, until the user adds rows.
+    assert set(rows) == {"claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"}
     assert rows["claude-fable-5"]["claude_label"] == "Claude Fable 5"  # curated name kept
-    assert rows["claude-nova-4"]["openai_model"] == "gpt-5.6-terra"
+    assert rows["claude-fable-5"]["claude_effort"] is None
     assert all(r["claude_label"] for r in rows.values())
 
 
 def test_map_model_resolves_catalogue_only_models():
     cat = make_catalogue()
-    assert map_model("claude-zenith-6", catalogue=cat) == OpenAIModelTarget("gpt-5.6-sol", "high")
+    assert map_model("claude-zenith-6", catalogue=cat) == OpenAIModelTarget("gpt-6-astra", "high")
     # A dated spelling of a catalogue row lands on the same row.
     assert map_model("claude-nova-4-20260901", catalogue=cat) == OpenAIModelTarget("gpt-5.6-terra", "medium")
 
@@ -165,9 +194,10 @@ def test_the_daemon_surfaces_pick_up_an_initialized_catalogue(monkeypatch):
     try:
         from claude_unlimited import connectors
         listing = connectors.models_listing("codex")
-        assert [mid for mid, _ in listing][0] == "claude-zenith-6"
+        # Default saved list -> the four family heads; first is the fable head.
+        assert [mid for mid, _ in listing][0] == "claude-fable-5"
         assert "gpt-5.9-new" in selectable_models()
-        assert any(r["claude_model"] == "claude-nova-4" for r in automatic_mapping())
+        assert any(r["claude_model"] == "claude-fable-5" for r in automatic_mapping())
     finally:
         monkeypatch.undo()
 
@@ -186,3 +216,88 @@ def test_a_fully_renamed_lineup_spreads_across_the_curated_tiers():
     assert emap["claude-alien-0"] == list(_MODEL_MAP.values())[0]
     assert emap["claude-alien-3"] == list(_MODEL_MAP.values())[-1]
     assert len({t for t in emap.values()}) >= 3
+
+
+# ---- Claude-side effort support gate (Feature 1) ----
+
+import pytest
+from claude_unlimited.openai_models import apply_claude_effort, claude_effort_for, normalize_parity, default_parity_rows
+
+
+@pytest.mark.parametrize("model,requested,expected", [
+    ("claude-fable-5-1", "xhigh", "xhigh"),   # top tier: full range
+    ("claude-fable-5-1", "max", "max"),
+    ("claude-opus-5", "max", "max"),
+    ("claude-opus-4-8", "xhigh", "xhigh"),    # opus >=4.7: full range
+    ("claude-opus-4-6", "xhigh", "high"),     # 4.6: all but xhigh -> clamp
+    ("claude-opus-4-6", "max", "max"),
+    ("claude-opus-4-5", "xhigh", "high"),     # 4.5: low/medium/high only
+    ("claude-opus-4-5", "max", "high"),
+    ("claude-sonnet-5", "xhigh", "xhigh"),
+    ("claude-sonnet-4-6", "xhigh", "high"),
+    ("claude-sonnet-4-5", "high", None),      # <=4.5 rejects the knob
+    ("claude-haiku-4-5", "low", None),        # haiku never accepts it
+    ("claude-haiku-4-5-20251001", "high", None),
+    ("claude-mystery-9", "high", None),       # unknown family: never risk a 400
+    ("claude-fable-5-1", "bogus", None),      # invalid level
+    ("claude-fable-5-1", None, None),
+])
+def test_apply_claude_effort_gate(model, requested, expected):
+    assert apply_claude_effort(model, requested) == expected
+
+
+def test_claude_effort_for_matches_a_row_and_gates_by_model():
+    cat = make_catalogue()
+    saved = [
+        {"claude_model": "claude-fable-5", "model": "gpt-5.6-sol", "effort": "high", "claude_effort": "max"},
+        {"claude_model": "claude-haiku-4-5", "model": "gpt-5.6-luna", "effort": "low", "claude_effort": "high"},
+    ]
+    assert claude_effort_for("claude-fable-5", saved, cat) == "max"
+    # a dated spelling still matches the row by base id
+    assert claude_effort_for("claude-fable-5-20260101", saved, cat) == "max"
+    # haiku's row sets it, but the model rejects it -> None (no injection)
+    assert claude_effort_for("claude-haiku-4-5", saved, cat) is None
+    # a model not in the saved list -> None
+    assert claude_effort_for("claude-opus-5", saved, cat) is None
+    # no row sets claude_effort -> None
+    assert claude_effort_for("claude-fable-5", None, cat) is None
+
+
+def test_normalize_parity_migrates_a_legacy_dict_to_the_default_rows_plus_extras():
+    cat = make_catalogue()
+    legacy = {
+        "claude-opus-5": {"model": "gpt-5.6-luna", "effort": "low"},  # overlay a default
+        "claude-zenith-6": {"model": "gpt-5.6-sol", "effort": "high"},  # a key outside defaults
+    }
+    rows = normalize_parity(legacy, cat)
+    by_id = {r["claude_model"]: r for r in rows}
+    # the four defaults are present, opus overlaid
+    assert set(["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]) <= set(by_id)
+    assert by_id["claude-opus-5"]["model"] == "gpt-5.6-luna"
+    # the non-default key survives as its own appended row
+    assert by_id["claude-zenith-6"]["model"] == "gpt-5.6-sol"
+
+
+def test_normalize_parity_empty_shapes_yield_the_defaults():
+    cat = make_catalogue()
+    defaults = [r["claude_model"] for r in default_parity_rows(cat)]
+    for empty in (None, {}, []):
+        assert [r["claude_model"] for r in normalize_parity(empty, cat)] == defaults
+
+
+def test_normalize_parity_fills_missing_fields_in_a_list_row():
+    cat = make_catalogue()
+    rows = normalize_parity([{"claude_model": "claude-opus-5"}], cat)  # no model/effort
+    assert rows == [{"claude_model": "claude-opus-5", "model": "gpt-5.6-terra",
+                     "effort": "high", "claude_effort": None}]
+
+
+def test_default_rows_pick_the_newest_version_of_each_family_not_the_priciest():
+    # LiteLLM sometimes prices an older point release above the flagship; the
+    # default parity row for a family must still be the newest version.
+    cat = make_catalogue(extra={
+        "claude-sonnet-4-6": entry("anthropic", 3e-05),  # priced ABOVE sonnet-5 (1e-05)
+    })
+    heads = {r["claude_model"] for r in default_parity_rows(cat)}
+    assert "claude-sonnet-5" in heads       # newest wins
+    assert "claude-sonnet-4-6" not in heads  # not the prilier older one

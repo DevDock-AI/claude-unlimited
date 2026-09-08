@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 
-from . import activity, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_tracking
+from . import activity, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_tracking
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, ProviderUnavailable, QuotaExhausted, Unknown, UsageSnapshot, classify
@@ -581,8 +581,14 @@ class Gateway:
             if profile.kind == "oauth":
                 credential = self._maybe_refresh_credential(profile, credential)
 
+            # The Claude side of a parity row's reasoning effort: gated to what
+            # the requested model actually accepts (None otherwise), so a bad
+            # row can never 400 a real request. Only oauth/api /v1/messages
+            # bodies are touched, inside build_upstream_request.
+            claude_effort = openai_models.claude_effort_for(request_model(body), pool.settings.model_parity)
             try:
-                upstream_req = build_upstream_request(profile, credential, method, path, headers, body)
+                upstream_req = build_upstream_request(profile, credential, method, path, headers, body,
+                                                      claude_effort=claude_effort)
             except ValueError:
                 # A structurally invalid inbound request (e.g. over the body
                 # size cap) — no Profile can serve this; retrying the next
@@ -655,7 +661,8 @@ class Gateway:
             if (profile.kind == "api" and profile.default_model
                     and isinstance(observation, Unknown) and observation.status_code in _MODEL_FALLBACK_STATUS_CODES):
                 retried = self._maybe_retry_with_default_model(
-                    profile, credential, method, path, headers, upstream_req.body, now)
+                    profile, credential, method, path, headers, body, now,
+                    parity=pool.settings.model_parity)
                 if retried is not None:
                     resp.connection.close()  # the first attempt's response is being discarded, unread
                     resp, observation = retried
@@ -1288,7 +1295,7 @@ class Gateway:
         return True
 
     def _maybe_retry_with_default_model(self, profile: Profile, credential: str, method: str, path: str,
-                                          headers: dict, body: bytes, now: datetime):
+                                          headers: dict, body: bytes, now: datetime, *, parity=None):
         """Retries ONCE against profile.default_model instead of whatever
         model the client actually asked for — called only when the first
         attempt already failed with a status in _MODEL_FALLBACK_STATUS_CODES
@@ -1309,8 +1316,14 @@ class Gateway:
         if requested_model is None or requested_model == profile.default_model:
             return None
         retry_body = rewrite_model(body, profile.default_model)
+        # Effort must match the model we're NOW sending (default_model), not the
+        # one that failed — carrying the original's effort could push a value
+        # default_model rejects (e.g. onto a Haiku-class default). Rebuilt from
+        # the original body so build_upstream_request injects the right one.
+        retry_effort = openai_models.claude_effort_for(profile.default_model, parity)
         try:
-            retry_req = build_upstream_request(profile, credential, method, path, headers, retry_body)
+            retry_req = build_upstream_request(profile, credential, method, path, headers, retry_body,
+                                               claude_effort=retry_effort)
         except ValueError:
             return None
         try:

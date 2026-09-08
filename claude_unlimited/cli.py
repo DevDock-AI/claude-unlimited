@@ -336,6 +336,33 @@ _MODEL_TIER_IDS = {
     "HAIKU": "claude-haiku-4-5",
 }
 
+# Each tier's family prefix — a saved parity row is matched to a tier by family
+# (not exact id), so a row saved with a dated or point-release id still labels
+# the right picker slot instead of silently falling back to a stale literal.
+_MODEL_TIER_FAMILY = {
+    "FABLE": "claude-fable",
+    "OPUS": "claude-opus",
+    "SONNET": "claude-sonnet",
+    "HAIKU": "claude-haiku",
+}
+
+
+def _tier_live_label(live: dict, tier_id: str, family: str):
+    """The (name, effort) from the live parity list for a tier: exact id, then
+    dated/undated base id, then family prefix. None if the list has no row for
+    this family (the user removed it)."""
+    from .model_catalogue import base_id
+    if tier_id in live:
+        return live[tier_id]
+    base = base_id(tier_id)
+    for claude_id, value in live.items():
+        if base_id(claude_id) == base:
+            return value
+    for claude_id, value in live.items():
+        if base_id(claude_id).lower().startswith(family):
+            return value
+    return None
+
 # OFFLINE FALLBACK ONLY. The live labels are derived per launch from the
 # daemon's own parity map (_fetch_parity_labels -> GET /v1/models), so they
 # always name the model that will really serve and never go stale. These
@@ -412,9 +439,16 @@ def _apply_model_labels(forced_profile, enabled_profiles=None,
       * rotated across a mixed pool -> name both the Claude tier and the GPT
         model it maps to, since either provider may serve a given request.
 
-    Live values come from the daemon's parity map when reachable, so the
-    picker matches the Models table; the module literals are the offline
-    fallback. Never overrides a value already set in the environment."""
+    Live values come from the daemon's parity map (GET /v1/models, now exactly
+    the user's saved parity list) when reachable, so the picker matches the
+    Models table; the module literals are the offline fallback. A tier the
+    user has REMOVED from the parity list gets no label — its env stays unset
+    so the picker doesn't resurrect a stale default. Never overrides a value
+    already set in the environment.
+
+    The env mechanism has only four tier slots (FABLE/OPUS/SONNET/HAIKU); a
+    parity list with extra rows advertises them via /v1/models but Claude
+    Code's picker can relabel at most these four — see the README note."""
     kind = getattr(forced_profile, "kind", None)
     if forced_profile is not None:
         labels = _CODEX_MODEL_LABELS if kind == "codex" else None
@@ -430,13 +464,17 @@ def _apply_model_labels(forced_profile, enabled_profiles=None,
     live = _fetch_parity_labels(host, port, token) if (host and port and token) else {}
     for tier, (fallback_name, fallback_desc) in labels.items():
         tier_id = _MODEL_TIER_IDS[tier]
-        parity = live.get(tier_id)
-        if parity is not None:
-            name, effort = parity
+        match = _tier_live_label(live, tier_id, _MODEL_TIER_FAMILY[tier]) if live else None
+        if match is not None:
+            name, effort = match
             lead = "Served by Codex" if codex_pinned else "Whichever account is active · Codex"
             description = f"{lead} · reasoning: {effort}" if effort else lead
+        elif live:
+            # Fetch succeeded but the user's parity list has no row for this
+            # family — they removed it; leave the tier unlabelled.
+            continue
         else:
-            name, description = fallback_name, fallback_desc
+            name, description = fallback_name, fallback_desc  # daemon unreachable: offline literals
         for suffix, value in (("", tier_id), ("_NAME", name), ("_DESCRIPTION", description)):
             os.environ.setdefault(f"ANTHROPIC_DEFAULT_{tier}_MODEL{suffix}", value)
 
@@ -1736,8 +1774,9 @@ def main(argv=None) -> int:
     sub.add_parser("add-account", aliases=["ac"],
                     help="log into a Claude account via an isolated Claude Code session "
                          "(doesn't affect other logged-in accounts) and add it as a Profile")
-    sub.add_parser("add-codex-account", help="log into a ChatGPT/Codex subscription via an isolated "
-                                              "session and add it as a codex-kind Profile")
+    sub.add_parser("add-codex-account", aliases=["aca"],
+                    help="log into a ChatGPT/Codex subscription via an isolated "
+                         "session and add it as a codex-kind Profile")
     reauth_p = sub.add_parser("reauth", help="re-authenticate an OAuth Profile that needs it "
                                               "(defaults to whichever ones the daemon reports as needing it)")
     reauth_p.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -1778,7 +1817,7 @@ def main(argv=None) -> int:
         return doctor()
     if args.cmd in ("add-account", "ac"):
         return add_account()
-    if args.cmd == "add-codex-account":
+    if args.cmd in ("add-codex-account", "aca"):
         return add_codex_account()
     if args.cmd == "reauth":
         return reauth(args.port)

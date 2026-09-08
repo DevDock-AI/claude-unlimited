@@ -396,9 +396,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             # carry its own copy of this table, which went stale the first
             # time the mapping changed.
             self._send_json(200, {
+                # The saved parity list, normalized to full rows (defaults when
+                # unset) — the editable table AND exactly what /model advertises.
                 "mapping": openai_models.automatic_mapping(load_pool().settings.model_parity),
-                "selectable_models": openai_models.selectable_models(),
-                "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),
+                "selectable_models": openai_models.selectable_models(),        # OpenAI dropdown, cost desc
+                "claude_selectable_models": openai_models.selectable_claude_models(),  # Claude dropdown, cost desc
+                "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),     # Codex side
+                "claude_efforts": list(openai_models.CLAUDE_REASONING_EFFORTS),       # Claude side
+                "defaults": openai_models.default_parity_rows(),  # for [+] prefill / Reset preview
             })
             return
 
@@ -1125,10 +1130,19 @@ def make_server(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> Threadin
     else:
         server = ThreadingHTTPServer((host, port), _DashboardHandler)
     _assert_bound_to_loopback(server)
+    # Remember the actually-bound port (port 0 resolves to a real one) so the
+    # background update loops can restart onto the SAME port — they have no
+    # request handler to read self.server.server_address from.
+    global _RUNNING_PORT
+    _RUNNING_PORT = server.server_address[1]
     return server
 
 
 PID_FILE = APP_DIR / "daemon.pid"
+# The port this daemon is actually serving on, set by make_server(). Used by
+# the auto-update restart paths so a daemon on a non-default port relaunches
+# correctly instead of onto DEFAULT_PORT.
+_RUNNING_PORT = DEFAULT_PORT
 
 
 _OAUTH_REFRESH_LOOP_INTERVAL_SECONDS = 60
@@ -1381,6 +1395,13 @@ def _run_update_check(settings=None, *, respect_idle: bool = True,
     _record_update_outcome(outcome, settings)
     with _update_lock:
         _update_state["install_deferred_until_idle"] = bool(deferred and outcome.action == "downloaded")
+    # An immediate auto-install (pool was idle at check time) has swapped the
+    # code on disk but the running process is still the old one — restart so
+    # the update actually takes effect. Previously only the DEFERRED path
+    # restarted, so an install that happened to land while idle silently did
+    # nothing until the next restart.
+    if outcome.action == "installed":
+        _restart_for_update(_RUNNING_PORT)
     return _public_update_state(settings)
 
 
@@ -1402,7 +1423,7 @@ def _install_deferred_update_if_idle() -> None:
         _update_state["install_deferred_until_idle"] = outcome.action == "downloaded"
     if outcome.action != "installed":
         return
-    _restart_for_update(DEFAULT_PORT)
+    _restart_for_update(_RUNNING_PORT)
 
 
 def _update_check_loop() -> None:
@@ -1468,6 +1489,16 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
     # happens here at all: refreshing is driven by `code` session launches
     # (POST /api/models/refresh) and the hourly update-loop tick.
     model_catalogue.initialize()
+    # Self-heal the CLI launchers on startup. The auto-updater only self-heals
+    # from the release AFTER the fix (the OLD updater installs the new tree),
+    # so a new command name — `cu`, added in 1.2.6 — would otherwise not reach
+    # `~/.local/bin` until an extra update. Doing it here means the moment this
+    # version's daemon runs (a restart the user does anyway), the alias exists.
+    # Best-effort: a launcher we can't write must never stop the daemon.
+    try:
+        updater.ensure_cli_aliases()
+    except Exception:
+        pass
     threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
     print(f"CSRF token for this run (Dashboard needs it, never logged again): {_CSRF_TOKEN}")

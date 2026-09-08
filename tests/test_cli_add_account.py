@@ -161,3 +161,18 @@ def test_add_account_never_calls_logout_or_status(env, monkeypatch, tmp_path):
     monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda token: account)
 
     assert cli.add_account() == 0
+
+
+def test_cli_aliases_dispatch_to_the_right_command(monkeypatch):
+    """`ac` -> add_account, `aca` -> add_codex_account. argparse sets args.cmd
+    to the ALIAS typed (not the canonical name), so main() must list each alias
+    explicitly — `aca` was inert until it was added to the dispatch."""
+    from claude_unlimited import cli
+    calls = []
+    monkeypatch.setattr(cli, "add_account", lambda: calls.append("add_account") or 0)
+    monkeypatch.setattr(cli, "add_codex_account", lambda: calls.append("add_codex_account") or 0)
+
+    assert cli.main(["ac"]) == 0
+    assert cli.main(["aca"]) == 0
+    assert cli.main(["add-codex-account"]) == 0
+    assert calls == ["add_account", "add_codex_account", "add_codex_account"]

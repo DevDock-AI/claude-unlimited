@@ -96,11 +96,15 @@ class Settings:
     notify_rotated: bool = False
     notify_quota_reset: bool = False
     notify_needs_attention: bool = True
-    # Claude model id -> {"model": str, "effort": str}. Only rows that differ
-    # from openai_models.py's built-in table are stored: keeping a full copy
-    # would freeze this config against the shipped lineup, so a retired model
-    # would be pinned forever and a newly added tier would never appear.
-    model_parity: dict = field(default_factory=dict)
+    # The editable model-parity list: an ORDERED list of rows
+    # [{"claude_model", "model"?, "effort"?, "claude_effort"?}, ...] that IS the
+    # set of models Claude Code's /model picker offers for Codex-served
+    # sessions. Empty ([] or {}) means "the default rows" (the 4 family heads),
+    # never "advertise nothing". A legacy sparse dict {claude_id: {...}} is
+    # still accepted and migrated at read time by openai_models.normalize_parity
+    # — the config file keeps its old shape until the user's next save writes
+    # the list, so no on-load rewrite is needed.
+    model_parity: object = field(default_factory=dict)
 
 
 @dataclass
@@ -197,38 +201,78 @@ _SETTINGS_FIELDS = {
 }
 
 
-def _validated_model_parity(raw) -> dict:
-    """Validates a parity override map, rejecting the whole payload rather
-    than silently dropping a bad row — a mapping that half-applied would be
-    worse than one that refused."""
-    from .openai_models import VALID_REASONING_EFFORTS
+def _validated_model_row_fields(where, row, entry):
+    """Validate the model/effort/claude_effort of one parity row into `entry`.
+    Shared by the dict (legacy) and list (current) shapes."""
+    from .openai_models import VALID_REASONING_EFFORTS, CLAUDE_REASONING_EFFORTS
+
+    model = row.get("model")
+    if model is not None:
+        # Left free-form on purpose: a Profile override already accepts an
+        # arbitrary model id, and pinning one this build has not heard of is
+        # legitimate. The fallback ladder handles a rejected model.
+        if not isinstance(model, str) or not model.strip() or len(model) > 128:
+            raise ValueError(f"{where}.model must be a short non-empty string")
+        entry["model"] = model.strip()
+    effort = row.get("effort")
+    if effort is not None:
+        if effort not in VALID_REASONING_EFFORTS:
+            raise ValueError(f"{where}.effort must be one of {list(VALID_REASONING_EFFORTS)}")
+        entry["effort"] = effort
+    claude_effort = row.get("claude_effort")
+    if claude_effort is not None:
+        if claude_effort not in CLAUDE_REASONING_EFFORTS:
+            raise ValueError(
+                f"{where}.claude_effort must be one of {list(CLAUDE_REASONING_EFFORTS)}")
+        entry["claude_effort"] = claude_effort
+    return entry
+
+
+def _validated_model_parity(raw):
+    """Validates a parity payload, rejecting the whole thing rather than
+    silently dropping a bad row — a mapping that half-applied would be worse
+    than one that refused.
+
+    Accepts BOTH shapes so old config files and export bundles keep working:
+      * the current ORDERED LIST of rows [{claude_model, model?, effort?,
+        claude_effort?}, ...] — the editable parity list; order is preserved;
+      * the legacy sparse dict {claude_id: {model?, effort?, claude_effort?}}.
+    openai_models.normalize_parity() turns either into the in-force row list at
+    read time, and the empty case ([]/{}) means "the default rows"."""
+    from .model_catalogue import base_id
+
+    if isinstance(raw, list):
+        if len(raw) > 64:
+            raise ValueError("model_parity has too many entries")
+        cleaned_list: list = []
+        seen_bases: set = set()
+        for i, row in enumerate(raw):
+            if not isinstance(row, dict):
+                raise ValueError(f"model_parity[{i}] must be an object")
+            claude_id = row.get("claude_model")
+            if not isinstance(claude_id, str) or not claude_id.strip() or len(claude_id) > 128:
+                raise ValueError(f"model_parity[{i}].claude_model must be a short non-empty model id")
+            claude_id = claude_id.strip()
+            base = base_id(claude_id)
+            if base in seen_bases:
+                raise ValueError(f"model_parity has a duplicate Claude model: {claude_id}")
+            seen_bases.add(base)
+            entry = {"claude_model": claude_id}
+            _validated_model_row_fields(f"model_parity[{i}]", row, entry)
+            cleaned_list.append(entry)
+        return cleaned_list
 
     if not isinstance(raw, dict):
-        raise ValueError("model_parity must be an object")
+        raise ValueError("model_parity must be a list of rows or an object")
     if len(raw) > 64:
         raise ValueError("model_parity has too many entries")
-
     cleaned: dict = {}
     for claude_id, row in raw.items():
         if not isinstance(claude_id, str) or not claude_id.strip():
             raise ValueError("model_parity keys must be non-empty model ids")
         if not isinstance(row, dict):
             raise ValueError(f"model_parity[{claude_id}] must be an object")
-        entry = {}
-        model = row.get("model")
-        if model is not None:
-            # Left free-form on purpose: a Profile override already accepts an
-            # arbitrary model id, and pinning one this build has not heard of
-            # is legitimate. The fallback ladder handles a rejected model.
-            if not isinstance(model, str) or not model.strip() or len(model) > 128:
-                raise ValueError(f"model_parity[{claude_id}].model must be a short non-empty string")
-            entry["model"] = model.strip()
-        effort = row.get("effort")
-        if effort is not None:
-            if effort not in VALID_REASONING_EFFORTS:
-                raise ValueError(
-                    f"model_parity[{claude_id}].effort must be one of {list(VALID_REASONING_EFFORTS)}")
-            entry["effort"] = effort
+        entry = _validated_model_row_fields(f"model_parity[{claude_id}]", row, {})
         if entry:
             cleaned[claude_id.strip()] = entry
     return cleaned

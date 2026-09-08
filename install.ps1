@@ -448,6 +448,9 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
     # every user's PATH by default, so a launcher dropped there works even in
     # terminals that were open before this ran.
     function Install-Launcher {
+        # Generates one launcher; called for both command names so the short
+        # alias `cu` works from an already-open terminal too.
+        param([string]$Name = 'claude-unlimited')
         $dir = Join-Path $env:LocalAppData 'Microsoft\WindowsApps'
         if (-not (Test-Path $dir)) { return $null }
         $pre  = @($py.Args | Where-Object { $_ })
@@ -460,7 +463,7 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
         # fallback for when pip generated no .exe. CRLF endings are required:
         # cmd.exe misparses a batch file with bare LF and reports "cannot find
         # the path specified".
-        $exePath = Join-Path $scripts 'claude-unlimited.exe'
+        $exePath = Join-Path $scripts "$Name.exe"
         # PYTHONPATH pinned to the absolute install directory. A --user install
         # is only importable via the per-user site-packages path, which Python
         # derives from %APPDATA% - so a session where that variable is missing
@@ -481,7 +484,7 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
                 (") else (`r`n") +
                 ('  "{0}" {1}-m claude_unlimited %*' -f $py.Exe, $args) + "`r`n" +
                 (")`r`n")
-        $file = Join-Path $dir 'claude-unlimited.cmd'
+        $file = Join-Path $dir "$Name.cmd"
         try {
             [IO.File]::WriteAllText($file, $text, [Text.Encoding]::ASCII)
             return $file
@@ -490,8 +493,10 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
         }
     }
 
-    $launcher = Install-Launcher
+    $launcher = Install-Launcher -Name 'claude-unlimited'
     if ($launcher) { Ok "Installed launcher: $launcher" }
+    # The short alias `cu` — same launcher, second name.
+    $null = Install-Launcher -Name 'cu'
 
     if (Test-CommandVisible 'claude-unlimited') {
         Ok "'claude-unlimited' is on your PATH - open a NEW terminal to use it (windows"

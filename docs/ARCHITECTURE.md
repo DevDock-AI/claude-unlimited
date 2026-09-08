@@ -116,7 +116,17 @@ only. A client that disconnects mid-stream simply gets no usage record.
 
 Claude Code asks for a Claude model; something has to choose which GPT model answers and
 how hard it reasons. `openai_models.py` owns that mapping and Settings → Models parity
-edits it. A Profile with its own override ignores the table.
+edits it. A Profile with its own override ignores the list.
+
+The parity is an **explicit ordered list** (`Settings.model_parity`) of rows
+`{claude_model, model, effort, claude_effort}`; the saved list IS what a codex Profile
+advertises at `GET /v1/models` and therefore what `/model` offers. Empty means the default
+four (fable/opus/sonnet/haiku family heads). A legacy sparse-dict config is migrated to the
+list at read time by `openai_models.normalize_parity` (no on-load rewrite; the file keeps
+its old shape until the next save). `claude_effort` is injected as `output_config.effort`
+onto oauth/api-served `/v1/messages` requests, gated per model by
+`openai_models.apply_claude_effort` so an unsupported model (Haiku, Sonnet ≤4.5) is never
+sent a value that would 400. Dropdown order is the catalogue rank (cost/generation desc).
 
 Codex quota is spent on reasoning tokens produced × model tier, not on context size — see
 [ADR 0007](adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).

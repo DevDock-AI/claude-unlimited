@@ -51,6 +51,13 @@ PREVIOUS_APP_DIR = INSTALL_ROOT / "app.previous"
 import os as _os
 VENV_PYTHON = INSTALL_ROOT / "venv" / ("Scripts" if _os.name == "nt" else "bin") / (
     "python.exe" if _os.name == "nt" else "python")
+# Where the venv's own console scripts land (pip generates one per name in
+# pyproject [project.scripts] — `claude-unlimited` AND `cu`).
+VENV_SCRIPTS = INSTALL_ROOT / "venv" / ("Scripts" if _os.name == "nt" else "bin")
+# Where the user-facing launchers live, mirroring install.sh / install.ps1.
+BIN_DIR = Path.home() / ".local" / "bin"
+# The command names this project exposes; both run claude_unlimited.cli:main.
+CLI_NAMES = ("claude-unlimited", "cu")
 
 NETWORK_TIMEOUT_SECONDS = 20
 SUBPROCESS_TIMEOUT_SECONDS = 300
@@ -163,9 +170,69 @@ def stage_release(release: Release, destination: Path, *, runner: Callable = sub
     return destination
 
 
+def _ensure_windows_alias() -> None:
+    """Windows has no symlinks we can rely on; install.ps1 drops a
+    `claude-unlimited.cmd` launcher in %LOCALAPPDATA%\\Microsoft\\WindowsApps
+    (always on PATH). Mirror it to `cu.cmd` so the short name works too — both
+    launchers differ only in which generated .exe they prefer, and both fall
+    back to `-m claude_unlimited`."""
+    windows_apps = Path(_os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps"
+    src = windows_apps / "claude-unlimited.cmd"
+    if not src.exists():
+        return
+    try:
+        text = src.read_text(encoding="ascii", errors="ignore")
+        (windows_apps / "cu.cmd").write_text(
+            text.replace("claude-unlimited.exe", "cu.exe"), encoding="ascii")
+    except OSError:
+        pass
+
+
+def ensure_cli_aliases(*, venv_scripts: Path = VENV_SCRIPTS, bin_dir: Path = BIN_DIR) -> None:
+    """Make every CLI_NAMES launcher reachable, self-healing an install that
+    predates a name being added.
+
+    The `cu` alias shipped in 1.2.6, but install.sh only ever symlinked
+    `claude-unlimited` and the updater relinked nothing — so existing installs
+    pip-regenerated `venv/bin/cu` on update yet never got `~/.local/bin/cu`,
+    and `cu` stayed 'command not found' no matter how many times someone
+    updated. Running this on every install closes that gap for both names."""
+    if _os.name == "nt":
+        _ensure_windows_alias()
+        return
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    for name in CLI_NAMES:
+        target = venv_scripts / name
+        if not target.exists():
+            continue  # pip didn't generate it (e.g. an old release predating the name)
+        link = bin_dir / name
+        try:
+            if link.is_symlink():
+                if link.resolve() == target.resolve():
+                    continue  # already correct
+                # Only ever replace a link that points into OUR install. `cu`
+                # is a common personal alias / real binary name — never clobber
+                # a foreign symlink, and never touch a regular file we didn't
+                # create. (Replacing our own stale link is fine.)
+                try:
+                    if not str(link.resolve()).startswith(str(INSTALL_ROOT)):
+                        continue
+                except OSError:
+                    continue  # dangling/foreign symlink — leave it alone
+                link.unlink()
+            elif link.exists():
+                continue  # a real file named `cu`/`claude-unlimited` that isn't ours
+            link.symlink_to(target)
+        except OSError:
+            pass  # a launcher we couldn't write is not worth failing an update over
+
+
 def install_staged(staged: Path, *, runner: Callable = subprocess.run,
                    app_dir: Path = APP_DIR, previous_dir: Path = PREVIOUS_APP_DIR,
-                   venv_python: Path = VENV_PYTHON) -> None:
+                   venv_python: Path = VENV_PYTHON, bin_dir: Path = BIN_DIR) -> None:
     """Installs an already-verified tree, keeping the old one to roll back to.
 
     The new code is proven importable before the old copy is released, so a
@@ -200,6 +267,11 @@ def install_staged(staged: Path, *, runner: Callable = subprocess.run,
     if check.returncode != 0:
         _roll_back(f"The new version could not be imported, rolled back: "
                     f"{(check.stderr or '').strip()[:200]}")
+
+    # pip regenerated the venv's console scripts above; make sure every CLI
+    # name is reachable from the user's bin dir. Best-effort — a launcher we
+    # can't write must never fail or roll back an otherwise-good update.
+    ensure_cli_aliases(venv_scripts=venv_python.parent, bin_dir=bin_dir)
 
 
 STAGING_DIR = INSTALL_ROOT / "staged-update"

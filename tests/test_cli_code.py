@@ -250,3 +250,28 @@ def test_a_user_supplied_settings_flag_still_wins(monkeypatch, tmp_path):
     from claude_unlimited import cli
     _routing_env(monkeypatch)
     assert cli._status_line_args(4317, ["--settings", "mine.json"]) == []
+
+
+def test_codex_picker_reflects_saved_list_and_unsets_removed_tiers(monkeypatch):
+    """The /model labels come from the saved parity list: a row matches its
+    tier by FAMILY (so a dated id still labels the slot), and a family the
+    user removed leaves that tier's env unset rather than a stale default."""
+    from claude_unlimited import cli
+    from claude_unlimited.config import Profile
+    import os
+    _clear(monkeypatch)
+    monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **k: {
+        "claude-fable-5-1-20260101": ("Fable 5.1 | GPT-6 Astra", "high"),  # dated id
+        "claude-opus-5": ("Opus 5 | GPT-5.6 Terra", "high"),
+    })
+    cli._apply_model_labels(
+        Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
+        [], host="h", port=1, token="t")
+
+    # Fable labelled via family match; the tier id stays the native default.
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
+    assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "Opus 5 | GPT-5.6 Terra"
+    # Sonnet and Haiku are not in the saved list -> left unset.
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" not in os.environ
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME" not in os.environ

@@ -9,8 +9,8 @@ The tiering is best-effort, matched by price/role parity between the Codex
 model catalog and Anthropic's published pricing; neither vendor documents an
 equivalence. The tiers are deliberately conservative, because Codex quota is
 spent on reasoning output weighted by model tier — not on the size of the
-request (docs/adr/0007). `gpt-5.6-sol` is the expensive one and is reserved
-for the top Claude tier; everything below it runs on a cheaper model, so an
+request (docs/adr/0007). `gpt-6-astra` is the flagship and is reserved for the
+top Claude tier (Fable); everything below it runs on a cheaper model, so an
 ordinary session does not sit on the most expensive target by default.
 Raising a row here raises what a session costs, so treat it as a spending
 decision — which is exactly why a catalogue refresh NEVER changes what a
@@ -34,6 +34,57 @@ from .model_catalogue import Catalogue, base_id
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
+# Claude-side reasoning effort — the `output_config.effort` knob on the Messages
+# API (GA, no beta header). A DIFFERENT set from the Codex side above: Claude
+# has no "minimal"/"ultra". A parity row's claude_effort, when set, is injected
+# onto oauth/api-served /v1/messages requests for that model (see proxy.py);
+# unset = passthrough (Claude Code's own choice), which is the zero-risk default.
+CLAUDE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_CLAUDE_EFFORT_RANK = {e: i for i, e in enumerate(CLAUDE_REASONING_EFFORTS)}
+
+
+def _clamp_effort(effort: str, ceiling: str) -> str:
+    if _CLAUDE_EFFORT_RANK.get(effort, 0) <= _CLAUDE_EFFORT_RANK[ceiling]:
+        return effort
+    return ceiling
+
+
+def apply_claude_effort(model_id: str, requested: Optional[str]) -> Optional[str]:
+    """The output_config.effort value to actually send for `model_id` given a
+    row's requested level — or None to SKIP injection entirely.
+
+    output_config.effort support is per-model and UPSTREAM-COUPLED (keep in
+    sync with the Messages API — see the Claude Code upstream-watch note). We
+    are deliberately conservative: an unknown family/version, or a model that
+    rejects the knob (Haiku, Sonnet <= 4.5), returns None so we never inject a
+    value that would 400 every request. Where a model supports `max` but not
+    `xhigh` (Opus/Sonnet 4.6) an `xhigh` request is clamped to `high`; where a
+    model supports only low/medium/high (Opus 4.5) higher requests clamp down.
+    thinking.budget_tokens is NOT used — it is removed (400) on this lineup."""
+    if requested not in CLAUDE_REASONING_EFFORTS:
+        return None
+    base = base_id(model_id).lower()
+    if "haiku" in base:
+        return None
+    if "fable" in base or "mythos" in base:
+        return requested  # top tier: full range
+    ver = model_catalogue._version_of(base)
+    if "opus" in base:
+        if ver >= 4.7:
+            return requested
+        if ver >= 4.6:
+            return "high" if requested == "xhigh" else requested  # all but xhigh
+        if ver >= 4.5:
+            return _clamp_effort(requested, "high")               # low/medium/high
+        return None
+    if "sonnet" in base:
+        if ver >= 5:
+            return requested
+        if ver >= 4.6:
+            return "high" if requested == "xhigh" else requested  # all but xhigh
+        return None                                               # <= 4.5 rejects it
+    return None  # unknown family: don't risk a 400
+
 
 @dataclass(frozen=True)
 class OpenAIModelTarget:
@@ -43,7 +94,7 @@ class OpenAIModelTarget:
 
 # Ordered most-capable-first — used only for the substring-match fallback below.
 _MODEL_MAP: dict[str, OpenAIModelTarget] = {
-    "claude-fable-5": OpenAIModelTarget("gpt-5.6-sol", "high"),
+    "claude-fable-5": OpenAIModelTarget("gpt-6-astra", "high"),
     "claude-opus-5": OpenAIModelTarget("gpt-5.6-terra", "high"),
     "claude-sonnet-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
     "claude-haiku-4-5-20251001": OpenAIModelTarget("gpt-5.6-luna", "low"),
@@ -58,7 +109,7 @@ _DEFAULT_TARGET = OpenAIModelTarget("gpt-5.6-terra", "medium")
 # been updated for). Checked in order, first match wins, before
 # _DEFAULT_TARGET.
 _FAMILY_FALLBACKS: list[tuple[str, OpenAIModelTarget]] = [
-    ("claude-fable", OpenAIModelTarget("gpt-5.6-sol", "high")),
+    ("claude-fable", OpenAIModelTarget("gpt-6-astra", "high")),
     ("claude-opus", OpenAIModelTarget("gpt-5.6-terra", "high")),
     ("claude-sonnet", OpenAIModelTarget("gpt-5.6-terra", "medium")),
     ("claude-haiku", OpenAIModelTarget("gpt-5.6-luna", "low")),
@@ -119,13 +170,13 @@ def effective_model_map(catalogue: Optional[Catalogue] = None) -> dict[str, Open
 
 def map_model(requested_claude_model: Optional[str], *, override_model: Optional[str] = None,
               override_reasoning_effort: Optional[str] = None,
-              parity: Optional[dict] = None,
+              parity=None,
               catalogue: Optional[Catalogue] = None) -> OpenAIModelTarget:
     """Resolves what to send to OpenAI for a given incoming Claude model id.
 
     Precedence, narrowest first: a per-Profile override
     (Profile.codex_model / codex_reasoning_effort) beats the user's parity
-    map, which beats the built-in table. Model and effort are independent at
+    list, which beats the built-in table. Model and effort are independent at
     every level, so overriding only the model keeps the effort this model
     would otherwise have used."""
     mapped = _resolve(requested_claude_model, parity, catalogue)
@@ -143,49 +194,169 @@ def map_model(requested_claude_model: Optional[str], *, override_model: Optional
     return base
 
 
-def _resolve(requested_claude_model: Optional[str],
-             parity: Optional[dict] = None,
-             catalogue: Optional[Catalogue] = None) -> OpenAIModelTarget:
-    effective = effective_model_map(catalogue)
+# The four families the default parity list is seeded from, most-capable-first.
+_DEFAULT_FAMILIES = ("claude-fable", "claude-opus", "claude-sonnet", "claude-haiku")
+
+
+def _curated_fallback(requested_claude_model: Optional[str],
+                      cat: Optional[Catalogue]) -> OpenAIModelTarget:
+    """The built-in Claude->Codex target for a model, ignoring the user's
+    parity list. Exact id -> dated/undated base -> family prefix -> default."""
+    effective = effective_model_map(cat)
     if not requested_claude_model:
-        return _apply_parity(_DEFAULT_TARGET, parity, None)
+        return _DEFAULT_TARGET
     if requested_claude_model in effective:
-        return _apply_parity(effective[requested_claude_model], parity, requested_claude_model)
-    # A dated spelling of a model the table carries undated (or vice versa)
-    # is the same model, and must land on the same row a parity override or
-    # the Dashboard table would use.
+        return effective[requested_claude_model]
     base = base_id(requested_claude_model)
     for row_id, target in effective.items():
         if base_id(row_id) == base:
-            return _apply_parity(target, parity, row_id)
+            return target
     lowered = requested_claude_model.lower()
     for prefix, target in _FAMILY_FALLBACKS:
         if prefix in lowered:
-            # Keyed on the canonical id the family resolves to, so an override
-            # for "claude-opus-5" also covers a dated Opus id.
-            canonical = next((c for c, t in _MODEL_MAP.items() if t == target), None)
-            return _apply_parity(target, parity, canonical)
-    return _apply_parity(_DEFAULT_TARGET, parity, None)
+            return target
+    return _DEFAULT_TARGET
 
 
-def _apply_parity(target: OpenAIModelTarget, parity: Optional[dict],
-                  claude_id: Optional[str]) -> OpenAIModelTarget:
-    """Overlays a user-configured row onto the built-in mapping.
+def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
+    """The parity list a fresh install (or a Reset) starts from: one row per
+    family in _DEFAULT_FAMILIES, each the highest-ranked model of that family
+    with its curated Codex target. With the vendored catalogue this is exactly
+    claude-fable-5-1 / claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5 —
+    the same ids cli.py's _MODEL_TIER_IDS use, so the /model picker relabels
+    the native tiers instead of duplicating them. No catalogue -> the 4
+    _MODEL_MAP literals."""
+    cat = _catalogue_or_current(catalogue)
+    rows: list[dict] = []
+    if cat is not None and cat.anthropic:
+        for family in _DEFAULT_FAMILIES:
+            members = [m for m in cat.anthropic if base_id(m.id).lower().startswith(family)]
+            if not members:
+                continue
+            # The family's "main" model is the NEWEST version, not the
+            # highest-priced — LiteLLM sometimes prices an older point release
+            # above the flagship, which would otherwise seed Sonnet 4.6 instead
+            # of Sonnet 5. Ties keep catalogue (cost-desc) order via max()'s
+            # first-max rule.
+            head = max(members, key=lambda m: model_catalogue._version_of(m.id)).id
+            target = _curated_fallback(head, cat)
+            rows.append({"claude_model": head, "model": target.model,
+                         "effort": target.reasoning_effort, "claude_effort": None})
+    if not rows:
+        for claude_id, target in _MODEL_MAP.items():
+            rows.append({"claude_model": claude_id, "model": target.model,
+                         "effort": target.reasoning_effort, "claude_effort": None})
+    return rows
 
-    Model and effort are independent, so overriding one keeps the shipped
-    default for the other — the same rule the per-Profile overrides follow."""
-    if not parity or not claude_id:
-        return target
-    row = parity.get(claude_id)
-    if not isinstance(row, dict):
-        return target
-    return OpenAIModelTarget(row.get("model") or target.model,
-                             row.get("effort") or target.reasoning_effort)
+
+def normalize_parity(raw, catalogue: Optional[Catalogue] = None) -> list[dict]:
+    """The parity list actually in force, as an ordered list of complete rows
+    ({claude_model, model, effort, claude_effort}).
+
+    Accepts every shape the config has ever stored, so old files and export
+    bundles keep working without a migration pass on load:
+      * a list -> each row with model/effort filled from the curated default
+        for that Claude id when absent;
+      * a non-empty legacy sparse dict {claude_id: {model,effort}} -> the
+        default rows with those overlays applied (matched by base id), plus a
+        row appended for any dict key outside the defaults;
+      * {} / [] / None -> the default rows (never "advertise nothing", which
+        would give Claude Code an empty /v1/models).
+    """
+    cat = _catalogue_or_current(catalogue)
+    defaults = default_parity_rows(cat)
+    if isinstance(raw, list):
+        rows: list[dict] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            claude_id = entry.get("claude_model")
+            if not claude_id:
+                continue
+            fallback = _curated_fallback(claude_id, cat)
+            rows.append({
+                "claude_model": claude_id,
+                "model": entry.get("model") or fallback.model,
+                "effort": entry.get("effort") or fallback.reasoning_effort,
+                "claude_effort": entry.get("claude_effort") or None,
+            })
+        return rows or defaults
+    if isinstance(raw, dict) and raw:
+        rows = [dict(row) for row in defaults]
+        by_base = {base_id(row["claude_model"]): row for row in rows}
+        for claude_id, overlay in raw.items():
+            if not isinstance(overlay, dict):
+                continue
+            row = by_base.get(base_id(claude_id))
+            if row is not None:
+                if overlay.get("model"):
+                    row["model"] = overlay["model"]
+                if overlay.get("effort"):
+                    row["effort"] = overlay["effort"]
+                if overlay.get("claude_effort"):
+                    row["claude_effort"] = overlay["claude_effort"]
+            else:
+                fallback = _curated_fallback(claude_id, cat)
+                rows.append({
+                    "claude_model": claude_id,
+                    "model": overlay.get("model") or fallback.model,
+                    "effort": overlay.get("effort") or fallback.reasoning_effort,
+                    "claude_effort": overlay.get("claude_effort") or None,
+                })
+        return rows
+    return defaults
+
+
+def _match_row(rows: list[dict], requested_claude_model: str) -> Optional[dict]:
+    """The parity row that governs a requested model: exact id, then
+    dated/undated base id, then family prefix."""
+    for row in rows:
+        if row["claude_model"] == requested_claude_model:
+            return row
+    base = base_id(requested_claude_model)
+    for row in rows:
+        if base_id(row["claude_model"]) == base:
+            return row
+    lowered = requested_claude_model.lower()
+    for family in _DEFAULT_FAMILIES:
+        if family in lowered:
+            for row in rows:
+                if base_id(row["claude_model"]).lower().startswith(family):
+                    return row
+    return None
+
+
+def _resolve(requested_claude_model: Optional[str], parity=None,
+             catalogue: Optional[Catalogue] = None) -> OpenAIModelTarget:
+    cat = _catalogue_or_current(catalogue)
+    if requested_claude_model:
+        row = _match_row(normalize_parity(parity, cat), requested_claude_model)
+        if row is not None:
+            return OpenAIModelTarget(row["model"], row["effort"])
+    # Not in the saved list (or no model requested): fall back to the built-in
+    # curated target so a typed-but-unlisted id still routes sanely.
+    return _curated_fallback(requested_claude_model, cat)
+
+
+def claude_effort_for(requested_claude_model: Optional[str], parity=None,
+                      catalogue: Optional[Catalogue] = None) -> Optional[str]:
+    """The output_config.effort to inject for an oauth/api-served request, or
+    None to leave the request untouched. Matches the requested model to a
+    parity row, then runs the row's claude_effort through the per-model support
+    gate (apply_claude_effort)."""
+    if not requested_claude_model:
+        return None
+    cat = _catalogue_or_current(catalogue)
+    row = _match_row(normalize_parity(parity, cat), requested_claude_model)
+    if row is None:
+        return None
+    return apply_claude_effort(requested_claude_model, row.get("claude_effort"))
 
 
 # Display names for the OpenAI models this mapping can target. Only used to
 # label the /v1/models listing a codex Profile serves — never sent upstream.
 _OPENAI_DISPLAY_NAMES: dict[str, str] = {
+    "gpt-6-astra": "GPT-6 Astra",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
     "gpt-5.6-luna": "GPT-5.6 Luna",
@@ -198,7 +369,7 @@ _OPENAI_DISPLAY_NAMES: dict[str, str] = {
 # account"). Rather than hardcode one id per tier and fail hard when it goes
 # away, a rejected model walks down this ladder, so the pool keeps working as
 # long as any one model in it is still served.
-_MODEL_LADDER: tuple[str, ...] = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+_MODEL_LADDER: tuple[str, ...] = ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 
 
 def model_ladder(catalogue: Optional[Catalogue] = None) -> list[str]:
@@ -264,52 +435,31 @@ def _openai_label(model_id: str, cat: Optional[Catalogue]) -> str:
     return model_id
 
 
-def automatic_mapping(parity: Optional[dict] = None,
+def automatic_mapping(parity=None,
                       catalogue: Optional[Catalogue] = None) -> list[dict]:
-    """The mapping table the Dashboard shows when a codex Profile is left on
-    automatic.
+    """The parity table the Dashboard renders — one entry per SAVED row (the
+    explicit list the user edits), in order.
 
-    Derived from _MODEL_MAP rather than restated in the page, because it was
-    restated there once and silently went stale the first time the mapping
-    changed — the modal kept advertising a model and effort the bridge had
-    stopped using."""
+    Each row also carries the built-in default for its Claude model, so the
+    UI can show what a Reset would restore and mark a row as overridden."""
     cat = _catalogue_or_current(catalogue)
     rows = []
-    for claude_id, target in effective_model_map(cat).items():
-        effective = _apply_parity(target, parity, claude_id)
+    for row in normalize_parity(parity, cat):
+        claude_id = row["claude_model"]
+        default = _curated_fallback(claude_id, cat)
         rows.append({
             "claude_model": claude_id,
             "claude_label": _claude_label(claude_id, cat),
-            "openai_model": effective.model,
-            "reasoning_effort": effective.reasoning_effort,
-            "default_model": target.model,
-            "default_effort": target.reasoning_effort,
-            "overridden": effective != target,
+            "openai_model": row["model"],
+            "reasoning_effort": row["effort"],
+            "claude_effort": row.get("claude_effort"),
+            "default_model": default.model,
+            "default_effort": default.reasoning_effort,
+            "overridden": (row["model"] != default.model
+                           or row["effort"] != default.reasoning_effort
+                           or bool(row.get("claude_effort"))),
         })
     return rows
-
-
-def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
-    """Every OpenAI model id the Dashboard may offer in a dropdown.
-
-    Served rather than restated in the page: the mapping table was hardcoded
-    in index.html once and went stale the first time the lineup changed, and a
-    second hardcoded copy in app.js would fail the same way. With a catalogue
-    loaded the current OpenAI chat lineup is offered too, so pinning a
-    Profile to a model this build has never heard of needs no release."""
-    cat = _catalogue_or_current(catalogue)
-    seen = model_ladder(cat)
-    for target in effective_model_map(cat).values():
-        if target.model not in seen:
-            seen.append(target.model)
-    if cat is not None:
-        for model in cat.openai:
-            if model.id not in seen:
-                seen.append(model.id)
-    for extra in _LEGACY_SELECTABLE:
-        if extra not in seen:
-            seen.append(extra)
-    return seen
 
 
 # Older ids that remain selectable for a Profile pinned to one, even though
@@ -317,29 +467,65 @@ def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
 _LEGACY_SELECTABLE: tuple[str, ...] = ("gpt-5.5", "gpt-5.2")
 
 
-def advertised_models(parity: Optional[dict] = None,
+def selectable_models(catalogue: Optional[Catalogue] = None) -> list[str]:
+    """Every OpenAI/Codex model id the Dashboard may offer in a dropdown,
+    ordered most-expensive/most-capable FIRST.
+
+    The order is the catalogue's own rank (model_catalogue._sort_key: OpenAI
+    is generation-then-cost, with the documented o1-pro correction), so the
+    flagship leads and legacy rungs trail. With a catalogue the live OpenAI
+    lineup comes first; the curated ladder rungs and _LEGACY_SELECTABLE are
+    appended so a known-good id is never lost. Without a catalogue this is the
+    ladder (already most-capable-first) then legacy."""
+    cat = _catalogue_or_current(catalogue)
+    seen: list[str] = []
+    if cat is not None:
+        for model in cat.openai:  # already rank-ordered, cost/generation desc
+            if model.id not in seen:
+                seen.append(model.id)
+    for rung in model_ladder(cat):
+        if rung not in seen:
+            seen.append(rung)
+    for target in effective_model_map(cat).values():
+        if target.model not in seen:
+            seen.append(target.model)
+    for extra in _LEGACY_SELECTABLE:
+        if extra not in seen:
+            seen.append(extra)
+    return seen
+
+
+def selectable_claude_models(catalogue: Optional[Catalogue] = None) -> list[dict]:
+    """`[{"id","label"}]` of Claude models a parity row may pick, ordered
+    most-expensive/most-capable first (the catalogue's Anthropic rank:
+    cost-then-version desc). Without a catalogue, the 4 curated tiers."""
+    cat = _catalogue_or_current(catalogue)
+    if cat is not None and cat.anthropic:
+        return [{"id": m.id, "label": _claude_label(m.id, cat)} for m in cat.anthropic]
+    return [{"id": claude_id, "label": _claude_label(claude_id, None)} for claude_id in _MODEL_MAP]
+
+
+def advertised_models(parity=None,
                       catalogue: Optional[Catalogue] = None) -> list[tuple[str, str]]:
     """(model_id, display_name) pairs for the Anthropic-shaped /v1/models
-    listing a codex Profile answers with, newest-capability-first.
+    listing a codex Profile answers with — exactly the SAVED parity rows, in
+    order. This is what the user's `/model` picker offers for Codex-served
+    sessions: the explicit list is the advertised set.
 
-    The ids stay Anthropic-shaped on purpose: Claude Code sends the picked
-    id straight back in /v1/messages and map_model() is keyed on exactly
-    these, so advertising raw OpenAI ids would make every pick fall through
-    to _DEFAULT_TARGET and collapse the tier system onto one model. The
-    display name is where the backing model is surfaced.
-
-    Derived from the effective map so the picker can't drift out of sync
-    with the mapping — and, once a catalogue is loaded, follows the live
-    Claude lineup instead of the literals."""
+    The ids stay Anthropic-shaped on purpose: Claude Code sends the picked id
+    straight back in /v1/messages and map_model() is keyed on exactly these,
+    so advertising raw OpenAI ids would make every pick fall through to
+    _DEFAULT_TARGET. The display name surfaces the backing model (and the
+    Claude-side effort when the row sets one and the model accepts it)."""
     cat = _catalogue_or_current(catalogue)
     out: list[tuple[str, str]] = []
-    for claude_id, target in effective_model_map(cat).items():
-        target = _apply_parity(target, parity, claude_id)
+    for row in normalize_parity(parity, cat):
+        claude_id = row["claude_model"]
         claude_label = _claude_label(claude_id, cat)
-        backing = _openai_label(target.model, cat)
-        # `<anthropic model> | <openai model> · <effort>` so the `/model` picker
-        # in a `cu code` session mirrors the Dashboard's parity table: each row
-        # names both the Claude tier being picked and the OpenAI/Codex model it
-        # actually routes to (effort kept — it's what Codex quota is spent on).
-        out.append((claude_id, f"{claude_label} | {backing} · {target.reasoning_effort}"))
+        backing = _openai_label(row["model"], cat)
+        applied = apply_claude_effort(claude_id, row.get("claude_effort"))
+        lead = f"{claude_label} (effort {applied})" if applied else claude_label
+        # `<claude> | <openai> · <codex effort>` — codex effort stays the LAST
+        # ` · ` segment so cli.py's _fetch_parity_labels keeps parsing it out.
+        out.append((claude_id, f"{lead} | {backing} · {row['effort']}"))
     return out

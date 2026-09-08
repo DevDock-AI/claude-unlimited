@@ -197,3 +197,67 @@ def test_filter_response_headers_only_keeps_allowlist():
         "anthropic-ratelimit-unified-5h-utilization": "0.61",
         "anthropic-ratelimit-unified-5h-reset": "1787191800",
     }
+
+
+# ---- Claude-side reasoning effort injection (output_config.effort) ----
+
+def _body(**kw):
+    base = {"model": "claude-fable-5-1", "messages": []}
+    base.update(kw)
+    return json.dumps(base).encode()
+
+
+def test_claude_effort_is_injected_for_oauth_messages():
+    req = build_upstream_request(oauth_profile(), "tok", "POST", "/v1/messages", {},
+                                 _body(), claude_effort="xhigh")
+    assert json.loads(req.body)["output_config"] == {"effort": "xhigh"}
+    assert req.headers["Content-Length"] == str(len(req.body))
+
+
+def test_claude_effort_is_injected_for_api_messages():
+    req = build_upstream_request(api_profile(), "sk", "POST", "/v1/messages", {},
+                                 _body(), claude_effort="high")
+    assert json.loads(req.body)["output_config"]["effort"] == "high"
+
+
+def test_claude_effort_merges_into_an_existing_output_config():
+    body = _body(output_config={"format": {"type": "json"}})
+    req = build_upstream_request(oauth_profile(), "tok", "POST", "/v1/messages", {},
+                                 body, claude_effort="max")
+    oc = json.loads(req.body)["output_config"]
+    assert oc["effort"] == "max"
+    assert oc["format"] == {"type": "json"}  # existing keys preserved
+
+
+def test_claude_effort_none_leaves_the_body_untouched():
+    body = _body()
+    req = build_upstream_request(oauth_profile(), "tok", "POST", "/v1/messages", {},
+                                 body, claude_effort=None)
+    assert req.body == body
+    assert "output_config" not in json.loads(req.body)
+
+
+def test_claude_effort_is_not_injected_off_the_messages_path():
+    body = _body()
+    req = build_upstream_request(oauth_profile(), "tok", "POST", "/v1/count_tokens", {},
+                                 body, claude_effort="high")
+    assert "output_config" not in json.loads(req.body)
+
+
+def test_claude_effort_and_account_uuid_rewrite_coexist():
+    p = oauth_profile()
+    body = json.dumps({
+        "model": "claude-fable-5-1", "messages": [],
+        "metadata": {"user_id": json.dumps({"account_uuid": "old", "session": "s"})},
+    }).encode()
+    req = build_upstream_request(p, "tok", "POST", "/v1/messages", {}, body, claude_effort="high")
+    parsed = json.loads(req.body)
+    assert parsed["output_config"]["effort"] == "high"
+    assert json.loads(parsed["metadata"]["user_id"])["account_uuid"] == "acct-123"
+    assert json.loads(parsed["metadata"]["user_id"])["session"] == "s"  # preserved
+
+
+def test_claude_effort_passthrough_on_a_non_json_body():
+    req = build_upstream_request(oauth_profile(), "tok", "POST", "/v1/messages", {},
+                                 b"not json", claude_effort="high")
+    assert req.body == b"not json"

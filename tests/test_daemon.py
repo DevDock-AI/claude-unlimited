@@ -62,3 +62,42 @@ def test_unknown_path_is_gated_not_leaked():
             t.join(timeout=2)
     finally:
         server.server_close()
+
+
+def test_an_immediate_auto_install_restarts_on_the_running_port(monkeypatch):
+    """An auto_install that lands while the pool is idle must restart so the new
+    code actually runs — and onto the port the daemon is really serving, not a
+    hardcoded DEFAULT_PORT. Previously only the deferred path restarted."""
+    from claude_unlimited import daemon
+    from claude_unlimited import updater
+    from claude_unlimited.config import Settings
+
+    monkeypatch.setattr(daemon, "_RUNNING_PORT", 4399)
+    monkeypatch.setattr(daemon._gateway, "is_idle", lambda *_a, **_k: True)
+    monkeypatch.setattr(updater, "run_update_cycle",
+                        lambda *a, **k: updater.UpdateOutcome(
+                            release=updater.Release(version="9.9.9", tag="v9.9.9", commit_sha="a"*40, notes=""),
+                            action="installed"))
+    monkeypatch.setattr(daemon, "_record_update_outcome", lambda *a, **k: None)
+    restarted = []
+    monkeypatch.setattr(daemon, "_restart_for_update", lambda port: restarted.append(port))
+
+    daemon._run_update_check(settings=Settings(update_mode="auto_install"), respect_idle=True)
+    assert restarted == [4399]
+
+
+def test_a_manual_check_never_installs_or_restarts(monkeypatch):
+    from claude_unlimited import daemon
+    from claude_unlimited import updater
+    from claude_unlimited.config import Settings
+
+    monkeypatch.setattr(updater, "run_update_cycle",
+                        lambda *a, **k: updater.UpdateOutcome(
+                            release=updater.Release(version="9.9.9", tag="v9.9.9", commit_sha="a"*40, notes=""),
+                            action="available"))
+    monkeypatch.setattr(daemon, "_record_update_outcome", lambda *a, **k: None)
+    restarted = []
+    monkeypatch.setattr(daemon, "_restart_for_update", lambda port: restarted.append(port))
+
+    daemon._run_update_check(settings=Settings(update_mode="manual"), respect_idle=True, mode_override="manual")
+    assert restarted == []

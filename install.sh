@@ -71,13 +71,15 @@ PIP="$INSTALL_ROOT/venv/bin/pip"
 "$PIP" install --upgrade pip -q --no-cache-dir --disable-pip-version-check
 "$PIP" install "$INSTALL_ROOT/app" -q --no-cache-dir --disable-pip-version-check
 
-# Symlink the venv's own console_script (pyproject's [project.scripts]) so the
-# command on PATH always matches what was installed, with its dependency
-# resolved, instead of a wrapper hoping the system python3 has cryptography.
+# Symlink the venv's own console_scripts (pyproject's [project.scripts]) so the
+# commands on PATH always match what was installed, with dependencies resolved,
+# instead of a wrapper hoping the system python3 has cryptography. Both names
+# ship — `claude-unlimited` and the short alias `cu` — so link both.
 ln -sf "$INSTALL_ROOT/venv/bin/claude-unlimited" "$BIN_DIR/claude-unlimited"
+ln -sf "$INSTALL_ROOT/venv/bin/cu" "$BIN_DIR/cu"
 
 echo
-echo "Installed: $BIN_DIR/claude-unlimited"
+echo "Installed: $BIN_DIR/claude-unlimited (also as: cu)"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)

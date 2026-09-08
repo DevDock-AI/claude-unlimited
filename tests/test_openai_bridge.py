@@ -117,7 +117,7 @@ def _sent_model(conn) -> str:
 
 def test_a_rejected_model_falls_back_to_the_next_one(monkeypatch):
     conns = _install_fake_connections(monkeypatch, [
-        _model_error("The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."),
+        _model_error("The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."),
         _ok(),
     ])
     body = json.dumps({"model": "claude-fable-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
@@ -126,13 +126,13 @@ def test_a_rejected_model_falls_back_to_the_next_one(monkeypatch):
     list(result.body_chunks)
 
     assert result.status == 200
-    assert _sent_model(conns[0]) == "gpt-5.6-sol"
-    assert _sent_model(conns[1]) == "gpt-5.6-terra"
+    assert _sent_model(conns[0]) == "gpt-6-astra"       # Fable's default top-tier target
+    assert _sent_model(conns[1]) == "gpt-5.6-sol"       # first rung below it
 
 
 def test_a_working_substitution_is_reused_on_the_next_request(monkeypatch):
     conns = _install_fake_connections(monkeypatch, [
-        _model_error("The model `gpt-5.6-sol` does not exist."), _ok(), _ok(),
+        _model_error("The model `gpt-6-astra` does not exist."), _ok(), _ok(),
     ])
     body = json.dumps({"model": "claude-fable-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
@@ -140,9 +140,10 @@ def test_a_working_substitution_is_reused_on_the_next_request(monkeypatch):
     list(run(_subscription_profile(), _cred(), body).body_chunks)
 
     # The third connection is the second request: it must skip the model
-    # already known to be rejected rather than pay for that failure again.
+    # already known to be rejected (astra) rather than pay for that failure
+    # again — going straight to the learned working substitute.
     assert len(conns) == 3
-    assert _sent_model(conns[2]) == "gpt-5.6-terra"
+    assert _sent_model(conns[2]) == "gpt-5.6-sol"
 
 
 def test_a_non_model_error_is_returned_without_retrying(monkeypatch):
@@ -161,14 +162,15 @@ def test_a_non_model_error_is_returned_without_retrying(monkeypatch):
 
 def test_when_every_model_is_rejected_the_last_error_is_returned(monkeypatch):
     rejection = "model is not supported"
-    conns = _install_fake_connections(monkeypatch, [_model_error(rejection) for _ in range(3)])
+    # Opus maps to gpt-5.6-terra; its full walk is terra -> luna -> astra -> sol.
+    conns = _install_fake_connections(monkeypatch, [_model_error(rejection) for _ in range(4)])
     body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
     result = run(_subscription_profile(), _cred(), body)
     chunks = b"".join(result.body_chunks)
 
     assert result.status == 400
-    assert len(conns) == 3
+    assert len(conns) == 4
     assert b"not supported" in chunks
 
 
@@ -185,7 +187,8 @@ def test_a_retired_profile_override_still_falls_back(monkeypatch):
 
     assert result.status == 200
     assert _sent_model(conns[0]) == "gpt-4o-legacy"
-    assert _sent_model(conns[1]) in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+    # An off-ladder override falls back to the whole ladder, top rung first.
+    assert _sent_model(conns[1]) in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 
 
 def test_run_sends_the_real_confirmed_subscription_endpoint_and_headers(monkeypatch):

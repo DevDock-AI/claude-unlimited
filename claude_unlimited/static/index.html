@@ -445,6 +445,19 @@
   .model-map-table th { color: var(--text-faint); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
   .model-map-table td.mono { color: var(--text); }
   .model-map-table tr:last-child td { border-bottom: none; }
+  /* The parity table's first column is now an editable Claude-model dropdown,
+     not bold static text — let the select-input style stand. */
+  #parityTable td:first-child { font-weight: 400; }
+  #parityTable td:last-child { width: 1%; white-space: nowrap; text-align: right; }
+  .parity-del { display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0; border: 1px solid var(--bad-border);
+    border-radius: 7px; background: var(--bad-soft); color: var(--bad); cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s; }
+  .parity-del svg { width: 15px; height: 15px; }
+  .parity-del:hover { background: var(--bad); color: #fff; border-color: var(--bad); }
+  #parityAddBtn { background: var(--good-soft); color: var(--good); border-color: var(--good);
+    font-weight: 600; transition: background .12s, color .12s; }
+  #parityAddBtn:hover { background: var(--good); color: #05130B; }
 
   .field-group { display: flex; flex-direction: column; gap: 7px; }
   .field-label { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
@@ -1156,19 +1169,24 @@
         </div>
       </div>
       <div class="section-body">
-        <div class="field-sub" data-i18n="settings.parity.desc">Which Codex model and reasoning effort each Claude model maps to. Applies to codex profiles left on Automatic; a profile with its own override keeps using that.</div>
+        <div class="field-sub" data-i18n="settings.parity.desc">The models listed here are exactly what Claude Code's model picker offers for Codex-served sessions. Each row maps a Claude model to a Codex model and reasoning effort; the Claude effort applies when a Claude account serves the request.</div>
         <table class="model-map-table" id="parityTable">
           <thead><tr>
-            <th data-i18n="modal.add_profile.codex_mapping_col_claude">Claude model</th>
+            <th data-i18n="settings.parity.col_claude_model">Claude model</th>
+            <th data-i18n="settings.parity.col_claude_effort">Claude effort</th>
             <th data-i18n="modal.add_profile.codex_mapping_col_openai">OpenAI/Codex model</th>
-            <th data-i18n="modal.add_profile.codex_mapping_col_effort">Reasoning effort</th>
+            <th data-i18n="settings.parity.col_codex_effort">Codex effort</th>
+            <th aria-hidden="true"></th>
           </tr></thead>
           <tbody id="parityRows"></tbody>
         </table>
         <div class="field-row">
-          <div class="field-text">
-            <div class="field-sub" data-i18n="settings.parity.cost_note">Higher tiers and higher effort cost more of a Codex plan's quota.</div>
-          </div>
+          <div class="btn" id="parityAddBtn" data-i18n="settings.parity.add_row">+ Add model</div>
+        </div>
+        <div class="field-sub" data-i18n="settings.parity.cost_note">Higher tiers and higher effort cost more of a Codex plan's quota.</div>
+        <div class="field-sub" data-i18n="settings.parity.picker_note">Claude Code's picker can relabel at most the four standard tiers (Fable, Opus, Sonnet, Haiku); extra rows are served and usable by id, but may not appear in the picker. Restart your <code>cu code</code> session to refresh the picker.</div>
+        <div class="field-row">
+          <div class="field-text"></div>
           <div class="btn primary" id="paritySaveBtn" data-i18n="settings.parity.save">Save</div>
         </div>
       </div>
@@ -1381,7 +1399,7 @@
     <div class="topbar">
       <div>
         <div class="page-title" data-i18n="nav.help">Help</div>
-        <div class="page-sub" data-i18n="help.subtitle">Every command claude-unlimited supports, run from a terminal — or the short alias cu</div>
+        <div class="page-sub" data-i18n="help.subtitle">Every command cu supports, run from a terminal (claude-unlimited works too)</div>
       </div>
     </div>
 
@@ -1392,7 +1410,7 @@
       <div class="section-body">
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-doctor">claude-unlimited doctor</code>
+            <code id="cmd-doctor">cu doctor</code>
             <div class="copy-btn" data-copy-target="cmd-doctor">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1403,7 +1421,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-add-account">claude-unlimited add-account</code>
+            <code id="cmd-add-account">cu add-account</code>
             <span class="cmd-optional">(alias: ac)</span>
             <div class="copy-btn" data-copy-target="cmd-add-account">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -1415,7 +1433,8 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-add-codex-account">claude-unlimited add-codex-account</code>
+            <code id="cmd-add-codex-account">cu add-codex-account</code>
+            <span class="cmd-optional">(alias: aca)</span>
             <div class="copy-btn" data-copy-target="cmd-add-codex-account">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1426,7 +1445,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-reauth">claude-unlimited reauth</code>
+            <code id="cmd-reauth">cu reauth</code>
             <div class="copy-btn" data-copy-target="cmd-reauth">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1437,7 +1456,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-start">claude-unlimited start</code>
+            <code id="cmd-start">cu start</code>
             <span class="cmd-optional">[--port PORT]</span>
             <div class="copy-btn" data-copy-target="cmd-start">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -1456,7 +1475,7 @@
       <div class="section-body">
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-code">claude-unlimited code</code>
+            <code id="cmd-code">cu code</code>
             <span class="cmd-optional">[--profile &lt;name&gt;] [-- claude args]</span>
             <div class="copy-btn" data-copy-target="cmd-code">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -1468,7 +1487,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-desktop">claude-unlimited desktop</code>
+            <code id="cmd-desktop">cu desktop</code>
             <div class="copy-btn" data-copy-target="cmd-desktop">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1479,7 +1498,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-status">claude-unlimited status</code>
+            <code id="cmd-status">cu status</code>
             <div class="copy-btn" data-copy-target="cmd-status">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1498,7 +1517,7 @@
       <div class="section-body">
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-install">claude-unlimited install</code>
+            <code id="cmd-install">cu install</code>
             <span class="cmd-optional">[--port PORT]</span>
             <div class="copy-btn" data-copy-target="cmd-install">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -1510,7 +1529,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-uninstall">claude-unlimited uninstall</code>
+            <code id="cmd-uninstall">cu uninstall</code>
             <div class="copy-btn" data-copy-target="cmd-uninstall">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1521,7 +1540,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-service-start">claude-unlimited service-start</code>
+            <code id="cmd-service-start">cu service-start</code>
             <div class="copy-btn" data-copy-target="cmd-service-start">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1532,7 +1551,7 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-service-stop">claude-unlimited service-stop</code>
+            <code id="cmd-service-stop">cu service-stop</code>
             <div class="copy-btn" data-copy-target="cmd-service-stop">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1543,7 +1562,7 @@
 
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-restart">claude-unlimited restart</code>
+            <code id="cmd-restart">cu restart</code>
             <div class="copy-btn" data-copy-target="cmd-restart">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1554,7 +1573,7 @@
 
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-purge">claude-unlimited purge</code>
+            <code id="cmd-purge">cu purge</code>
             <div class="copy-btn" data-copy-target="cmd-purge">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1576,7 +1595,7 @@
         <div class="field-label" data-i18n="help.desktop.auto_title">Automatic (recommended)</div>
         <div class="cmd-row">
           <div class="code-row">
-            <code id="cmd-desktop2">claude-unlimited desktop</code>
+            <code id="cmd-desktop2">cu desktop</code>
             <div class="copy-btn" data-copy-target="cmd-desktop2">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
@@ -1610,7 +1629,7 @@
         <div class="divider"></div>
         <div class="field-sub" data-i18n="help.desktop.note_signin"><b>Note:</b> third-party mode runs from a separate app profile with its own session, so you may be asked to sign in again. Your normal Claude setup is not affected.</div>
         <div class="field-sub" data-i18n="help.desktop.note_profile"><b>Note:</b> enable at least one profile here first, or the app's "Test connection" fails with "No eligible Profile available" — which looks like a configuration error but is not.</div>
-        <div class="field-sub" data-i18n="help.desktop.note_revert">To undo everything and put the app back as it was, run <span class="mono">claude-unlimited desktop --revert</span>.</div>
+        <div class="field-sub" data-i18n="help.desktop.note_revert">To undo everything and put the app back as it was, run <span class="mono">cu desktop --revert</span>.</div>
       </div>
     </div>
 
@@ -1645,7 +1664,7 @@
           <div class="type-card sel" data-type-card="oauth">
             <div class="type-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg></div>
             <div class="type-name" data-i18n="modal.add_profile.kind_oauth">Claude subscription</div>
-            <div class="type-desc" data-i18n="modal.add_profile.type_oauth_desc">Use Import below, or claude-unlimited add-account from the terminal</div>
+            <div class="type-desc" data-i18n="modal.add_profile.type_oauth_desc">Use Import below, or cu add-account from the terminal</div>
           </div>
           <div class="type-card" data-type-card="import">
             <div class="type-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v13m0 0-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></div>
@@ -1689,7 +1708,7 @@
           <div class="field-label" data-i18n="modal.add_profile.oauth_pane_label">Add a Claude subscription account</div>
           <div class="cmd-row">
             <div class="code-row">
-              <code id="cmd-add-account-modal">claude-unlimited add-account</code>
+              <code id="cmd-add-account-modal">cu add-account</code>
               <span class="cmd-optional">(alias: ac)</span>
               <div class="copy-btn" data-copy-target="cmd-add-account-modal">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -1706,7 +1725,8 @@
           <div class="field-label" data-i18n="modal.add_profile.codex_pane_label">Add a ChatGPT subscription account</div>
           <div class="cmd-row">
             <div class="code-row">
-              <code id="cmd-add-codex-account-modal">claude-unlimited add-codex-account</code>
+              <code id="cmd-add-codex-account-modal">cu add-codex-account</code>
+              <span class="cmd-optional">(alias: aca)</span>
               <div class="copy-btn" data-copy-target="cmd-add-codex-account-modal">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
                 <span data-i18n="settings.network.copy">Copy</span>

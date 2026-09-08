@@ -78,6 +78,10 @@ def resolve_base_url(profile: Profile) -> str:
     return (profile.base_url or ANTHROPIC_DEFAULT_BASE_URL).rstrip("/")
 
 
+def _is_messages_path(path: str) -> bool:
+    return path.rstrip("/").endswith("/v1/messages")
+
+
 def build_upstream_request(
     profile: Profile,
     credential: str,
@@ -85,7 +89,15 @@ def build_upstream_request(
     path: str,
     inbound_headers: dict[str, str],
     inbound_body: bytes,
+    *,
+    claude_effort: Optional[str] = None,
 ) -> UpstreamRequest:
+    """`claude_effort`, when given, is written to `output_config.effort` on a
+    /v1/messages body for oauth- and api-kind Profiles — the Claude side of a
+    parity row's reasoning effort. It is the caller's job (gateway) to resolve
+    it against the request's model and the per-model support gate
+    (openai_models.claude_effort_for), so this module never guesses and stays
+    free of a model-catalogue dependency. None = leave the body untouched."""
     if len(inbound_body) > 20_000_000:  # 20MB: generous, but not unbounded
         raise ValueError("request body too large to proxy")
 
@@ -99,14 +111,38 @@ def build_upstream_request(
         headers["x-api-key"] = credential
 
     body = inbound_body
-    if profile.kind == "oauth" and profile.account_uuid and path.rstrip("/").endswith("/v1/messages") and inbound_body:
-        body = _rewrite_account_uuid(inbound_body, profile.account_uuid)
+    if profile.kind == "oauth" and profile.account_uuid and _is_messages_path(path) and inbound_body:
+        body = _rewrite_account_uuid(body, profile.account_uuid)
+    if claude_effort and profile.kind in ("oauth", "api") and _is_messages_path(path) and body:
+        body = _inject_output_effort(body, claude_effort)
 
     if body is not inbound_body:
         headers["Content-Length"] = str(len(body))
 
     base_url = resolve_base_url(profile)
     return UpstreamRequest(url=f"{base_url}{path}", method=method, headers=headers, body=body)
+
+
+def _inject_output_effort(body: bytes, effort: str) -> bytes:
+    """Set `output_config.effort` on a Messages request, MERGING into any
+    existing output_config (never clobbering a structured-output config). The
+    body is passed through untouched if it isn't a JSON object or can't be
+    re-serialized — a reasoning-effort nicety must never fail a real request."""
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(parsed, dict):
+        return body
+    output_config = parsed.get("output_config")
+    if not isinstance(output_config, dict):
+        output_config = {}
+    output_config["effort"] = effort
+    parsed["output_config"] = output_config
+    try:
+        return json.dumps(parsed).encode("utf-8")
+    except (TypeError, ValueError):
+        return body
 
 
 def _rewrite_account_uuid(body: bytes, account_uuid: str) -> bytes:
