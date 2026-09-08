@@ -47,6 +47,7 @@ from . import connection_test
 from . import daemon_installer
 from . import export_import
 from . import i18n
+from . import model_catalogue
 from . import notifications
 from . import openai_models
 from . import openai_observation
@@ -560,6 +561,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         if not path.startswith("/api/"):
             self._handle_proxy_request("POST", path)
+            return
+
+        if path == "/api/models/refresh":
+            # CSRF-exempt like GET /api/session-token above: fired by
+            # `claude-unlimited code` at session launch, a CLI process with
+            # no CSRF token to present. Safe without one: it takes no input,
+            # changes no user-visible state, and the refresh it schedules is
+            # throttled (one sha check per 5 min) and backed off hard in
+            # model_catalogue, so the worst a forged cross-site POST can do
+            # is a catalogue check that was about to happen anyway. The
+            # thread returns this response immediately — a `code` launch
+            # must never wait on GitHub.
+            threading.Thread(target=model_catalogue.refresh_if_allowed,
+                             daemon=True, name="model-catalogue-session-refresh").start()
+            self._send_json(202, {"status": "scheduled"})
             return
 
         if not self._check_csrf():
@@ -1408,6 +1424,20 @@ def _update_check_loop() -> None:
                 _install_deferred_update_if_idle()
         except Exception:
             pass
+        # Its OWN step, deliberately not inside run_update_cycle(): that
+        # function returns early on every no-op path (no release, not
+        # newer, offline), so a refresh hooked inside it would almost never
+        # run (docs/tickets/007, constraint 1). This is the hourly
+        # BASELINE: refresh_if_due() is a timestamp comparison until an
+        # hour has passed, then a ~1 KB sha check that downloads the real
+        # file only when the sha changed, and backs off hard on failure or
+        # rate limiting — calling it every tick is cheap and can never turn
+        # into request spam. Session launches may refresh sooner via
+        # POST /api/models/refresh (see do_POST).
+        try:
+            model_catalogue.refresh_if_due()
+        except Exception:
+            pass
         time.sleep(_UPDATE_IDLE_RECHECK_SECONDS)
         since_last_check += _UPDATE_IDLE_RECHECK_SECONDS
 
@@ -1433,6 +1463,11 @@ def _oauth_refresh_loop() -> None:
 
 def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
     server = make_server(host, port)
+    # Offline load (cache, else vendored snapshot) — synchronous but reads
+    # one small local file, so startup never waits on the network. No fetch
+    # happens here at all: refreshing is driven by `code` session launches
+    # (POST /api/models/refresh) and the hourly update-loop tick.
+    model_catalogue.initialize()
     threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
     print(f"CSRF token for this run (Dashboard needs it, never logged again): {_CSRF_TOKEN}")

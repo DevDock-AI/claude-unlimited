@@ -2096,7 +2096,17 @@ function setupSelectInput(el, options, onChange) {
 }
 
 document.addEventListener('click', () => closeAllSelectPops());
-document.addEventListener('scroll', () => closeAllSelectPops(), true);
+// Capture-phase so a PAGE scroll dismisses the position:fixed popup (which
+// would otherwise detach from its trigger). But the popup's own list is
+// scrollable (max-height:260px; overflow:auto) — a scroll originating INSIDE
+// it must scroll the list, not close it. Without this guard a long lineup
+// (e.g. the catalogue's ~20 OpenAI models) was unreachable: any wheel over the
+// popup closed it before you could reach the lower options.
+document.addEventListener('scroll', (e) => {
+  const t = e.target;
+  if (t && t.nodeType === 1 && t.closest && t.closest('.select-pop')) return;
+  closeAllSelectPops();
+}, true);
 window.addEventListener('resize', () => closeAllSelectPops());
 
 // ---- Settings ----

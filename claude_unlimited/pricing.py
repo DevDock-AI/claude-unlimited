@@ -1,14 +1,23 @@
-"""Approximate cost calculation from published Anthropic API pricing
-(standard, non-batch rates). PRICING_SOURCE and PRICING_FETCHED below record
-where the table came from and when. Prices change and this table can go
-stale, so any cost figure shown must be labeled an estimate; Anthropic's own
-billing is the only authoritative record of what was charged.
+"""Approximate cost calculation, sourced from the model catalogue with the
+literal table below as fallback (docs/tickets/007, stage 2).
+
+Rates come first from model_catalogue.current(), which is itself a chain
+(live LiteLLM fetch -> disk cache -> vendored snapshot); a model the
+catalogue doesn't carry — retired families past their deprecation date, or
+any run where the catalogue never loaded — falls back to the MODEL_PRICES
+literals, which stay in the file exactly for that (a long-lived local
+history may still reference claude-3-opus). PRICING_SOURCE and
+PRICING_FETCHED record where the literal table came from and when. Prices
+change and estimates are estimates; Anthropic's own billing is the only
+authoritative record of what was charged.
 
 Matched by model-id PREFIX rather than exact equality, because a real model
-id carries a dated snapshot suffix (e.g. "claude-haiku-4-5-20251001") this
-table doesn't enumerate. The longest matching prefix wins, so a more specific
-entry ("claude-opus-4-8") beats a shorter one that would also match
-("claude-opus-4").
+id carries a dated snapshot suffix (e.g. "claude-haiku-4-5-20251001")
+neither source enumerates: catalogue ids are undated base ids (LiteLLM's
+provider namespaces already stripped by model_catalogue), so
+"claude-opus-4-5-20251101" resolves "claude-opus-4-5". The longest matching
+prefix wins, so a more specific entry ("claude-opus-4-8") beats a shorter
+one that would also match ("claude-opus-4").
 """
 
 from __future__ import annotations
@@ -16,8 +25,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from . import model_catalogue
+
 PRICING_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
 PRICING_FETCHED = "2026-08-20"
+
+# Anthropic prices prompt-cache traffic as fixed multiples of the base input
+# rate (uniform across every model family in the table below). Used only
+# when LiteLLM states a model's input/output rates but omits a cache rate.
+CACHE_WRITE_5M_INPUT_MULTIPLIER = 1.25
+CACHE_WRITE_1H_INPUT_MULTIPLIER = 2.0
+CACHE_READ_INPUT_MULTIPLIER = 0.10
 
 
 @dataclass(frozen=True)
@@ -54,10 +72,57 @@ MODEL_PRICES: tuple[ModelPrice, ...] = (
 )
 
 
-def find_price(model: Optional[str]) -> Optional[ModelPrice]:
+def _price_from_model_info(info) -> Optional[ModelPrice]:
+    """A ModelPrice from a catalogue ModelInfo, or None when LiteLLM didn't
+    state both base rates — never a guessed price. Cache rates use
+    LiteLLM's own fields when present and Anthropic's uniform multipliers
+    of the input rate otherwise."""
+    if not isinstance(info.input_cost, (int, float)) or not isinstance(info.output_cost, (int, float)):
+        return None
+    input_per_mtok = info.input_cost * 1_000_000
+    output_per_mtok = info.output_cost * 1_000_000
+
+    def per_mtok(stated: Optional[float], multiplier: float) -> float:
+        if isinstance(stated, (int, float)):
+            return stated * 1_000_000
+        return input_per_mtok * multiplier
+
+    return ModelPrice(
+        prefix=model_catalogue.base_id(info.id).lower(),
+        input_per_mtok=input_per_mtok,
+        cache_write_5m_per_mtok=per_mtok(info.cache_write_cost, CACHE_WRITE_5M_INPUT_MULTIPLIER),
+        cache_write_1h_per_mtok=per_mtok(info.cache_write_1h_cost, CACHE_WRITE_1H_INPUT_MULTIPLIER),
+        cache_read_per_mtok=per_mtok(info.cache_read_cost, CACHE_READ_INPUT_MULTIPLIER),
+        output_per_mtok=output_per_mtok,
+    )
+
+
+_USE_CURRENT_CATALOGUE = object()  # sentinel: default to model_catalogue.current()
+
+
+def find_price(model: Optional[str], catalogue=_USE_CURRENT_CATALOGUE) -> Optional[ModelPrice]:
+    """Longest-prefix match, catalogue first, MODEL_PRICES literals when
+    the catalogue is unavailable or doesn't carry the model at all.
+    `catalogue` exists for tests: pass a Catalogue to inject one, or None
+    to force the literal fallback."""
     if not model:
         return None
+    if catalogue is _USE_CURRENT_CATALOGUE:
+        catalogue = model_catalogue.current()
     normalized = model.lower()
+
+    if catalogue is not None:
+        best_info = None
+        best_len = -1
+        for info in catalogue.anthropic:
+            prefix = model_catalogue.base_id(info.id).lower()
+            if normalized.startswith(prefix) and len(prefix) > best_len:
+                price = _price_from_model_info(info)
+                if price is not None:
+                    best_info, best_len = price, len(prefix)
+        if best_info is not None:
+            return best_info
+
     best: Optional[ModelPrice] = None
     for price in MODEL_PRICES:
         if normalized.startswith(price.prefix) and (best is None or len(price.prefix) > len(best.prefix)):

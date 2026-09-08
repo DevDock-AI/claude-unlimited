@@ -48,6 +48,10 @@ Funding = "https://ko-fi.com/devdock"
 
 [project.scripts]
 claude-unlimited = "claude_unlimited.cli:main"
+# Short alias, same entrypoint: `cu code`, `cu status`, `cu doctor`, …
+# Console scripts are generated at install time, so an existing install
+# only gains `cu` after a reinstall.
+cu = "claude_unlimited.cli:main"
 
 [tool.setuptools.dynamic]
 # Read from claude_unlimited/__init__.py rather than restated here. The two
@@ -66,4 +70,4 @@ packages = ["claude_unlimited", "claude_unlimited.secret_store", "claude_unlimit
 # daemon would start, but / and /app.js would 404 and i18n would have
 # nothing to load. Caught before it ever shipped, by actually building the
 # install rather than assuming `packages` alone covers it.
-claude_unlimited = ["static/*", "locales/*"]
+claude_unlimited = ["static/*", "locales/*", "data/*"]
