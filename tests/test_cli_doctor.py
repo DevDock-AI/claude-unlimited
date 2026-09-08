@@ -10,6 +10,8 @@ import claude_unlimited.profiles as profile_repo
 def env(monkeypatch, tmp_path):
     monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
     monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    # doctor self-heals the CLI launchers; never touch the real ~/.local/bin.
+    monkeypatch.setattr(cli.updater, "ensure_cli_aliases", lambda *a, **kw: None)
 
 
 def test_doctor_reports_notifications_availability(env, capsys):

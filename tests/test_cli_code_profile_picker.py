@@ -81,6 +81,9 @@ def code_env(monkeypatch, tmp_path):
     # (for the /model picker labels). Stub both.
     monkeypatch.setattr(cli, "_request_models_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **kw: {})
+    # code() self-heals the CLI launchers; never let that touch the real
+    # ~/.local/bin in a test.
+    monkeypatch.setattr(cli.updater, "ensure_cli_aliases", lambda *a, **kw: None)
     execs = []
     monkeypatch.setattr(cli.os, "execvp", lambda file, args: execs.append((file, args)))
     monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
@@ -147,3 +150,19 @@ def test_code_non_interactive_stdin_never_prompts_even_with_multiple_profiles(mo
 
     assert cli.code(4317, [], profile_arg=None) == 0
     assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "placeholder-tok"
+
+
+def test_code_self_heals_the_cli_launchers(monkeypatch, code_env):
+    """Running `code` must (best-effort) create any missing CLI launcher — this
+    is the reliable path that puts `cu` on PATH after an update, since it runs
+    the freshly-installed code via the claude-unlimited symlink without needing
+    the daemon to have restarted."""
+    from claude_unlimited.config import Pool, Profile, save_pool
+    save_pool(Pool(profiles=[Profile(id="a", name="Alice", kind="oauth", enabled=True)]))
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port, timeout=2.0: "tok")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    called = []
+    monkeypatch.setattr(cli.updater, "ensure_cli_aliases", lambda *a, **kw: called.append(True))
+
+    assert cli.code(4317, [], profile_arg=None) == 0
+    assert called == [True]

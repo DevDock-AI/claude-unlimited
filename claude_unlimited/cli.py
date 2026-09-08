@@ -33,6 +33,7 @@ from . import __version__
 from . import anthropic_oauth
 from . import daemon_installer
 from . import i18n
+from . import updater
 from . import profiles as profile_repo
 from .config import CLAUDE_ACCOUNTS_DIR, CODEX_ACCOUNTS_DIR, ensure_app_dir, load_pool
 from .daemon import DEFAULT_PORT, LOOPBACK_HOST, run_foreground
@@ -133,6 +134,21 @@ def doctor() -> int:
     print(f"Profiles configured: {len(pool.profiles)}")
     if not pool.profiles:
         print("  (none yet — run `claude-unlimited add-account`, or add one from the Dashboard)")
+
+    # Heal any missing launcher (e.g. `cu` after updating from an older
+    # version whose updater couldn't), then report what's actually on PATH.
+    try:
+        updater.ensure_cli_aliases()
+    except Exception:
+        pass
+    on_path = [name for name in ("claude-unlimited", "cu") if shutil.which(name)]
+    if len(on_path) == 2:
+        print("CLI launchers: OK — claude-unlimited and cu both on PATH")
+    else:
+        missing = [n for n in ("claude-unlimited", "cu") if n not in on_path]
+        print(f"CLI launchers: {', '.join(on_path) or 'none'} on PATH — "
+              f"{', '.join(missing)} missing (ensure ~/.local/bin is on your PATH)")
+        ok = False
 
     print("Live proxy: ready — rotation, credential substitution, and usage tracking active.")
 
@@ -1313,6 +1329,16 @@ def desktop_revert() -> int:
 
 def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -> int:
     _banner()
+    # Self-heal the CLI launchers on every `code` run. This is the RELIABLE
+    # trigger: unlike the daemon-startup heal (which only fires if an update
+    # actually restarts the daemon — older updaters didn't), this runs the
+    # freshly-installed code via the ~/.local/bin/claude-unlimited -> venv
+    # symlink, so simply running `claude-unlimited code` once after an update
+    # creates the missing `cu` link. Best-effort; never blocks a launch.
+    try:
+        updater.ensure_cli_aliases()
+    except Exception:
+        pass
     if not shutil.which("claude"):
         print("Claude Code CLI (`claude`) not found on PATH. Install/update Claude Code first.", file=sys.stderr)
         return 1
