@@ -374,17 +374,42 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     def _translated_chunks() -> Iterator[bytes]:
         translator = fmt.response_stream()
         buffer = b""
+        terminal_event_seen = False
         try:
             while True:
-                chunk = resp.read(CHUNK_READ_SIZE)
+                incomplete = None
+                try:
+                    chunk = resp.read(CHUNK_READ_SIZE)
+                except http.client.IncompleteRead as exc:
+                    # ChatGPT's backend sometimes closes a chunked response
+                    # after sending a complete SSE stream but before writing
+                    # the zero-length HTTP terminator. http.client preserves
+                    # those final bytes on the exception. Translate them, and
+                    # accept the close only when the provider's own terminal
+                    # event proves the response was complete. A genuinely
+                    # truncated SSE stream must still fail visibly.
+                    incomplete = exc
+                    chunk = exc.partial
                 if not chunk:
-                    break
-                buffer += chunk
+                    if incomplete is None:
+                        break
+                else:
+                    buffer += chunk
                 while b"\n\n" in buffer:
                     frame, _, buffer = buffer.partition(b"\n\n")
                     event = _parse_sse_frame(frame)
                     if event is not None:
+                        if event.get("type") in {
+                            "response.completed",
+                            "response.failed",
+                            "response.incomplete",
+                        }:
+                            terminal_event_seen = True
                         yield from translator.feed(event)
+                if incomplete is not None:
+                    if terminal_event_seen:
+                        break
+                    raise incomplete
         finally:
             conn.close()
 

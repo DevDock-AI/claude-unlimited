@@ -1,3 +1,4 @@
+import http.client
 import json
 
 import pytest
@@ -27,6 +28,17 @@ class FakeHTTPResponse:
         chunk = self._body[self._pos:self._pos + n]
         self._pos += len(chunk)
         return chunk
+
+
+class IncompleteChunkedHTTPResponse(FakeHTTPResponse):
+    """One chunked read whose bytes survived a missing HTTP terminator."""
+
+    def read(self, n=None):
+        if n is None:
+            return super().read(n)
+        partial = self._body[self._pos:]
+        self._pos = len(self._body)
+        raise http.client.IncompleteRead(partial)
 
 
 class FakeHTTPSConnection:
@@ -232,6 +244,56 @@ def test_run_uses_api_key_endpoint_and_no_account_header(monkeypatch):
     assert req["path"] == "/v1/responses"
     assert req["headers"]["Authorization"] == "Bearer sk-real-key"
     assert "ChatGPT-Account-ID" not in req["headers"]
+
+
+def test_complete_sse_survives_a_missing_http_chunk_terminator(monkeypatch):
+    events = [
+        {"type": "response.created", "response": {"id": "r1", "model": "gpt-test"}},
+        {"type": "response.output_item.added", "item": {"type": "message"}},
+        {"type": "response.output_text.delta", "delta": "hello"},
+        {"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}},
+    ]
+    response = IncompleteChunkedHTTPResponse(
+        200,
+        {"content-type": "text/event-stream"},
+        _sse_body(events),
+    )
+    _install_fake_connection(monkeypatch, response)
+
+    result = run(
+        _subscription_profile(),
+        _cred(),
+        json.dumps({"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+    )
+    chunks = b"".join(result.body_chunks)
+
+    assert b"hello" in chunks
+    assert b"event: message_stop" in chunks
+    assert FakeHTTPSConnection.last_instance.closed is True
+
+
+def test_truncated_sse_still_raises_incomplete_read(monkeypatch):
+    events = [
+        {"type": "response.created", "response": {"id": "r1", "model": "gpt-test"}},
+        {"type": "response.output_item.added", "item": {"type": "message"}},
+        {"type": "response.output_text.delta", "delta": "partial"},
+    ]
+    response = IncompleteChunkedHTTPResponse(
+        200,
+        {"content-type": "text/event-stream"},
+        _sse_body(events),
+    )
+    _install_fake_connection(monkeypatch, response)
+
+    result = run(
+        _subscription_profile(),
+        _cred(),
+        json.dumps({"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+    )
+
+    with pytest.raises(http.client.IncompleteRead):
+        b"".join(result.body_chunks)
+    assert FakeHTTPSConnection.last_instance.closed is True
 
 
 def test_run_accepts_a_bare_api_key_string_not_just_the_encoded_blob(monkeypatch):
