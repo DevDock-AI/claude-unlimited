@@ -338,3 +338,68 @@ def test_tool_call_survives_the_non_streaming_collapse(pool_env, monkeypatch):
     block, = json.loads(b"".join(result.body_chunks))["content"]
     assert block["name"] == "Read"
     assert block["input"] == {"file_path": "a.txt"}
+
+
+def _usage_sse(model: str) -> list[bytes]:
+    """An Anthropic-shaped stream the usage capture can actually read: the
+    model arrives on message_start, the final token counts on message_delta."""
+    start = json.dumps({"type": "message_start",
+                        "message": {"model": model, "usage": {"input_tokens": 10, "output_tokens": 0}}})
+    delta = json.dumps({"type": "message_delta", "usage": {"input_tokens": 10, "output_tokens": 5}})
+    return [f"event: message_start\ndata: {start}\n\n".encode(),
+            f"event: message_delta\ndata: {delta}\n\n".encode(),
+            b"event: message_stop\ndata: {}\n\n"]
+
+
+def test_usage_records_the_claude_model_asked_for_next_to_the_openai_one(pool_env, monkeypatch):
+    """A codex Profile answers as gpt-6-astra whether the client asked for Fable
+    or for Opus — the mapping is the only difference. Without the requested
+    model the log cannot tell them apart, which is exactly what made a nested
+    'fable' subagent impossible to spot from our own records."""
+    import claude_unlimited.usage_history as usage_history
+
+    save_pool(Pool(profiles=[_codex_profile()]))
+
+    def fake_run(profile, credential, body, timeout=120, parity=None):
+        return OpenAIBridgeResult(status=200, headers={"content-type": "text/event-stream"},
+                                   body_chunks=iter(_usage_sse("gpt-6-astra")))
+
+    monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no Anthropic transport")))
+
+    result = gw.handle("POST", "/v1/messages", {},
+                       json.dumps({"model": "claude-fable-5-1", "stream": True,
+                                   "messages": [{"role": "user", "content": "hi"}]}).encode())
+    list(result.body_chunks)
+
+    events = usage_history.list_events()
+    assert len(events) == 1
+    assert events[0].model == "gpt-6-astra"
+    assert events[0].requested_model == "claude-fable-5-1"
+
+
+def test_a_non_streaming_codex_request_still_records_both_models(pool_env, monkeypatch):
+    """stream:false takes the assemble-to-JSON path, which reads the same parsed
+    body the requested model comes from."""
+    import claude_unlimited.usage_history as usage_history
+
+    save_pool(Pool(profiles=[_codex_profile()]))
+
+    def fake_run(profile, credential, body, timeout=120, parity=None):
+        return OpenAIBridgeResult(status=200, headers={"content-type": "text/event-stream"},
+                                   body_chunks=iter(_usage_sse("gpt-5.6-terra")))
+
+    monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no Anthropic transport")))
+
+    result = gw.handle("POST", "/v1/messages", {},
+                       json.dumps({"model": "claude-opus-5", "stream": False,
+                                   "messages": [{"role": "user", "content": "hi"}]}).encode())
+    body = b"".join(result.body_chunks)
+
+    assert result.headers["content-type"] == "application/json"
+    assert json.loads(body)["type"] == "message"
+    events = usage_history.list_events()
+    assert len(events) == 1
+    assert (events[0].model, events[0].requested_model) == ("gpt-5.6-terra", "claude-opus-5")
+

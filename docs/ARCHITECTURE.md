@@ -177,6 +177,10 @@ refreshed only through the existing per-Profile refresh clocks. Off switch:
 
 ## Usage tracking
 
+Each recorded event also carries `requested_model` whenever the client asked for a
+different model than the one that served it — a codex-kind Profile answers as `gpt-*`, so
+without it the log cannot distinguish a Fable request from an Opus one.
+
 `usage_tracking.py` is a **strict tee**. Every chunk read from upstream is yielded onward
 unmodified and in order; a separate copy is parsed for token counts. Every parse is
 guarded, so a malformed body costs a usage record and never the response.

@@ -344,3 +344,40 @@ def test_a_line_with_the_wrong_shape_is_skipped_not_fatal(monkeypatch, tmp_path)
     events = usage_history.list_events()
     assert [e.profile_id for e in events] == ["a"]
     assert events[0].input_tokens == 10
+
+
+def test_requested_model_is_recorded_when_the_served_model_differs(env):
+    """A codex-kind Profile answers with the OpenAI model that actually ran, so
+    the log alone could not tell a Fable request from an Opus one — both come
+    back as a gpt-* id, only the mapping differs."""
+    event = usage_history.record("prof-c", None, "gpt-6-astra",
+                                 {"input_tokens": 10, "output_tokens": 5},
+                                 requested_model="claude-fable-5-1")
+    assert event.requested_model == "claude-fable-5-1"
+    assert usage_history.list_events()[0].requested_model == "claude-fable-5-1"
+
+
+def test_requested_model_is_left_out_when_it_matches_what_served(env):
+    # The ordinary case stays null, so a non-null value always means "translated".
+    event = usage_history.record("prof-a", None, "claude-sonnet-5",
+                                 {"input_tokens": 1, "output_tokens": 1},
+                                 requested_model="claude-sonnet-5")
+    assert event.requested_model is None
+    assert usage_history.list_events()[0].requested_model is None
+
+
+def test_rows_written_before_requested_model_existed_still_load(env):
+    """list_events() drops any row it cannot construct, so a new field without a
+    default would have silently emptied every existing user's usage history."""
+    import json
+
+    legacy = {"timestamp": "2026-09-01T10:00:00+00:00", "profile_id": "p", "project_id": None,
+              "model": "claude-sonnet-5", "input_tokens": 5, "output_tokens": 5,
+              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "cost_usd": 0.01}
+    usage_history.USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    usage_history.USAGE_HISTORY_FILE.write_text(json.dumps(legacy) + "\n")
+
+    events = usage_history.list_events()
+    assert len(events) == 1
+    assert events[0].model == "claude-sonnet-5" and events[0].requested_model is None
+

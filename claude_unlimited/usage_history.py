@@ -39,9 +39,17 @@ class UsageEvent:
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
     cost_usd: Optional[float]  # None when the model isn't in pricing.py's table
+    # What the CLIENT asked for, when that differs from what actually served
+    # the request. A codex-kind Profile records the OpenAI model it ran
+    # (gpt-6-astra), which on its own cannot be told apart from a request that
+    # asked for Opus — the mapping is what differs. None means "same as
+    # `model`", which is the ordinary case. Defaulted so logs written before
+    # this field, and callers that don't know it, keep working.
+    requested_model: Optional[str] = None
 
 
-def record(profile_id: str, project_id: Optional[str], model: Optional[str], usage: dict) -> UsageEvent:
+def record(profile_id: str, project_id: Optional[str], model: Optional[str], usage: dict,
+           requested_model: Optional[str] = None) -> UsageEvent:
     event = UsageEvent(
         timestamp=datetime.now(timezone.utc).isoformat(),
         profile_id=profile_id,
@@ -52,6 +60,9 @@ def record(profile_id: str, project_id: Optional[str], model: Optional[str], usa
         cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
         cache_read_input_tokens=int(usage.get("cache_read_input_tokens") or 0),
         cost_usd=pricing.estimate_cost_usd(model, usage),
+        # Recorded only when it actually differs, so the common case stays null
+        # and "was this request translated?" is answerable from the log alone.
+        requested_model=requested_model if requested_model and requested_model != model else None,
     )
     ensure_app_dir()
     with _lock:

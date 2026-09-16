@@ -147,20 +147,36 @@ def _restorable_usage_fields(persisted: Optional[dict], now: datetime) -> dict:
 
 
 
-def _client_wants_streaming(body: bytes) -> bool:
+def _parsed_request(body: bytes) -> Optional[dict]:
+    """The inbound Anthropic request body as a dict, or None when there is
+    nothing usable. A conversation body can be megabytes, so callers share
+    ONE parse rather than each doing their own."""
+    if not body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _requested_model(parsed: Optional[dict]) -> Optional[str]:
+    """The model the CLIENT asked for. A codex-kind Profile answers with the
+    OpenAI model that actually ran (gpt-6-astra), which on its own cannot be
+    told apart from a request that asked for Opus — so this is the only
+    record of what the mapping started from."""
+    model = (parsed or {}).get("model")
+    return model if isinstance(model, str) else None
+
+
+def _client_wants_streaming(parsed: Optional[dict]) -> bool:
     """Whether the inbound Anthropic request asked for an SSE response.
 
     Anthropic's default is non-streaming, but every real Claude Code turn
     sets stream:true explicitly; an unparsable or absent body is treated as
     streaming so a malformed request can never silently buffer a whole
     response in memory."""
-    if not body:
-        return True
-    try:
-        parsed = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return True
-    if not isinstance(parsed, dict) or "stream" not in parsed:
+    if not parsed or "stream" not in parsed:
         return True
     return bool(parsed.get("stream"))
 
@@ -1108,7 +1124,12 @@ class Gateway:
         # 200 is actually the translated event stream.
         content_type = "text/event-stream; charset=utf-8" if result.status < 300 else "application/json"
         client_headers = {"content-type": content_type}
-        body_chunks = self._wrap_with_usage_capture(result.body_chunks, client_headers, profile.id, project_id)
+        # One parse of the inbound body, shared by both readers below: what the
+        # client asked for (recorded beside the OpenAI model that actually ran)
+        # and whether it wants SSE back.
+        parsed_body = _parsed_request(body)
+        body_chunks = self._wrap_with_usage_capture(result.body_chunks, client_headers, profile.id, project_id,
+                                                     requested_model=_requested_model(parsed_body))
         body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id)
 
         # The upstream Responses call is always streamed, but the client
@@ -1117,7 +1138,7 @@ class Gateway:
         # unavailable — which is how Claude Code's auto-mode safety
         # classifier (a non-streaming call) ends up blocking tools that need
         # a safety decision.
-        if result.status < 300 and not _client_wants_streaming(body):
+        if result.status < 300 and not _client_wants_streaming(parsed_body):
             message = openai_translate.assemble_message_from_sse(body_chunks)
             payload = json.dumps(message).encode("utf-8")
             client_headers = {"content-type": "application/json"}
@@ -1509,7 +1530,8 @@ class Gateway:
             pass
 
     @staticmethod
-    def _wrap_with_usage_capture(chunks, resp_headers: dict, profile_id: str, project_id: Optional[str]):
+    def _wrap_with_usage_capture(chunks, resp_headers: dict, profile_id: str, project_id: Optional[str],
+                                  requested_model: Optional[str] = None):
         """Tees the response body through UsageCapture (see its module
         docstring for the safety invariant: every byte forwarded exactly
         unchanged) and records one usage_history event as soon as the
@@ -1543,7 +1565,8 @@ class Gateway:
             finally:
                 if capture.model and capture.usage:
                     try:
-                        usage_history.record(profile_id, project_id, capture.model, capture.usage)
+                        usage_history.record(profile_id, project_id, capture.model, capture.usage,
+                                             requested_model=requested_model)
                     except Exception:
                         pass  # usage history is best-effort — must never affect a real request
 
