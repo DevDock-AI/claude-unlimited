@@ -29,7 +29,9 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -139,6 +141,73 @@ def check_for_update(current_version: str, *, opener: Callable = urllib.request.
                     notes=(payload.get("body") or "").strip())
 
 
+def _clear_readonly_and_retry(func, path, _exc=None) -> None:
+    """`shutil.rmtree` error hook that survives read-only files.
+
+    Git marks everything it writes under `.git/objects` read-only. On Windows
+    a file's own read-only attribute blocks deletion outright; on POSIX,
+    deleting only needs write permission on the *parent directory*, so the
+    same tree removes cleanly there. That makes this a Windows-only failure —
+    and ignoring the error silently left a partial `.git` behind, which made
+    the next `git clone` refuse the destination forever."""
+    try:
+        _os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass  # still best-effort; a tree we cannot clear is reported by caller
+
+
+def _rmtree(path: Path) -> None:
+    """Best-effort recursive delete that actually succeeds on a git checkout
+    under Windows, which ignoring errors did not."""
+    if not Path(path).exists():
+        return
+    # `onerror` is deprecated from 3.12 and `onexc` does not exist before it;
+    # this project supports 3.10+, so pick per interpreter rather than pin one.
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    else:
+        shutil.rmtree(path, onerror=_clear_readonly_and_retry)
+
+
+def _has_entries(path: Path) -> bool:
+    """True if `path` still holds anything — i.e. a delete did not finish."""
+    try:
+        return path.exists() and any(path.iterdir())
+    except OSError:
+        return True  # unreadable is not "safely empty"
+
+
+def _is_windows() -> bool:
+    """Platform check as a seam, so tests can fake it without touching
+    `os.name`.
+
+    `pathlib` picks WindowsPath or PosixPath from `os.name` at instantiation,
+    so a test that monkeypatched the real `os.name` to "nt" made every Path
+    built while it was patched a WindowsPath — which raises NotImplementedError
+    on POSIX. Those tests passed on Windows (where the patch is a no-op) and
+    failed everywhere else. Patch this instead."""
+    return _os.name == "nt"
+
+
+def _install_interpreter(venv_python: Path) -> tuple:
+    """The interpreter an update installs into, plus any extra pip flags.
+
+    install.sh builds a venv at INSTALL_ROOT/venv and the updater installs
+    into it. install.ps1 deliberately does not — it runs `pip install --user`
+    against the system interpreter and writes .cmd launchers — so on Windows
+    there is no venv to find, and demanding one failed every self-update with
+    a message telling the user to re-run a bash script they never ran."""
+    if venv_python.exists():
+        return venv_python, []
+    if _is_windows():
+        # pip refuses --user inside an active virtualenv, and the daemon may
+        # well be running inside one; only pass it when we are not.
+        in_venv = sys.prefix != sys.base_prefix
+        return Path(sys.executable), ([] if in_venv else ["--user"])
+    raise UpdateError(f"No virtual environment at {venv_python}. Re-run install.sh instead.")
+
+
 def _run(command: list, runner: Callable) -> subprocess.CompletedProcess:
     try:
         return runner(command, capture_output=True, text=True,
@@ -152,7 +221,11 @@ def stage_release(release: Release, destination: Path, *, runner: Callable = sub
     checked out is the one the API named. Git objects are content-addressed,
     so this is a content check, not a second appeal to the transport."""
     if destination.exists():
-        shutil.rmtree(destination, ignore_errors=True)
+        _rmtree(destination)
+        if _has_entries(destination):
+            raise UpdateError(
+                f"Could not clear the staging directory {destination} — something "
+                f"in it could not be deleted. Remove it by hand and try again.")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     clone = _run(["git", "clone", "--depth", "1", "--branch", release.tag,
@@ -163,7 +236,7 @@ def stage_release(release: Release, destination: Path, *, runner: Callable = sub
     head = _run(["git", "-C", str(destination), "rev-parse", "HEAD"], runner)
     got = (head.stdout or "").strip()
     if got != release.commit_sha:
-        shutil.rmtree(destination, ignore_errors=True)
+        _rmtree(destination)
         raise UpdateError(
             f"Refusing to install {release.tag}: downloaded commit {got[:12] or '?'} "
             f"does not match the {release.commit_sha[:12]} GitHub named for that tag.")
@@ -197,7 +270,7 @@ def ensure_cli_aliases(*, venv_scripts: Path = VENV_SCRIPTS, bin_dir: Path = BIN
     pip-regenerated `venv/bin/cu` on update yet never got `~/.local/bin/cu`,
     and `cu` stayed 'command not found' no matter how many times someone
     updated. Running this on every install closes that gap for both names."""
-    if _os.name == "nt":
+    if _is_windows():
         _ensure_windows_alias()
         return
     try:
@@ -240,30 +313,29 @@ def install_staged(staged: Path, *, runner: Callable = subprocess.run,
     works."""
     if not staged.joinpath("pyproject.toml").exists():
         raise UpdateError("The downloaded tree does not look like this project.")
-    if not venv_python.exists():
-        raise UpdateError(f"No virtual environment at {venv_python}. Re-run install.sh instead.")
+    python, pip_flags = _install_interpreter(venv_python)
 
-    shutil.rmtree(staged / ".git", ignore_errors=True)
+    _rmtree(staged / ".git")
     if previous_dir.exists():
-        shutil.rmtree(previous_dir, ignore_errors=True)
+        _rmtree(previous_dir)
     if app_dir.exists():
         shutil.move(str(app_dir), str(previous_dir))
     shutil.move(str(staged), str(app_dir))
 
     def _roll_back(reason: str):
-        shutil.rmtree(app_dir, ignore_errors=True)
+        _rmtree(app_dir)
         if previous_dir.exists():
             shutil.move(str(previous_dir), str(app_dir))
-            _run([str(venv_python), "-m", "pip", "install", "--force-reinstall",
-                  "--no-deps", "-q", str(app_dir)], runner)
+            _run([str(python), "-m", "pip", "install", "--force-reinstall",
+                  *pip_flags, "--no-deps", "-q", str(app_dir)], runner)
         raise UpdateError(reason)
 
-    installed = _run([str(venv_python), "-m", "pip", "install", "--force-reinstall",
-                      "--no-deps", "-q", str(app_dir)], runner)
+    installed = _run([str(python), "-m", "pip", "install", "--force-reinstall",
+                      *pip_flags, "--no-deps", "-q", str(app_dir)], runner)
     if installed.returncode != 0:
         _roll_back(f"Install failed, rolled back: {(installed.stderr or '').strip()[:200]}")
 
-    check = _run([str(venv_python), "-c", "import claude_unlimited"], runner)
+    check = _run([str(python), "-c", "import claude_unlimited"], runner)
     if check.returncode != 0:
         _roll_back(f"The new version could not be imported, rolled back: "
                     f"{(check.stderr or '').strip()[:200]}")
@@ -271,7 +343,7 @@ def install_staged(staged: Path, *, runner: Callable = subprocess.run,
     # pip regenerated the venv's console scripts above; make sure every CLI
     # name is reachable from the user's bin dir. Best-effort — a launcher we
     # can't write must never fail or roll back an otherwise-good update.
-    ensure_cli_aliases(venv_scripts=venv_python.parent, bin_dir=bin_dir)
+    ensure_cli_aliases(venv_scripts=python.parent, bin_dir=bin_dir)
 
 
 STAGING_DIR = INSTALL_ROOT / "staged-update"

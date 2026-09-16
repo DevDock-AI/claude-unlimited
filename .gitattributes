@@ -1,0 +1,4 @@
+# Line endings are LF in this repo, on every platform.
+# Without this a Windows checkout rewrites whole files to CRLF and every diff
+# becomes unreadable churn (it happened: 1858 insertions for 338 real lines).
+* text=auto eol=lf

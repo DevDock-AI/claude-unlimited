@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from claude_unlimited.openai_models import OpenAIModelTarget
 from claude_unlimited.openai_translate import ResponseTranslator, anthropic_request_to_openai
 
@@ -112,9 +114,90 @@ def test_tool_choice_mapping():
     assert anthropic_request_to_openai({"messages": [], "tool_choice": {"type": "auto"}}, TARGET)["tool_choice"] == "auto"
     assert anthropic_request_to_openai({"messages": [], "tool_choice": {"type": "any"}}, TARGET)["tool_choice"] == "required"
     assert anthropic_request_to_openai({"messages": [], "tool_choice": {"type": "none"}}, TARGET)["tool_choice"] == "none"
-    assert anthropic_request_to_openai(
-        {"messages": [], "tool_choice": {"type": "tool", "name": "Bash"}}, TARGET)["tool_choice"] == "Bash"
     assert anthropic_request_to_openai({"messages": []}, TARGET)["tool_choice"] == "auto"
+
+
+def test_forcing_one_tool_names_it_as_a_function_not_a_bare_string():
+    """A bare tool name is not a shape the Responses API accepts. Sending one
+    failed the whole request with `Invalid value: 'Bash'. Supported values are:
+    'none', 'auto', and 'required'.` - for every forced tool, not just one."""
+    out = anthropic_request_to_openai(
+        {"messages": [], "tool_choice": {"type": "tool", "name": "Bash"}}, TARGET)
+    assert out["tool_choice"] == {"type": "function", "name": "Bash"}
+
+
+def test_forcing_web_search_chooses_the_hosted_tool_by_type():
+    """A built-in is chosen by its type, never as a function - this is the
+    request that first surfaced the bug, on a `how's the weather` prompt."""
+    out = anthropic_request_to_openai(
+        {"messages": [], "tool_choice": {"type": "tool", "name": "web_search"}}, TARGET)
+    assert out["tool_choice"] == {"type": "web_search"}
+
+
+def test_forcing_a_server_tool_we_cannot_translate_falls_back_to_auto():
+    """web_fetch is dropped from `tools`, so forcing it by name would point at
+    a tool that is not in the request at all."""
+    out = anthropic_request_to_openai(
+        {"messages": [], "tool_choice": {"type": "tool", "name": "web_fetch"}}, TARGET)
+    assert out["tool_choice"] == "auto"
+
+
+# ---- Anthropic server-side tools -> OpenAI built-ins ----
+
+@pytest.mark.parametrize("anthropic_type", ["web_search_20250305", "web_search_20260209"])
+def test_web_search_becomes_openais_own_built_in(anthropic_type):
+    """Anthropic dates these types and bumps the date on revisions, so both the
+    basic and the dynamic-filtering spelling must map to the same built-in.
+    Translating either into a function tool offered the model a tool that
+    nothing on the OpenAI side could execute."""
+    out = anthropic_request_to_openai(
+        {"messages": [], "tools": [{"type": anthropic_type, "name": "web_search"}]}, TARGET)
+    assert out["tools"] == [{"type": "web_search"}]
+
+
+def test_web_search_carries_over_the_options_both_sides_express():
+    out = anthropic_request_to_openai({"messages": [], "tools": [{
+        "type": "web_search_20260209",
+        "name": "web_search",
+        "allowed_domains": ["example.com"],
+        "user_location": {"type": "approximate", "country": "RO", "city": "Bucharest"},
+    }]}, TARGET)
+    assert out["tools"] == [{
+        "type": "web_search",
+        "filters": {"allowed_domains": ["example.com"]},
+        "user_location": {"type": "approximate", "country": "RO", "city": "Bucharest"},
+    }]
+
+
+def test_blocked_domains_is_dropped_rather_than_inverted():
+    """OpenAI has no deny-list. Turning one into an allow-list would widen the
+    restriction the caller asked for, so it is dropped, not guessed at."""
+    out = anthropic_request_to_openai({"messages": [], "tools": [{
+        "type": "web_search_20260209", "name": "web_search",
+        "blocked_domains": ["blocked.example"],
+    }]}, TARGET)
+    assert out["tools"] == [{"type": "web_search"}]
+
+
+def test_a_server_tool_with_no_openai_equivalent_is_dropped():
+    """Better no tool than a function tool the model is invited to call and
+    nothing can run."""
+    out = anthropic_request_to_openai({"messages": [], "tools": [
+        {"type": "web_fetch_20260209", "name": "web_fetch"},
+        {"name": "Bash", "description": "run a command", "input_schema": {"type": "object"}},
+    ]}, TARGET)
+    assert [t["type"] for t in out["tools"]] == ["function"]
+    assert out["tools"][0]["name"] == "Bash"
+
+
+def test_ordinary_client_tools_are_untouched_by_the_server_tool_path():
+    out = anthropic_request_to_openai({"messages": [], "tools": [
+        {"name": "Bash", "description": "run", "input_schema": {"type": "object", "properties": {}}},
+    ]}, TARGET)
+    assert out["tools"] == [{
+        "type": "function", "name": "Bash", "description": "run",
+        "parameters": {"type": "object", "properties": {}}, "strict": False,
+    }]
 
 
 def test_unknown_content_block_type_is_skipped_not_fatal():

@@ -147,7 +147,46 @@ def _tool_result_text(content) -> str:
     return str(content)
 
 
-def _map_tool_choice(anthropic_tool_choice) -> str:
+# Tools Anthropic runs on its own servers rather than handing back to the
+# client. They arrive with no input_schema and a *versioned* type
+# (`web_search_20250305` today), and OpenAI's Responses API has its own
+# built-in equivalents that are declared by type alone. Translating one of
+# these into an ordinary function tool produced a tool the model was told to
+# call and that nothing could execute.
+# Keyed by the Anthropic type's family, because Anthropic versions these with
+# a date and bumps it on revisions: web search arrives as `web_search_20250305`
+# on older models and `web_search_20260209` on newer ones, and both mean the
+# same thing here. A value of None means Anthropic has a server tool that
+# OpenAI has no equivalent for.
+SERVER_TOOL_EQUIVALENTS = {
+    "web_search": "web_search",
+    # OpenAI's Responses API has no fetch-this-URL built-in. Sending it on as a
+    # function tool would offer the model something nothing can execute, so the
+    # tool is dropped instead: the model simply cannot fetch on a codex Profile.
+    "web_fetch": None,
+}
+
+
+def _server_tool_type(tool: dict):
+    """(is_server_tool, openai_type) for an Anthropic tool definition.
+
+    `openai_type` is None either because this is an ordinary client tool
+    (is_server_tool False) or because OpenAI has no equivalent (True)."""
+    kind = tool.get("type") or ""
+    for family, openai_type in SERVER_TOOL_EQUIVALENTS.items():
+        if kind.startswith(family):
+            return True, openai_type
+    return False, None
+
+
+def _map_tool_choice(anthropic_tool_choice):
+    """Anthropic tool_choice -> Responses API tool_choice.
+
+    Returns a plain string for the three blanket modes, or an object naming
+    one tool. Returning the bare tool name — which this did until it was
+    caught on a forced `web_search` — is not a shape the API accepts at all:
+    it answers `Invalid value: 'web_search'. Supported values are: 'none',
+    'auto', and 'required'.` and fails the whole request, for any forced tool."""
     if not isinstance(anthropic_tool_choice, dict):
         return "auto"
     kind = anthropic_tool_choice.get("type")
@@ -157,9 +196,34 @@ def _map_tool_choice(anthropic_tool_choice) -> str:
         return "required"
     if kind == "none":
         return "none"
-    if kind == "tool" and anthropic_tool_choice.get("name"):
-        return anthropic_tool_choice["name"]
+    name = anthropic_tool_choice.get("name")
+    if kind == "tool" and name:
+        hosted = SERVER_TOOL_EQUIVALENTS.get(name)
+        if hosted:
+            # A hosted tool is chosen by its type; it is not a function.
+            return {"type": hosted}
+        if name in SERVER_TOOL_EQUIVALENTS:
+            # Forcing a server tool we dropped would name a tool that is not in
+            # the request at all. Let the model choose from what it does have.
+            return "auto"
+        return {"type": "function", "name": name}
     return "auto"
+
+
+def _builtin_tool(tool: dict, openai_type: str) -> dict:
+    """An Anthropic server-side tool as OpenAI's built-in equivalent, carrying
+    over the options both sides express."""
+    spec: dict = {"type": openai_type}
+    allowed = tool.get("allowed_domains")
+    if isinstance(allowed, list) and allowed:
+        spec["filters"] = {"allowed_domains": allowed}
+    # `blocked_domains` is deliberately not translated: OpenAI has no
+    # deny-list equivalent, and silently inverting it into an allow-list would
+    # widen a restriction the caller asked for. It is dropped, not guessed at.
+    location = tool.get("user_location")
+    if isinstance(location, dict):
+        spec["user_location"] = location
+    return spec
 
 
 def _map_tools(anthropic_tools) -> list[dict]:
@@ -167,7 +231,14 @@ def _map_tools(anthropic_tools) -> list[dict]:
         return []
     tools = []
     for t in anthropic_tools:
-        if not isinstance(t, dict) or not t.get("name"):
+        if not isinstance(t, dict):
+            continue
+        is_server_tool, builtin = _server_tool_type(t)
+        if is_server_tool:
+            if builtin:
+                tools.append(_builtin_tool(t, builtin))
+            continue
+        if not t.get("name"):
             continue
         tools.append({
             "type": "function",

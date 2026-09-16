@@ -1,7 +1,9 @@
 import io
 import json
 import os
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -240,12 +242,114 @@ def test_install_refuses_a_tree_that_is_not_this_project(tmp_path):
     assert (app / "marker.txt").read_text() == "old"
 
 
-def test_install_refuses_without_a_virtualenv(tmp_path):
+def test_install_refuses_without_a_virtualenv(tmp_path, monkeypatch):
+    """POSIX only: install.sh always builds the venv, so its absence there is a
+    broken install. Windows has no venv by design — see the test below."""
+    monkeypatch.setattr(updater, "_is_windows", lambda: False)
     staged, app, previous, venv, bin_dir = _prepare(tmp_path)
     venv.unlink()
     with pytest.raises(UpdateError, match="No virtual environment"):
         updater.install_staged(staged, runner=lambda *a, **k: _completed(),
                                 app_dir=app, previous_dir=previous, venv_python=venv)
+
+
+# ---- Windows: read-only git objects, and the venv that never exists ----
+
+def _make_readonly_git_checkout(root: Path) -> Path:
+    """A directory shaped like the leftover a failed update leaves behind: a
+    `.git` whose pack files carry the read-only bit git sets on them."""
+    pack = root / ".git" / "objects" / "pack"
+    pack.mkdir(parents=True)
+    blob = pack / "pack-deadbeef.pack"
+    blob.write_bytes(b"PACK")
+    os.chmod(blob, stat.S_IREAD)
+    return blob
+
+
+def test_rmtree_removes_a_checkout_whose_git_objects_are_read_only(tmp_path):
+    """`rmtree(ignore_errors=True)` silently left this behind on Windows, because
+    a read-only file cannot be deleted there at all."""
+    root = tmp_path / "staged-update"
+    root.mkdir()
+    _make_readonly_git_checkout(root)
+
+    updater._rmtree(root)
+
+    assert not root.exists()
+
+
+def test_stage_release_clears_a_leftover_read_only_clone(tmp_path):
+    """The reported bug: a previous attempt left `.git` behind, and every later
+    download failed with "destination path already exists and is not an empty
+    directory" — permanently, since the retry hit the same leftover."""
+    sha = "e" * 40
+    release = Release(version="1.2.7", tag="v1.2.7", commit_sha=sha, notes="")
+    dest = tmp_path / "staged-update"
+    dest.mkdir()
+    _make_readonly_git_checkout(dest)
+
+    def runner(cmd, **kw):
+        if cmd[1] == "clone":
+            target = Path(cmd[-1])
+            # Behave exactly as real git does rather than assuming a clean slate.
+            if target.exists() and any(target.iterdir()):
+                return _completed(returncode=128, stderr=(
+                    f"fatal: destination path '{target}' already exists "
+                    f"and is not an empty directory."))
+            target.mkdir(parents=True, exist_ok=True)
+            return _completed()
+        return _completed(stdout=sha + "\n")
+
+    assert updater.stage_release(release, dest, runner=runner) == dest
+
+
+def test_stage_release_reports_a_staging_dir_it_cannot_clear(tmp_path, monkeypatch):
+    """If the directory still cannot be emptied, say so in terms that name the
+    path — never fall through to git's confusing "already exists" message."""
+    dest = tmp_path / "staged-update"
+    dest.mkdir()
+    (dest / "stuck.txt").write_text("x")
+    monkeypatch.setattr(updater, "_rmtree", lambda path: None)  # a delete that fails
+
+    release = Release(version="1.2.7", tag="v1.2.7", commit_sha="f" * 40, notes="")
+    with pytest.raises(UpdateError, match="Could not clear the staging directory"):
+        updater.stage_release(release, dest, runner=lambda *a, **k: _completed())
+
+
+def test_install_on_windows_without_a_venv_uses_the_user_site(tmp_path, monkeypatch):
+    """install.ps1 installs with `pip install --user` and never creates a venv,
+    so demanding one told Windows users to re-run a bash script they never ran."""
+    monkeypatch.setattr(updater, "_is_windows", lambda: True)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)  # not inside a virtualenv
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
+    venv.unlink()  # no venv anywhere, as on a real Windows install
+    commands = []
+
+    def runner(cmd, **kw):
+        commands.append(cmd)
+        return _completed()
+
+    updater.install_staged(staged, runner=runner, app_dir=app,
+                            previous_dir=previous, venv_python=venv, bin_dir=bin_dir)
+
+    assert (app / "marker.txt").read_text() == "new"
+    pip_cmd = next(c for c in commands if "pip" in c)
+    assert "--user" in pip_cmd
+    assert pip_cmd[0] == sys.executable  # the running interpreter, not a missing venv
+
+
+def test_install_prefers_a_real_venv_over_the_user_site(tmp_path, monkeypatch):
+    """A venv that does exist still wins on Windows — only its absence falls back."""
+    monkeypatch.setattr(updater, "_is_windows", lambda: True)
+    staged, app, previous, venv, bin_dir = _prepare(tmp_path)
+    commands = []
+
+    updater.install_staged(staged, runner=lambda cmd, **kw: (commands.append(cmd), _completed())[1],
+                            app_dir=app, previous_dir=previous, venv_python=venv, bin_dir=bin_dir)
+
+    pip_cmd = next(c for c in commands if "pip" in c)
+    assert pip_cmd[0] == str(venv)
+    assert "--user" not in pip_cmd
 
 
 # ---- the source cannot be redirected ----
