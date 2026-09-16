@@ -364,8 +364,8 @@ def test_agents_moved_off_an_unavailable_account_are_logged_and_notified_once(po
     for ag in agents:
         assert serve(gw, hdrs(agent=ag)).profile_id == "b"
 
-    events = [json.loads(line) for line in (pool_env / "activity.jsonl").read_text().splitlines()]
-    moves = [e for e in events if any("Agent moved A → B" in str(v) for v in e.values())]
+    import claude_unlimited.activity as activity_module
+    moves = [e for e in activity_module.list_events(limit=100) if "Agent moved A → B" in e.text]
     assert len(moves) == 2                    # one per agent that actually moved
     assert notified.count("rotated") == 1     # one per account, not per agent
 

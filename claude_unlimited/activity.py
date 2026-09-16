@@ -15,10 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from . import db
 from .config import APP_DIR, ensure_app_dir
 
+# Kept for db.import_legacy_logs(), the only thing that still reads this file.
 ACTIVITY_FILE = APP_DIR / "activity.jsonl"
-MAX_EVENTS = 2000  # bounded — no unbounded local log growth
+# No longer trims: the store keeps every event. Retained as the export cap.
+MAX_EVENTS = 2000
 
 _lock = threading.Lock()
 
@@ -47,28 +50,13 @@ def record(category: str, text: str, meta: Optional[str] = None) -> ActivityEven
     # lesser failure, and the same trade-off notifications and runtime-state
     # persistence already make. The category check above still raises: that is
     # a programming error, not an environmental one.
-    try:
-        ensure_app_dir()
-        with _lock:
-            with ACTIVITY_FILE.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(asdict(event)) + "\n")
-            _trim_if_needed()
-    except OSError:
-        pass
+    # Swallowed exactly as the file write was: record() runs inside the live
+    # request path, and losing an audit line is the lesser failure (db.execute
+    # returns None rather than raising). The category check above still raises
+    # — that is a programming error, not an environmental one.
+    db.execute("INSERT INTO activity_event (ts, category, text, meta) VALUES (?, ?, ?, ?)",
+               (event.timestamp, event.category, event.text, event.meta))
     return event
-
-
-def _trim_if_needed() -> None:
-    """Caller must hold _lock. Keeps the file bounded without a database;
-    cheap enough at MAX_EVENTS scale to check on every write."""
-    if not ACTIVITY_FILE.exists():
-        return
-    lines = ACTIVITY_FILE.read_text(encoding="utf-8").splitlines()
-    if len(lines) > MAX_EVENTS:
-        trimmed = lines[-MAX_EVENTS:]
-        tmp = ACTIVITY_FILE.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
-        tmp.replace(ACTIVITY_FILE)
 
 
 def list_events(
@@ -77,38 +65,20 @@ def list_events(
     since: Optional[str] = None,
     until: Optional[str] = None,
 ) -> list[ActivityEvent]:
-    """`since`/`until` are inclusive ISO 8601 timestamps, compared as
-    strings. Safe because every stored timestamp is ISO 8601 UTC, which
+    """Newest first. `since`/`until` are inclusive ISO 8601 timestamps compared
+    as strings — safe because every stored timestamp is ISO 8601 UTC, which
     sorts identically as a string and as a datetime."""
-    if not ACTIVITY_FILE.exists():
-        return []
-    events = []
-    with _lock:
-        lines = ACTIVITY_FILE.read_text(encoding="utf-8").splitlines()
-    for line in reversed(lines):  # newest first
-        if not line.strip():
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # a corrupt line never breaks the whole log
-        if not isinstance(data, dict):
-            continue
-        if category and data.get("category") != category:
-            continue
-        ts = data.get("timestamp", "")
-        if since and ts < since:
-            continue
-        if until and ts > until:
-            continue
-        try:
-            events.append(ActivityEvent(**data))
-        except TypeError:
-            # Valid JSON, wrong shape: a field this build does not know
-            # (written by a newer version, then downgraded) or one missing.
-            # "A corrupt line never breaks the whole log" has to mean this
-            # too, or one such line 500s the whole Activity page.
-            continue
-        if len(events) >= limit:
-            break
-    return events
+    clauses, params = [], []
+    if category:
+        clauses.append("category = ?")
+        params.append(category)
+    if since:
+        clauses.append("ts >= ?")
+        params.append(since)
+    if until:
+        clauses.append("ts <= ?")
+        params.append(until)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(int(limit))
+    return [ActivityEvent(timestamp=r["ts"], category=r["category"], text=r["text"], meta=r["meta"])
+            for r in db.query(f"SELECT * FROM activity_event{where} ORDER BY id DESC LIMIT ?", params)]

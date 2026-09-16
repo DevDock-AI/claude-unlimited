@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import claude_unlimited.db as db
 import claude_unlimited.usage_history as usage_history
 
 
@@ -38,22 +39,15 @@ def test_record_missing_usage_fields_default_to_zero(env):
     assert event.output_tokens == 0
 
 
-def test_list_events_survives_corrupt_line(env):
-    usage_history.USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    usage_history.record("prof-a", None, "claude-sonnet-5", {"input_tokens": 1, "output_tokens": 1})
-    with usage_history.USAGE_HISTORY_FILE.open("a") as f:
-        f.write("not valid json\n")
-    events = usage_history.list_events()
-    assert len(events) == 1
-
-
-def test_trims_to_max_events(env, monkeypatch):
+def test_history_is_kept_rather_than_trimmed(env, monkeypatch):
+    """The old log discarded everything past MAX_EVENTS; a statistics view
+    measured in months cannot be built on that."""
     monkeypatch.setattr(usage_history, "MAX_EVENTS", 5)
     for i in range(10):
         usage_history.record(f"prof-{i}", None, "claude-sonnet-5", {"input_tokens": 1, "output_tokens": 1})
     events = usage_history.list_events()
-    assert len(events) == 5
-    assert events[-1].profile_id == "prof-9"  # newest survives
+    assert len(events) == 10
+    assert events[-1].profile_id == "prof-9" and events[0].profile_id == "prof-0"
 
 
 def test_reset_clears_history(env):
@@ -323,29 +317,6 @@ def test_tokens_by_project_cost_none_when_no_priced_events():
     assert totals["-Users-a-app"]["cost_usd"] is None
 
 
-def test_a_line_with_the_wrong_shape_is_skipped_not_fatal(monkeypatch, tmp_path):
-    """This file feeds GET /api/profiles, both usage pages, and the api-kind
-    token-budget check on the request path. One valid-JSON-wrong-shape line
-    used to take all of them down together with a TypeError."""
-    log = tmp_path / "usage_history.jsonl"
-    monkeypatch.setattr(usage_history, "APP_DIR", tmp_path)
-    monkeypatch.setattr(usage_history, "USAGE_HISTORY_FILE", log)
-
-    usage_history.record("a", None, "claude-opus-4",
-                         {"input_tokens": 10, "output_tokens": 20})
-    with log.open("a", encoding="utf-8") as f:
-        f.write('{"timestamp":"2026-01-02T00:00:00+00:00","profile_id":"a",'
-                '"project_id":null,"model":"m","input_tokens":1,"output_tokens":1,'
-                '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,'
-                '"cost_usd":null,"reasoning_tokens":7}\n')   # a field this build does not know
-        f.write('{"timestamp":"2026-01-02T00:00:00+00:00"}\n')  # missing fields
-        f.write('[1, 2, 3]\n')                                   # not an object
-
-    events = usage_history.list_events()
-    assert [e.profile_id for e in events] == ["a"]
-    assert events[0].input_tokens == 10
-
-
 def test_requested_model_is_recorded_when_the_served_model_differs(env):
     """A codex-kind Profile answers with the OpenAI model that actually ran, so
     the log alone could not tell a Fable request from an Opus one — both come
@@ -365,19 +336,4 @@ def test_requested_model_is_left_out_when_it_matches_what_served(env):
     assert event.requested_model is None
     assert usage_history.list_events()[0].requested_model is None
 
-
-def test_rows_written_before_requested_model_existed_still_load(env):
-    """list_events() drops any row it cannot construct, so a new field without a
-    default would have silently emptied every existing user's usage history."""
-    import json
-
-    legacy = {"timestamp": "2026-09-01T10:00:00+00:00", "profile_id": "p", "project_id": None,
-              "model": "claude-sonnet-5", "input_tokens": 5, "output_tokens": 5,
-              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "cost_usd": 0.01}
-    usage_history.USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    usage_history.USAGE_HISTORY_FILE.write_text(json.dumps(legacy) + "\n")
-
-    events = usage_history.list_events()
-    assert len(events) == 1
-    assert events[0].model == "claude-sonnet-5" and events[0].requested_model is None
 

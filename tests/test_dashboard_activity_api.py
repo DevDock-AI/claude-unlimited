@@ -83,12 +83,10 @@ def test_activity_limit_query_param_respected(running_server, monkeypatch):
 
 def test_activity_since_until_query_params_respected(running_server):
     base, _ = running_server
-    import claude_unlimited.activity as activity
-    activity.ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with activity.ACTIVITY_FILE.open("a") as f:
-        for day, text in [("18", "day-18"), ("19", "day-19"), ("20", "day-20")]:
-            f.write(json.dumps({"timestamp": f"2026-08-{day}T00:00:00+00:00", "category": "config",
-                                 "text": text, "meta": None}) + "\n")
+    import claude_unlimited.db as db
+    for day, text in [("18", "day-18"), ("19", "day-19"), ("20", "day-20")]:
+        db.execute("INSERT INTO activity_event (ts, category, text, meta) VALUES (?, ?, ?, ?)",
+                   (f"2026-08-{day}T00:00:00+00:00", "config", text, None))
 
     with urllib.request.urlopen(f"{base}/api/activity?since=2026-08-19T00:00:00%2B00:00", timeout=2) as resp:
         body = json.loads(resp.read())

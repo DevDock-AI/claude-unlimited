@@ -19,11 +19,15 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from . import pricing
+from . import db, pricing
 from .config import APP_DIR, ensure_app_dir
 
+# Kept for db.import_legacy_logs(), which is the only thing that still reads
+# this file: rows live in the SQLite store now.
 USAGE_HISTORY_FILE = APP_DIR / "usage_history.jsonl"
-MAX_EVENTS = 20_000  # keeps the local log from growing without bound
+# No longer trims anything — the store keeps every event, which is the whole
+# point of moving off the log. Retained because callers use it as a read cap.
+MAX_EVENTS = 20_000
 
 _lock = threading.Lock()
 
@@ -64,56 +68,32 @@ def record(profile_id: str, project_id: Optional[str], model: Optional[str], usa
         # and "was this request translated?" is answerable from the log alone.
         requested_model=requested_model if requested_model and requested_model != model else None,
     )
-    ensure_app_dir()
-    with _lock:
-        with USAGE_HISTORY_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(event)) + "\n")
-        _trim_if_needed()
+    # Best-effort, exactly as the JSONL write was: a lost usage row must never
+    # surface as an exception in the request path (db.execute swallows).
+    db.execute(
+        """INSERT INTO usage_event (ts, profile_id, project_id, model, input_tokens, output_tokens,
+                                    cache_creation_input_tokens, cache_read_input_tokens, cost_usd,
+                                    requested_model)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (event.timestamp, event.profile_id, event.project_id, event.model,
+         event.input_tokens, event.output_tokens, event.cache_creation_input_tokens,
+         event.cache_read_input_tokens, event.cost_usd, event.requested_model))
     return event
 
 
-def _trim_if_needed() -> None:
-    """Caller must hold _lock."""
-    if not USAGE_HISTORY_FILE.exists():
-        return
-    lines = USAGE_HISTORY_FILE.read_text(encoding="utf-8").splitlines()
-    if len(lines) > MAX_EVENTS:
-        trimmed = lines[-MAX_EVENTS:]
-        tmp = USAGE_HISTORY_FILE.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
-        tmp.replace(USAGE_HISTORY_FILE)
-
-
 def list_events() -> list[UsageEvent]:
-    if not USAGE_HISTORY_FILE.exists():
-        return []
-    with _lock:
-        lines = USAGE_HISTORY_FILE.read_text(encoding="utf-8").splitlines()
-    events = []
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # a corrupt line never breaks the whole log
-        if not isinstance(data, dict):
-            continue
-        try:
-            events.append(UsageEvent(**data))
-        except TypeError:
-            # Valid JSON, wrong shape — an unknown or missing field. This
-            # file is read by GET /api/profiles, the usage pages AND the
-            # api-kind token-budget check on the request path, so one such
-            # line would otherwise take all of them down at once.
-            continue
-    return events
+    """Oldest first, the order the append-only log produced and every
+    aggregation helper below assumes."""
+    return [UsageEvent(timestamp=r["ts"], profile_id=r["profile_id"], project_id=r["project_id"],
+                       model=r["model"], input_tokens=r["input_tokens"], output_tokens=r["output_tokens"],
+                       cache_creation_input_tokens=r["cache_creation_input_tokens"],
+                       cache_read_input_tokens=r["cache_read_input_tokens"],
+                       cost_usd=r["cost_usd"], requested_model=r["requested_model"])
+            for r in db.query("SELECT * FROM usage_event ORDER BY id")]
 
 
 def reset() -> None:
-    with _lock:
-        ensure_app_dir()
-        USAGE_HISTORY_FILE.write_text("")
+    db.execute("DELETE FROM usage_event")
 
 
 # ---- pure aggregation helpers (no I/O: take the list, return a shape) ----

@@ -172,10 +172,15 @@ def test_usage_summary_range_param_filters_by_real_elapsed_time(running_server):
         input_tokens=100, output_tokens=0, cache_creation_input_tokens=0,
         cache_read_input_tokens=0, cost_usd=0.5,
     )
-    usage_history.USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with usage_history.USAGE_HISTORY_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(dataclasses.asdict(old_event)) + "\n")
-        f.write(json.dumps(dataclasses.asdict(recent_event)) + "\n")
+    import claude_unlimited.db as db
+    for event in (old_event, recent_event):
+        db.execute(
+            """INSERT INTO usage_event (ts, profile_id, project_id, model, input_tokens, output_tokens,
+                                        cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event.timestamp, event.profile_id, event.project_id, event.model, event.input_tokens,
+             event.output_tokens, event.cache_creation_input_tokens, event.cache_read_input_tokens,
+             event.cost_usd))
 
     # Both events visible over a year
     status, body = _request(f"{running_server}/api/usage/summary?range=1y")
