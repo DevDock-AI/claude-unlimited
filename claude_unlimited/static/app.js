@@ -577,7 +577,13 @@ function renderStatStrip(profiles) {
   const el = document.getElementById('statStrip');
   if (!el) return;
 
-  const activeName = (_lastStatus && _lastStatus.current_profile_name) || t('stat.no_active');
+  // Agents routed per branch (balancing, forced subagents) never move
+  // current_profile_id, so the pointer alone would name a stale account.
+  // Profiles serving live agents are what is actually active; busiest first.
+  const serving = profiles.filter((p) => p.live_agents > 0).sort((a, b) => b.live_agents - a.live_agents);
+  const activeName = serving.length
+    ? serving.slice(0, 2).map((p) => p.name).join(', ') + (serving.length > 2 ? ` +${serving.length - 2}` : '')
+    : (_lastStatus && _lastStatus.current_profile_name) || t('stat.no_active');
   const enabledCount = profiles.filter((p) => p.enabled).length;
 
   // Both reset fields must be considered: an oauth Profile populates only
@@ -653,6 +659,22 @@ const CODEX_PLAN_LABEL_KEYS = {
 // neutral badge since "plan" doesn't apply, and codex its own flat --codex
 // accent. No "5x"/"20x" multiplier: neither provider exposes it over an API,
 // so there is no way to show it without guessing.
+// The "Forced in subagents" marker: this Profile serves every subagent branch,
+// whatever rotation would otherwise pick. Shown wherever a Profile is listed so
+// the routing override is never invisible.
+const SUBAGENT_TAG_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2"/><path d="M12 7v3M6 21v-3a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v3"/><circle cx="6" cy="21" r="1"/><circle cx="18" cy="21" r="1"/></svg>';
+function subagentTag(p) {
+  if (!p.forced_for_subagents) return '';
+  return `<span class="subagent-tag" title="${esc(t('profiles.forced_subagents_tag_title'))}">${SUBAGENT_TAG_ICON}<span>${esc(t('profiles.forced_subagents_tag'))}</span></span>`;
+}
+
+// How many Claude Code agents (main agents and subagents) are pinned to this
+// Profile right now. The live counterpart of "active" for per-branch routing.
+function liveAgentsPill(p) {
+  if (!(p.live_agents > 0)) return '';
+  return `<span class="live-agents-pill" title="${esc(t('profiles.live_agents_title'))}">${esc(t('profiles.live_agents_tag').replace('{n}', String(p.live_agents)))}</span>`;
+}
+
 function planBadge(p) {
   if (p.kind === 'codex') {
     // An api_key codex Profile is a raw OpenAI API key — there's no ChatGPT
@@ -850,7 +872,7 @@ function usageWindowLabelOrBlank(rawLabel) {
 }
 
 function renderProfileCard(p) {
-  const isActive = _lastStatus && _lastStatus.current_profile_id === p.id;
+  const isActive = (_lastStatus && _lastStatus.current_profile_id === p.id) || p.live_agents > 0;
   const statusColors = STATUS_COLORS[p.status_word] || { color: 'var(--good)', bg: 'var(--good-soft)' };
   // The plan badge already names the tier, so this carries only the detail
   // it has no room for: the base_url. A chatgpt_subscription codex Profile
@@ -899,7 +921,7 @@ function renderProfileCard(p) {
       <div class="p-top">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
-        ${planBadge(p)}
+        ${planBadge(p)}${subagentTag(p)}${liveAgentsPill(p)}
         ${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}
         ${kindLabel ? `<span class="p-kind">${kindLabel}</span>` : ''}
         <span class="p-priority" title="${esc(t('profiles.priority_tooltip'))}">
@@ -990,7 +1012,7 @@ function oauthKindLabel(p) {
 }
 
 function renderProfileTableRow(p) {
-  const isActive = _lastStatus && _lastStatus.current_profile_id === p.id;
+  const isActive = (_lastStatus && _lastStatus.current_profile_id === p.id) || p.live_agents > 0;
   const kindLabel = oauthKindLabel(p);
   const has5h = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
   const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
@@ -1038,7 +1060,7 @@ function renderProfileTableRow(p) {
       <div class="row-name-cell">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
-          <div class="p-name">${esc(p.name)} ${planBadge(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}</div>
+          <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}</div>
           <div class="p-kind">${kindLabel}</div>
         </div>
       </div>
@@ -1236,6 +1258,10 @@ function openProfileKebabMenu(anchorBtn, profileId) {
     { icon: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>', label: t('profiles.menu_fetch_info'), action: 'fetch_info' },
     { divider: true },
     { icon: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/>', label: t('profiles.menu_take_over'), action: 'take_over', title: t('profiles.take_over_tooltip') },
+    { icon: '<circle cx="12" cy="5" r="2"/><path d="M12 7v3M6 21v-3a3 3 0 0 1 3-3h6a3 3 0 0 1 3 3v3"/><circle cx="6" cy="21" r="1"/><circle cx="18" cy="21" r="1"/>',
+      label: profile.forced_for_subagents ? t('profiles.menu_unforce_subagents') : t('profiles.menu_force_subagents'),
+      action: 'forced_subagents',
+      title: t('profiles.forced_subagents_tag_title') },
     { divider: true },
     { icon: '<path d="M4.9 4.9l14.2 14.2"/><circle cx="12" cy="12" r="9"/>', label: profile.enabled ? t('profiles.menu_disable') : t('profiles.menu_enable'), action: 'toggle' },
     { icon: '<path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m-9 0 1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/>', label: t('profile.remove'), action: 'remove', danger: true },
@@ -1277,6 +1303,26 @@ function openProfileKebabMenu(anchorBtn, profileId) {
           await loadProfiles();
         } catch (err) {
           showToast('error', t('toast.take_over_failed'), err.message);
+        }
+      }
+      if (action === 'forced_subagents') {
+        const turningOn = !profile.forced_for_subagents;
+        try {
+          await api(`/api/profiles/${profileId}`, {
+            method: 'PATCH', body: JSON.stringify({ forced_for_subagents: turningOn }),
+          });
+          // Turning it on silently would be the one case worth explaining, so
+          // the toast carries the same sentence the modal's toggle does.
+          showToast('success',
+            turningOn ? t('toast.forced_subagents_on') : t('toast.forced_subagents_off'),
+            turningOn ? t('modal.add_profile.forced_subagents_sub') : profile.name,
+            turningOn ? { duration: 6000 } : undefined);
+          await loadProfilesTable();
+          await loadProfiles();
+        } catch (err) {
+          // The common failure is another profile already holding it — the
+          // daemon's message names that profile, so show it verbatim.
+          showToast('error', t('toast.forced_subagents_failed'), err.message);
         }
       }
       if (action === 'test') {
@@ -1461,6 +1507,7 @@ function openProfileDetailModal(profileId) {
 
   document.getElementById('pd_priority_val').textContent = String(p.priority);
   document.getElementById('pd_automatic_toggle').classList.toggle('off', !p.automatic);
+  setForcedSubagentsToggle('pd', !!p.forced_for_subagents);
   document.getElementById('pd_automatic_sub').textContent = p.automatic ? t('profiles.automatic_on_sub') : t('profiles.automatic_off_sub');
   _pdSelectedTagColor = p.tag_color || null;
   renderDetailTagRow();
@@ -1489,6 +1536,7 @@ async function saveProfileDetail() {
     name,
     priority: Number(document.getElementById('pd_priority_val').textContent),
     automatic: !document.getElementById('pd_automatic_toggle').classList.contains('off'),
+    forced_for_subagents: !document.getElementById('pd_forced_subagents_toggle').classList.contains('off'),
     tag_color: _pdSelectedTagColor,
   };
   if (isApi) {
@@ -2319,6 +2367,8 @@ async function loadSettings() {
     document.getElementById('updateModeSelect')._cuOptions = UPDATE_MODE_OPTIONS();
     document.getElementById('updateModeSelect')._cuRenderValue();
     setToggleState(document.getElementById('notifMasterToggle'), settings.notifications_enabled);
+    setToggleState(document.getElementById('distributeDefaultToggle'), settings.distribute_sessions_default);
+    setToggleState(document.getElementById('usageFreshToggle'), settings.keep_usage_fresh);
     renderNotifList(settings);
     refreshUpdateState();
   } catch (e) {
@@ -2395,6 +2445,29 @@ async function toggleNotificationsMaster() {
   const next = el.classList.contains('off');
   await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ notifications_enabled: next }) });
   setToggleState(el, next);
+}
+
+async function toggleUsageFresh() {
+  const el = document.getElementById('usageFreshToggle');
+  const next = el.classList.contains('off');
+  await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ keep_usage_fresh: next }) });
+  setToggleState(el, next);
+}
+
+async function toggleDistributeDefault() {
+  const el = document.getElementById('distributeDefaultToggle');
+  const next = el.classList.contains('off');
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ distribute_sessions_default: next }) });
+    setToggleState(el, next);
+    // It changes how every session consumes accounts, so say what happened
+    // rather than letting a silent knob-slide be the only feedback.
+    showToast('success',
+      next ? t('toast.distribute_default_on') : t('toast.distribute_default_off'),
+      t('toast.distribute_default_detail'), { duration: 6000 });
+  } catch (err) {
+    showToast('error', t('toast.settings_save_failed'), err.message);
+  }
 }
 
 async function loadDaemonServiceStatus() {
@@ -2700,6 +2773,7 @@ function openModal() {
   _selectedTagColor = null;
   renderAddProfileTagRow();
   document.getElementById('f_automatic_toggle').classList.remove('off');
+  setForcedSubagentsToggle('f', false);
   document.getElementById('advancedBody').classList.add('open');
   document.getElementById('advancedToggle').classList.add('open');
   document.getElementById('importStatus').style.display = 'none';
@@ -2725,6 +2799,7 @@ async function submitProfile() {
     switch_threshold: Number(document.getElementById('f_threshold_val').textContent),
     priority: Number(document.getElementById('f_priority_val').textContent),
     automatic: !document.getElementById('f_automatic_toggle').classList.contains('off'),
+    forced_for_subagents: !document.getElementById('f_forced_subagents_toggle').classList.contains('off'),
   };
   if (_selectedTagColor) payload.tag_color = _selectedTagColor;
   if (kind === 'api') {
@@ -3081,6 +3156,21 @@ document.addEventListener('visibilitychange', () => {
 });
 setInterval(pollLiveUpdate, 1000);
 
+// Tells the daemon a person is here, so background usage checks run while the
+// Dashboard is actually in use and pause once it isn't. Real input only — a
+// tab left open on another screen is not a person — and at most once a minute.
+let _lastPresencePing = 0;
+function notePresence() {
+  if (document.hidden) return;
+  const now = Date.now();
+  if (now - _lastPresencePing < 60000) return;
+  _lastPresencePing = now;
+  api('/api/presence', { method: 'POST' }).catch(() => {});
+}
+['pointerdown', 'keydown', 'wheel'].forEach((type) => document.addEventListener(type, notePresence, { passive: true }));
+document.addEventListener('visibilitychange', notePresence);
+notePresence();
+
 document.querySelectorAll('.rail-item').forEach((el) => {
   el.addEventListener('click', () => switchView(el.dataset.view));
 });
@@ -3091,6 +3181,8 @@ document.getElementById('paritySaveBtn').addEventListener('click', saveModelPari
 document.getElementById('parityResetBtn').addEventListener('click', resetModelParity);
 document.getElementById('parityAddBtn').addEventListener('click', onAddParityRow);
 document.getElementById('notifMasterToggle').addEventListener('click', toggleNotificationsMaster);
+document.getElementById('distributeDefaultToggle').addEventListener('click', toggleDistributeDefault);
+document.getElementById('usageFreshToggle').addEventListener('click', toggleUsageFresh);
 document.getElementById('autostartToggle').addEventListener('click', toggleAutostart);
 document.getElementById('regenTokenBtn').addEventListener('click', regeneratePlaceholderToken);
 document.getElementById('killProcessBtn').addEventListener('click', killProcess);
@@ -3172,6 +3264,23 @@ document.getElementById('profileDetailCancelBtn').addEventListener('click', clos
 document.getElementById('pd_save_btn').addEventListener('click', saveProfileDetail);
 document.getElementById('pd_remove_btn').addEventListener('click', removeProfileFromDetail);
 document.getElementById('pd_automatic_toggle').addEventListener('click', (e) => e.currentTarget.classList.toggle('off'));
+
+// "Always use this profile for subagents" — the warning is only shown while
+// the toggle is ON, so activating it always states plainly what it does.
+function setForcedSubagentsToggle(prefix, on) {
+  const toggle = document.getElementById(`${prefix}_forced_subagents_toggle`);
+  const warning = document.getElementById(`${prefix}_forced_subagents_warning`);
+  if (!toggle) return;
+  toggle.classList.toggle('off', !on);
+  if (warning) warning.hidden = !on;
+}
+['f', 'pd'].forEach((prefix) => {
+  const toggle = document.getElementById(`${prefix}_forced_subagents_toggle`);
+  if (!toggle) return;
+  toggle.addEventListener('click', () => {
+    setForcedSubagentsToggle(prefix, toggle.classList.contains('off'));
+  });
+});
 document.querySelectorAll('[data-pd-step]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const field = btn.dataset.pdStep;

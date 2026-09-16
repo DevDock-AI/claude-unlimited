@@ -367,3 +367,94 @@ def test_delete_still_succeeds_when_the_directory_is_already_gone(fake_store, tm
                                 claude_config_dir=str(tmp_path / "claude-accounts" / "never-made"))
     profiles.delete_profile(p.id)
     assert profiles.list_profiles() == []
+
+
+# ---- "always use this profile for subagents" ------------------------------
+
+def test_forced_for_subagents_can_be_set_and_cleared(fake_store):
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    assert a.forced_for_subagents is False  # off by default — it changes routing
+
+    updated = profiles.update_profile(a.id, forced_for_subagents=True)
+    assert updated.forced_for_subagents is True
+    assert profiles.update_profile(a.id, forced_for_subagents=False).forced_for_subagents is False
+
+
+def test_only_one_profile_can_be_forced_for_subagents(fake_store):
+    # "every subagent goes here" is meaningless if two claim it, so the second
+    # is refused with a message naming the one that already holds it, rather
+    # than silently demoting it.
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    b = profiles.create_profile(name="GPT", kind="oauth", credential="sk-ant-87654321", account_uuid="u2")
+    profiles.update_profile(a.id, forced_for_subagents=True)
+
+    with pytest.raises(profiles.ValidationError, match="Claude"):
+        profiles.update_profile(b.id, forced_for_subagents=True)
+
+    # Turning it off on the holder frees it for the other one.
+    profiles.update_profile(a.id, forced_for_subagents=False)
+    assert profiles.update_profile(b.id, forced_for_subagents=True).forced_for_subagents is True
+
+
+def test_updating_the_holder_itself_is_not_blocked_by_its_own_flag(fake_store):
+    # Re-saving the holder (e.g. renaming it) must not trip the uniqueness
+    # check against itself.
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    profiles.update_profile(a.id, forced_for_subagents=True)
+    renamed = profiles.update_profile(a.id, name="Claude Main", forced_for_subagents=True)
+    assert renamed.name == "Claude Main" and renamed.forced_for_subagents is True
+
+
+def test_a_new_profile_can_be_created_forced_for_subagents(fake_store):
+    """The Dashboard's Add Profile form always sends forced_for_subagents;
+    create_profile once had no such parameter, so every add from the form failed."""
+    a = profiles.create_profile(name="GPT", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="u1", forced_for_subagents=True)
+    assert a.forced_for_subagents is True
+
+    with pytest.raises(profiles.ValidationError, match="GPT"):
+        profiles.create_profile(name="Other", kind="oauth", credential="sk-ant-87654321",
+                                account_uuid="u2", forced_for_subagents=True)
+    assert [p.name for p in profiles.list_profiles()] == ["GPT"]
+    assert list(fake_store.tokens) == [a.id]  # the refused one's Keychain entry was rolled back
+
+
+def test_a_disabled_holder_does_not_block_forcing_another_profile(fake_store):
+    # A disabled holder routes nothing; refusing would send the user off to
+    # edit an account they already turned off. The mark moves instead.
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    b = profiles.create_profile(name="GPT", kind="oauth", credential="sk-ant-87654321", account_uuid="u2")
+    profiles.update_profile(a.id, forced_for_subagents=True)
+    profiles.update_profile(a.id, enabled=False)
+
+    assert profiles.update_profile(b.id, forced_for_subagents=True).forced_for_subagents is True
+    by_id = {p.id: p for p in profiles.list_profiles()}
+    assert by_id[a.id].forced_for_subagents is False  # moved, not duplicated
+
+
+def test_forced_for_subagents_must_be_a_boolean(fake_store):
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    with pytest.raises(profiles.ValidationError):
+        profiles.update_profile(a.id, forced_for_subagents="yes")
+
+
+def test_a_config_with_two_forced_holders_still_loads_and_saves(fake_store):
+    """A hand-edited or foreign config with two holders used to make every
+    later save raise, while routing quietly used one of them."""
+    import json
+
+    import claude_unlimited.config as config
+
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    b = profiles.create_profile(name="GPT", kind="oauth", credential="sk-ant-87654321", account_uuid="u2")
+    raw = json.loads(config.CONFIG_FILE.read_text())
+    for item in raw["profiles"]:
+        item["forced_for_subagents"] = True
+        if item["id"] == a.id:
+            item["enabled"] = False
+    config.CONFIG_FILE.write_text(json.dumps(raw))
+
+    # Keeps the holder routing actually uses: the first ENABLED one.
+    assert [p.id for p in config.load_pool().profiles if p.forced_for_subagents] == [b.id]
+    profiles.update_profile(a.id, name="Claude renamed")  # used to raise TooManySubagentProfilesError
+

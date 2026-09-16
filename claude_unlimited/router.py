@@ -95,6 +95,61 @@ def choose(pool: PoolSnapshot, now: datetime) -> RoutingDecision:
     return RoutingDecision(profile_id=candidates[0].profile_id, reason="rotated")
 
 
+def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
+                          branch_counts: Optional[dict] = None,
+                          exclude: frozenset = frozenset()) -> RoutingDecision:
+    """Pick the account for a NEW conversation branch (a session's main agent
+    or one of its subagents) — used only by distribute-mode routing.
+
+    Unlike choose(), this is deliberately NOT sticky and NOT "first by
+    priority": its job is to spread branches so one account isn't drained
+    while another sits idle. Ordering, in force:
+
+      1. fewest branches currently pinned to it (`branch_counts`) — the
+         spreading rule, and it has to come FIRST. Any other leading key
+         (priority, utilization) is the same for every branch of a session,
+         so every branch would pick the same winner and "each subagent gets
+         its own account" would quietly become "all of them share one".
+         Count-first makes the assignment round-robin: each account takes a
+         branch before any account takes a second.
+      2. priority band — decides the order WITHIN a round, so the user's
+         preference still says who is used first, second, third.
+      3. least-utilized first (`last_usage_percent`) — accounts are limited
+         by usage windows, not request count. A profile with no observation
+         yet sorts as 0.0, so a fresh account is preferred over a part-spent
+         one at the same priority.
+      4. `_reset_sort_key` — the same last resort choose() uses.
+
+    A depleted account can't be pulled in by this: candidates are ELIGIBLE
+    only, so exhausted, draining and cooling-down accounts are already out.
+
+    `branch_counts` is passed IN (derived by Gateway from its pin map) rather
+    than read here: this module stays pure — no I/O, no clock, no mutable
+    cross-request state — so it remains deterministically testable.
+
+    Candidates must be ELIGIBLE and `automatic`: a manual-only Profile is
+    never auto-assigned to a branch (that's what `automatic` means), which is
+    a deliberate difference from choose()'s current-pointer exception.
+    `exclude` carries the ids already tried and failed for this request, so
+    failover picks a genuinely different account."""
+    counts = branch_counts or {}
+    candidates = [
+        p
+        for p in pool.profiles
+        if p.state == ProfileState.ELIGIBLE and p.automatic and p.profile_id not in exclude
+    ]
+    if not candidates:
+        return RoutingDecision(profile_id=None, reason="no_eligible_profile")
+    candidates.sort(key=lambda p: (
+        counts.get(p.profile_id, 0),
+        p.priority,
+        p.last_usage_percent if p.last_usage_percent is not None else 0.0,
+        _reset_sort_key(p),
+        p.profile_id,  # final tie-break so equal candidates order deterministically
+    ))
+    return RoutingDecision(profile_id=candidates[0].profile_id, reason="branch_assigned")
+
+
 def observe(pool: PoolSnapshot, profile_id: str, observation: Observation, now: datetime) -> PoolSnapshot:
     """Returns a NEW PoolSnapshot (the input is not mutated) with
     profile_id's runtime state folded in per the observation. Callers own

@@ -286,6 +286,14 @@ def _fetch_session_token(host: str, port: int, profile_id: str, timeout: float =
         return json.loads(resp.read())["token"]
 
 
+def _fetch_distribute_token(host: str, port: int, timeout: float = 2.0) -> str:
+    """A session token meaning "spread this session's branches across
+    accounts" — the main agent and each subagent get their own pin."""
+    url = f"http://{host}:{port}/api/session-token?mode=distribute"
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read())["token"]
+
+
 def _match_profile(profiles: list, needle: str):
     """Resolve --profile NAME_OR_ID against currently-enabled Profiles:
     exact id, then exact case-insensitive name, then a name substring. Only
@@ -1327,7 +1335,8 @@ def desktop_revert() -> int:
     return 0
 
 
-def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -> int:
+def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
+         distribute: bool = False) -> int:
     _banner()
     # Self-heal the CLI launchers on every `code` run. This is the RELIABLE
     # trigger: unlike the daemon-startup heal (which only fires if an update
@@ -1358,7 +1367,13 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
     # prompt it cannot answer. Both fall through to "Rotated accounts".
     forced_profile = None
     try:
-        enabled_profiles = load_pool().enabled_profiles()
+        pool = load_pool()
+        enabled_profiles = pool.enabled_profiles()
+        # Settings → "Balance sessions and subagents across accounts" makes --distribute the default.
+        # The daemon enforces this on its own (gateway._branch_decision reads
+        # the same setting), but the CLI has to know too: otherwise the picker
+        # below would pin the session and quietly override it.
+        distribute = distribute or pool.settings.distribute_sessions_default
     except Exception:
         enabled_profiles = []
 
@@ -1369,6 +1384,11 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
             if enabled_profiles:
                 print("Available: " + ", ".join(p.name for p in enabled_profiles), file=sys.stderr)
             return 1
+    elif distribute:
+        # --distribute already answered "which account?" — with "all of them,
+        # one per branch". Prompting would pin the session and silently undo
+        # the flag.
+        pass
     elif len(enabled_profiles) > 1 and sys.stdin.isatty():
         try:
             forced_profile = _prompt_profile_choice(enabled_profiles)
@@ -1379,6 +1399,8 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
     try:
         if forced_profile is not None:
             token = _fetch_session_token(LOOPBACK_HOST, port, forced_profile.id)
+        elif distribute:
+            token = _fetch_distribute_token(LOOPBACK_HOST, port)
         else:
             token = _fetch_placeholder_token(LOOPBACK_HOST, port)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError) as exc:
@@ -1401,6 +1423,9 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None) -
     if forced_profile is not None:
         print(f"Routing through Claude Unlimited at {LOOPBACK_HOST}:{port}, pinned to {forced_profile.name} "
               f"— launching claude…\n")
+    elif distribute:
+        print(f"Routing through Claude Unlimited at {LOOPBACK_HOST}:{port}, balancing across accounts "
+              f"(each new agent starts on the least-busy one) — launching claude…\n")
     else:
         print(f"Routing through Claude Unlimited at {LOOPBACK_HOST}:{port} — launching claude…\n")
     # execvp replaces this process image outright: it never returns and
@@ -1813,8 +1838,12 @@ def main(argv=None) -> int:
 
     code_p = sub.add_parser("code", help="start the daemon if needed, then launch `claude` routed through it")
     code_p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    code_p.add_argument("--profile", metavar="NAME_OR_ID", default=None,
-                         help="pin this session to one Profile by name or id, skipping the interactive picker")
+    code_pin = code_p.add_mutually_exclusive_group()
+    code_pin.add_argument("--profile", metavar="NAME_OR_ID", default=None,
+                           help="pin this session to one Profile by name or id, skipping the interactive picker")
+    code_pin.add_argument("--distribute", action="store_true",
+                           help="balance this session across accounts: the main agent and each subagent start "
+                                "on the least-busy Profile and stay there, each keeping its own prompt cache warm")
     # Deliberately no positional for claude's own args: nargs=REMAINDER
     # fails as soon as the first passthrough token looks like a flag (e.g.
     # `claude-unlimited code --model opus`, where argparse matches --model
@@ -1848,7 +1877,7 @@ def main(argv=None) -> int:
     if args.cmd == "reauth":
         return reauth(args.port)
     if args.cmd == "code":
-        return code(args.port, unknown, profile_arg=args.profile)
+        return code(args.port, unknown, profile_arg=args.profile, distribute=args.distribute)
     if args.cmd == "desktop":
         return desktop_revert() if args.revert else desktop(args.port)
     if args.cmd == "install":

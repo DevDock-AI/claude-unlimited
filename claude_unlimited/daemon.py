@@ -41,6 +41,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
+from . import usage_probe
 from . import activity
 from . import anthropic_oauth
 from . import connection_test
@@ -244,6 +245,7 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "codex_home": p.codex_home,
         "codex_model": p.codex_model,
         "codex_reasoning_effort": p.codex_reasoning_effort,
+        "forced_for_subagents": getattr(p, "forced_for_subagents", False),
         "state": state_value,
         "status_word": _STATUS_WORDS.get(state_value, state_value),
         "usage_5h_percent": runtime.last_usage_percent if runtime is not None else None,
@@ -379,6 +381,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "uptime_seconds": (datetime.now(timezone.utc) - _DAEMON_STARTED_AT).total_seconds(),
                 "current_profile_id": current_profile_id,
                 "current_profile_name": current_profile.name if current_profile is not None else None,
+                # Branch-routed agents never move current_profile_id; this is
+                # what they are actually on (profile id -> live agents).
+                "live_agents": _gateway.live_agent_counts(),
             })
             return
 
@@ -388,6 +393,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             in_flight = _gateway.in_flight_ids()
             items = [_profile_to_public_dict(p, runtime_map.get(p.id), usage_map.get(p.id), p.id in in_flight)
                      for p in profile_repo.list_profiles()]
+            live_agents = _gateway.live_agent_counts()
+            for item in items:
+                item["live_agents"] = live_agents.get(item["id"], 0)
             self._send_json(200, {"profiles": items})
             return
 
@@ -448,9 +456,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             # reuses a live token for the same profile_id instead of minting
             # one per call, so this stays an idempotent lookup.
             qs = parse_qs(urlparse(self.path).query)
+            # `mode=distribute` is the alternative to pinning: the session
+            # spreads its branches (main agent + each subagent) across
+            # accounts instead of being tied to one Profile.
+            if qs.get("mode", [None])[0] == "distribute":
+                self._send_json(200, {"token": session_tokens.get_or_create_distribute()})
+                return
             profile_id = qs.get("profile_id", [None])[0]
             if not profile_id:
-                self._send_json(400, {"error": "bad_request", "message": "profile_id is required."})
+                self._send_json(400, {"error": "bad_request",
+                                       "message": "profile_id or mode=distribute is required."})
                 return
             profile = next((p for p in profile_repo.list_profiles() if p.id == profile_id), None)
             if profile is None:
@@ -584,6 +599,13 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if not self._check_csrf():
+            return
+
+        if path == "/api/presence":
+            # Real Dashboard input (app.js notePresence, at most once a minute).
+            # Keeps background usage checks running while someone is here.
+            _note_user_activity()
+            self._send_json(200, {"active": True})
             return
 
         if path == "/api/profiles":
@@ -963,17 +985,17 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def _check_placeholder_token(self) -> Optional[tuple]:
         """None on rejection, having already sent the 401. Otherwise a
-        (forced_profile_id_or_None,) tuple: the shared placeholder token
-        carries no forced profile and normal Rotation applies, while a
-        session_tokens-minted one pins the request to the Profile
-        `claude-unlimited code --profile` asked for."""
+        (SessionGrant,) tuple: the shared placeholder token grants nothing
+        special and normal Rotation applies, while a session_tokens-minted one
+        either pins the request to the Profile `--profile` asked for, or marks
+        the session as distributing its branches across accounts."""
         auth = self.headers.get("Authorization", "")
         presented = auth[len("Bearer "):] if auth.startswith("Bearer ") else auth
         if placeholder_token.matches(presented):
-            return (None,)
-        forced_profile_id = session_tokens.resolve(presented)
-        if forced_profile_id is not None:
-            return (forced_profile_id,)
+            return (session_tokens.SessionGrant(),)
+        grant = session_tokens.resolve_grant(presented)
+        if grant.forced_profile_id is not None or grant.distribute:
+            return (grant,)
         self._send_json(401, {"type": "error", "error": {"type": "authentication_error",
                                                            "message": "[claude-unlimited] invalid local credential"}})
         return None
@@ -984,17 +1006,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         Gated by the placeholder token or a session token, never by CSRF:
         Claude Code has no CSRF token, which is a Dashboard-browser
         concept."""
+        _note_user_activity()
 
         auth_result = self._check_placeholder_token()
         if auth_result is None:
             return
-        (forced_profile_id,) = auth_result
+        (grant,) = auth_result
 
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length > 0 else b""
         inbound_headers = {k: v for k, v in self.headers.items()}
 
-        result = _gateway.handle(method, path, inbound_headers, body, forced_profile_id=forced_profile_id)
+        result = _gateway.handle(method, path, inbound_headers, body,
+                                  forced_profile_id=grant.forced_profile_id,
+                                  distribute=grant.distribute)
 
         if result.error is not None:
             _FORCED_PROFILE_ERROR_MESSAGES = {
@@ -1146,6 +1171,9 @@ _RUNNING_PORT = DEFAULT_PORT
 
 
 _OAUTH_REFRESH_LOOP_INTERVAL_SECONDS = 60
+# Background usage checks (usage_probe.py): who is due, idle gating, backoff.
+_usage_probe = usage_probe.Scheduler()
+_usage_probe_tick_lock = threading.Lock()
 _UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 _UPDATE_CHECK_STARTUP_DELAY_SECONDS = 120
 # An update replaces the running code and needs a restart to take effect, so
@@ -1426,6 +1454,80 @@ def _install_deferred_update_if_idle() -> None:
     _restart_for_update(_RUNNING_PORT)
 
 
+def _note_user_activity() -> None:
+    """Any sign someone is using Claude Unlimited: a proxied request or real
+    Dashboard input. Coming back from an idle pause checks usage straight
+    away rather than on the next tick."""
+    try:
+        if _usage_probe.note_activity():
+            threading.Thread(target=_run_usage_probe_tick, daemon=True, name="usage-probe-resume").start()
+    except Exception:  # noqa: BLE001 - presence tracking must never break a request
+        pass
+
+
+def _usage_probe_candidates(pool) -> list:
+    runtime = _gateway.runtime_snapshot()
+    observed = _gateway.usage_observed_at()
+    candidates = []
+    for profile in pool.profiles:
+        provider = usage_probe.provider_for(profile)
+        if provider is None or not profile.enabled:
+            continue
+        rt = runtime.get(profile.id)
+        # A Profile that needs re-auth is the refresh loop's business; a read
+        # would only fail, and failing reads are exactly the noise to avoid.
+        if rt is not None and rt.state.value in ("auth_invalid", "disabled"):
+            continue
+        candidates.append(usage_probe.Candidate(profile.id, provider, observed.get(profile.id)))
+    return candidates
+
+
+def _probe_usage(profile) -> None:
+    provider = usage_probe.provider_for(profile)
+    try:
+        stored = profile_repo.secret_store.get_token(profile.id)
+        if provider == usage_probe.PROVIDER_ANTHROPIC:
+            # Through the Gateway's refresh, which owns the one per-Profile
+            # refresh backoff clock — never a second, competing refresh path.
+            result = usage_probe.fetch_anthropic_usage(_gateway._maybe_refresh_credential(profile, stored))
+        else:
+            from . import openai_bridge, openai_credential
+            credential = openai_bridge._refresh_if_needed(profile, openai_credential.decode(stored))
+            result = usage_probe.fetch_codex_usage(credential)
+    except Exception:  # noqa: BLE001 - counted as a failure, with backoff
+        result = usage_probe.ProbeResult(status=None)
+    message = _usage_probe.record(profile.id, provider, result)
+    if result.status == 200 and result.headers:
+        _record_ping(profile, {"status": 200, "headers": result.headers})
+    if message:
+        activity.record("error", f"{profile.name} — usage check paused", meta=message)
+
+
+def _run_usage_probe_tick() -> None:
+    """One pass: read usage for whichever accounts are due. Never overlaps
+    itself (a resume can race the timer), never raises."""
+    if not _usage_probe_tick_lock.acquire(blocking=False):
+        return
+    try:
+        pool = load_pool()
+        if not pool.settings.keep_usage_fresh:
+            return
+        for profile_id in _usage_probe.due(_usage_probe_candidates(pool)):
+            profile = pool.get(profile_id)
+            if profile is not None:
+                _probe_usage(profile)
+    except Exception:  # noqa: BLE001 - a background courtesy, never a crash
+        pass
+    finally:
+        _usage_probe_tick_lock.release()
+
+
+def _usage_probe_loop() -> None:
+    while True:
+        time.sleep(usage_probe.TICK_SECONDS)
+        _run_usage_probe_tick()
+
+
 def _update_check_loop() -> None:
     """Polls for a new release on a slow timer.
 
@@ -1501,6 +1603,7 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
         pass
     threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
+    threading.Thread(target=_usage_probe_loop, daemon=True, name="usage-probe").start()
     print(f"CSRF token for this run (Dashboard needs it, never logged again): {_CSRF_TOKEN}")
     # Written on every start on every OS. Harmless where the installer
     # backend gets a pid another way (launchctl, systemctl), and the only

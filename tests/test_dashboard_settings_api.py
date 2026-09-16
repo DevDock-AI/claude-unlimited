@@ -89,6 +89,28 @@ def test_patch_settings_requires_csrf(running_server):
     assert status == 403
 
 
+def test_distribute_sessions_default_is_off_and_round_trips(running_server):
+    """It changes how every session consumes accounts, so it must ship OFF and
+    only ever be on because someone turned it on."""
+    base, token, _ = running_server
+    status, body = _request(f"{base}/api/settings")
+    assert body["settings"]["distribute_sessions_default"] is False
+
+    status, body = _request(f"{base}/api/settings", "PATCH",
+                             {"distribute_sessions_default": True},
+                             headers={"X-CSRF-Token": token})
+    assert status == 200
+    assert body["settings"]["distribute_sessions_default"] is True
+
+    _, body = _request(f"{base}/api/settings")
+    assert body["settings"]["distribute_sessions_default"] is True
+
+    _, body = _request(f"{base}/api/settings", "PATCH",
+                        {"distribute_sessions_default": False},
+                        headers={"X-CSRF-Token": token})
+    assert body["settings"]["distribute_sessions_default"] is False
+
+
 def test_get_locales_lists_available_and_current(running_server):
     base, _, _ = running_server
     status, body = _request(f"{base}/api/locales")

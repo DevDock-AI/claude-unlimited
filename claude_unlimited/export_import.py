@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from . import activity as activity_module
 from . import secret_store
-from .config import CONFIG_LOCK, Profile, load_pool, save_pool
+from .config import CONFIG_LOCK, Profile, load_pool, normalize_forced_subagents, save_pool
 
 BUNDLE_VERSION = 1
 PBKDF2_ITERATIONS = 600_000  # OWASP 2023 recommendation floor for PBKDF2-HMAC-SHA256
@@ -71,6 +71,9 @@ class ExportedProfile:
     # above.
     codex_model: Optional[str] = None
     codex_reasoning_effort: Optional[str] = None
+    # "Every subagent goes here". Defaulted so bundles written before the
+    # field existed still import.
+    forced_for_subagents: bool = False
 
 
 def build_export_bundle(
@@ -100,6 +103,7 @@ def build_export_bundle(
                 token_threshold=p.token_threshold,
                 tag_color=p.tag_color, account_uuid=p.account_uuid, credential=cred,
                 plan=p.plan, codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
+                forced_for_subagents=p.forced_for_subagents,
             )))
         payload["profiles"] = exported
 
@@ -213,6 +217,7 @@ def apply_import(
                         monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                         tag_color=item.get("tag_color"), plan=item.get("plan"),
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
+                        forced_for_subagents=bool(item.get("forced_for_subagents", False)),
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
                     result["profiles_updated"] += 1
@@ -229,10 +234,15 @@ def apply_import(
                     tag_color=item.get("tag_color"),
                     account_uuid=item.get("account_uuid"), plan=item.get("plan"),
                     codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
+                    forced_for_subagents=bool(item.get("forced_for_subagents", False)),
                 )
                 secret_store.set_token(new_profile.id, item["credential"])
                 pool.profiles.append(new_profile)
                 result["profiles_added"] += 1
+            # A bundle can bring a forced-subagent Profile into a pool that
+            # already has one; the holder already routing (earlier in the
+            # list) keeps it, rather than save_pool() rejecting the import.
+            pool.profiles = normalize_forced_subagents(pool.profiles)
             save_pool(pool)
 
     if import_settings and parsed.settings:

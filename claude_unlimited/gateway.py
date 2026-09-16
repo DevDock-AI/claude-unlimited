@@ -32,11 +32,47 @@ from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, ProviderUnavailable, QuotaExhausted, Unknown, UsageSnapshot, classify
 from .proxy import build_upstream_request, filter_response_headers, request_model, rewrite_model
-from .router import PoolSnapshot, ProfileRuntime, ProfileState, RoutingDecision, choose, observe, recover_expired_cooldowns
+from .router import (
+    PoolSnapshot,
+    ProfileRuntime,
+    ProfileState,
+    RoutingDecision,
+    choose,
+    choose_for_new_branch,
+    observe,
+    recover_expired_cooldowns,
+)
 from .upstream import UpstreamResponse
 from .upstream import send as real_send
 
 MAX_ROTATION_ATTEMPTS = 4  # bounded — never loop the whole pool forever on a bad run
+
+# How long an idle branch keeps its account pin. A pin is only a routing
+# preference, so outliving Anthropic's prompt cache costs nothing; expiring too
+# eagerly would scatter a slow-but-live branch across accounts. Evicted lazily
+# at request boundaries (no background task), like session_tokens' prune-on-touch.
+BRANCH_PIN_TTL_SECONDS = 3600.0
+# Hard ceiling so a long-lived daemon can't accumulate pins without bound;
+# oldest-touched is evicted first.
+BRANCH_PIN_CAP = 512
+
+
+def _pin_clock() -> float:
+    """The branch-pin store's clock — its own seam, so a test can age pins
+    without replacing time.monotonic for every thread in the process."""
+    return time.monotonic()
+
+
+# An agent moved off an unavailable account is logged every time, but the
+# desktop notification fires at most this often per source account: one busy
+# session can move many agents off the same account within seconds.
+BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS = 900.0
+# Decision reasons that mean "this request was routed for ONE branch, not by
+# the shared rotation pointer". Such a request must never move that pointer or
+# fire a "Rotated" notification — the same discipline an explicit --profile pin
+# already follows, for the same reason: other concurrent sessions and branches
+# are relying on normal rotation at the same moment.
+_BRANCH_ROUTED_REASONS = frozenset({"branch_pinned", "subagent_forced", "branch_assigned"})
 
 
 def _client_label(headers: dict) -> str:
@@ -169,6 +205,19 @@ def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
     return fields
 
 
+@dataclass
+class BranchPin:
+    """Which account one conversation branch is bound to, and when it was last
+    used (for TTL/LRU eviction). agent_id/parent_agent_id are carried for the
+    Dashboard's session tree only — routing keys on the map key, not these."""
+
+    profile_id: str
+    last_touch: float  # time.monotonic()
+    created_at: float
+    agent_id: str
+    parent_agent_id: Optional[str] = None
+
+
 @dataclass(frozen=True)
 class GatewayResult:
     status: int
@@ -265,6 +314,21 @@ class Gateway:
         # once — e.g. two concurrent `claude-unlimited code --profile`
         # terminals pinned to different Profiles.
         self._in_flight: set[str] = set()
+        # Per-branch account pins: {(lineage_session_id, agent_id): BranchPin}.
+        # A "branch" is one conversation thread — a session's main agent, or
+        # one of its subagents (project_attribution.branch_key). Pinning keeps
+        # a branch on the account that already holds its prompt cache, while
+        # DIFFERENT branches of the same session can sit on different accounts
+        # (that's the point: several subscriptions serving one session at once,
+        # each with a warm cache). Lives here rather than in router.py because
+        # it is mutable cross-request state with a clock and a lock — exactly
+        # what that module's purity contract excludes.
+        self._branch_pins: dict[tuple, BranchPin] = {}
+        self._branch_move_notified_at: dict[str, float] = {}
+        # Epoch seconds of each Profile's last usage reading, from any source
+        # (real traffic or usage_probe) — so a background check can skip an
+        # account real traffic already refreshed.
+        self._usage_observed_at: dict[str, float] = {}
         # Monotonic time each Profile's current in-flight streak began. A
         # request that never drains — a client that abandons the stream, or an
         # upstream connection that hangs open — would otherwise leave its
@@ -472,6 +536,14 @@ class Gateway:
                 )
         if self._current_profile_id not in live_ids:
             self._current_profile_id = None
+        # A pin naming a Profile that has been deleted (or turned off) is dead
+        # weight that would otherwise be re-checked on every request until its
+        # TTL; drop it here, where the persisted Pool is already in hand, so
+        # those branches simply get re-assigned on their next request.
+        if self._branch_pins:
+            usable = {p.id for p in pool.profiles if p.enabled}
+            for key in [k for k, pin in self._branch_pins.items() if pin.profile_id not in usable]:
+                del self._branch_pins[key]
         return PoolSnapshot(profiles=list(self._runtime.values()), current_profile_id=self._current_profile_id)
 
     @staticmethod
@@ -489,7 +561,8 @@ class Gateway:
             f"{p.name} hit its token budget ({used}/{p.token_threshold}) — excluded from rotation.", pool.settings)
 
     def handle(self, method: str, path: str, headers: dict, body: bytes,
-               forced_profile_id: Optional[str] = None) -> GatewayResult:
+               forced_profile_id: Optional[str] = None,
+               distribute: bool = False) -> GatewayResult:
         """forced_profile_id (see session_tokens.py) pins this ONE request
         to exactly that Profile — set by a `claude-unlimited code --profile`
         terminal session, and scoped to it alone: unlike force_active()
@@ -503,6 +576,22 @@ class Gateway:
         now = datetime.now(timezone.utc)
         attempted: set[str] = set()
         previous_profile_id = self._current_profile_id
+        is_subagent = project_attribution.is_subagent(headers)
+        # Which conversation branch is this? None for anything that isn't
+        # identifiable Claude Code traffic, which then routes exactly as before.
+        # Identifying it JSON-parses the whole body (a conversation can be
+        # megabytes), so it is only done when a per-branch mode can apply at
+        # all. Checked against a fresh read outside the lock; a setting toggled
+        # between here and the decision simply applies from the next request.
+        branch = (project_attribution.branch_key(headers, body)
+                  if self._branch_modes_apply(load_pool(), distribute, is_subagent) else None)
+        branch_moves: list[tuple[str, str]] = []
+        parent_agent_id = project_attribution.parent_agent_id_from_headers(headers)
+        # Pins are only CREATED for real message traffic — token counting and
+        # other ancillary calls never populate the prompt cache, so pinning on
+        # them would just burn map slots. Lookups still apply to every path so
+        # a branch's side calls ride its existing pin.
+        may_create_pin = method == "POST" and path.rstrip("/").endswith("/v1/messages")
 
         for _ in range(MAX_ROTATION_ATTEMPTS):
             with self._lock:
@@ -512,9 +601,17 @@ class Gateway:
                 snapshot = recover_expired_cooldowns(snapshot, now)
                 self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
                 if forced_profile_id is not None:
+                    # An explicit --profile pin outranks everything: it must
+                    # never be silently substituted, not even by a branch pin.
                     decision = self._forced_decision(pool, forced_profile_id)
                 else:
-                    decision = choose(snapshot, now)
+                    decision = self._branch_decision(
+                        pool, snapshot, now, branch, is_subagent, parent_agent_id,
+                        attempted, distribute, may_create_pin, moves=branch_moves)
+            branch_routed = decision.reason in _BRANCH_ROUTED_REASONS
+            for from_id, to_id in branch_moves:
+                self._record_branch_move(pool, from_id, to_id)
+            branch_moves.clear()
 
             for rt in snapshot.profiles:
                 if pre_recovery_states.get(rt.profile_id) in _QUOTA_RESET_SOURCE_STATES and rt.state == ProfileState.ELIGIBLE:
@@ -573,7 +670,8 @@ class Gateway:
 
             if profile.kind == "codex":
                 result = self._handle_codex(profile, credential, method, path, headers, body, now,
-                                             forced_profile_id, previous_profile_id, pool)
+                                             forced_profile_id, previous_profile_id, pool,
+                                             branch_routed=branch_routed)
                 if result is not None:
                     return result
                 continue  # this attempt failed in a rotate-away way — try the next eligible Profile
@@ -708,11 +806,13 @@ class Gateway:
                     activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
                     continue
 
-            if forced_profile_id is None:
+            if forced_profile_id is None and not branch_routed:
                 # A pinned session's requests must never move the shared
                 # rotation pointer or fire a "Rotated" notification — other
                 # concurrent terminals may be relying on normal rotation at
-                # the exact same time (see handle()'s docstring).
+                # the exact same time (see handle()'s docstring). The same
+                # holds for a branch-routed request (a subagent on its own
+                # account): it speaks for ONE branch, not for the pool.
                 with self._lock:
                     self._current_profile_id = profile.id
                 self._persist()
@@ -886,7 +986,8 @@ class Gateway:
 
     def _handle_codex(self, profile: Profile, credential: str, method: str, path: str, headers: dict,
                        body: bytes, now: datetime, forced_profile_id: Optional[str],
-                       previous_profile_id: Optional[str], pool: Pool) -> Optional["GatewayResult"]:
+                       previous_profile_id: Optional[str], pool: Pool,
+                       branch_routed: bool = False) -> Optional["GatewayResult"]:
         """The codex-kind analogue of handle()'s main oauth/api body — kept
         as a separate method rather than inlined in the same branch,
         because openai_bridge.run() owns its own HTTP call and response
@@ -968,7 +1069,9 @@ class Gateway:
                 activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
                 return None
 
-        if forced_profile_id is None:
+        # Same rule as the oauth/api path: a pinned OR branch-routed request
+        # speaks for one terminal/branch, never for the shared pointer.
+        if forced_profile_id is None and not branch_routed:
             with self._lock:
                 self._current_profile_id = profile.id
             self._persist()
@@ -1446,6 +1549,152 @@ class Gateway:
 
         return generator()
 
+    # ---- branch pinning (call with self._lock held) ------------------------
+
+    def _live_pin(self, key: tuple, attempted: set) -> Optional[str]:
+        """The account this branch is pinned to, if that pin is still usable:
+        not expired, the Profile still ELIGIBLE, and not already tried and
+        failed on this request. Anything else is treated as no pin, so the
+        caller re-assigns (and the re-assignment overwrites the stale one)."""
+        pin = self._branch_pins.get(key)
+        if pin is None:
+            return None
+        if _pin_clock() - pin.last_touch >= BRANCH_PIN_TTL_SECONDS:
+            del self._branch_pins[key]  # lazy expiry, at the request boundary
+            return None
+        if pin.profile_id in attempted:
+            return None
+        runtime = self._runtime.get(pin.profile_id)
+        if runtime is None or runtime.state != ProfileState.ELIGIBLE:
+            return None
+        pin.last_touch = _pin_clock()
+        return pin.profile_id
+
+    def _remember_pin(self, key: tuple, profile_id: str, parent_agent_id: Optional[str]) -> None:
+        now = _pin_clock()
+        existing = self._branch_pins.get(key)
+        if existing is not None:
+            existing.profile_id = profile_id
+            existing.last_touch = now
+            return
+        if len(self._branch_pins) >= BRANCH_PIN_CAP:
+            oldest = min(self._branch_pins, key=lambda k: self._branch_pins[k].last_touch)
+            del self._branch_pins[oldest]
+        self._branch_pins[key] = BranchPin(profile_id=profile_id, last_touch=now, created_at=now,
+                                            agent_id=key[1], parent_agent_id=parent_agent_id)
+
+    def _branch_counts(self) -> dict:
+        """Live pins per Profile — the selector's least-loaded tie-break, so
+        two equally-utilized accounts alternate instead of both taking every
+        branch."""
+        counts: dict = {}
+        cutoff = _pin_clock() - BRANCH_PIN_TTL_SECONDS
+        for pin in self._branch_pins.values():
+            if pin.last_touch > cutoff:
+                counts[pin.profile_id] = counts.get(pin.profile_id, 0) + 1
+        return counts
+
+    def _forced_subagent_profile(self, pool: Pool):
+        """The Profile flagged 'always use for subagents', if any is enabled.
+        config.save_pool guarantees at most one."""
+        return next((p for p in pool.profiles
+                     if getattr(p, "forced_for_subagents", False) and p.enabled), None)
+
+    def _branch_modes_apply(self, pool: Pool, distribute: bool, is_subagent: bool) -> bool:
+        """Whether any per-branch routing mode could route this request — the
+        same conditions _branch_decision() checks before falling through."""
+        return bool(distribute or pool.settings.distribute_sessions_default
+                    or (is_subagent and self._forced_subagent_profile(pool) is not None))
+
+    def _record_branch_move(self, pool: Pool, from_id: str, to_id: str) -> None:
+        """A pinned agent had to leave its account: it stopped being eligible,
+        or failed this request. Branch-routed traffic never moves the shared
+        pointer (see _BRANCH_ROUTED_REASONS), so without this a pool running
+        entirely per branch would never log or announce a switch at all.
+        Call WITHOUT self._lock held — activity and notifications do I/O."""
+        from_name, to_name = self._profile_name(pool, from_id), self._profile_name(pool, to_id)
+        activity.record("rotation", f"Agent moved {from_name} → {to_name}",
+                        meta=f"{from_name} stopped being available")
+        with self._lock:
+            last = self._branch_move_notified_at.get(from_id)
+            due = last is None or _pin_clock() - last >= BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS
+            if due:
+                self._branch_move_notified_at[from_id] = _pin_clock()
+        if due:
+            notifications.notify_if_enabled("rotated", "Claude Unlimited",
+                                              f"Agents moving {from_name} → {to_name}.", pool.settings)
+
+    def _branch_decision(self, pool: Pool, snapshot: PoolSnapshot, now: datetime, key: Optional[tuple],
+                         is_subagent: bool, parent_agent_id: Optional[str], attempted: set,
+                         distribute: bool, may_create_pin: bool,
+                         moves: Optional[list] = None) -> RoutingDecision:
+        """Routing for per-branch modes, in precedence order. Falls through to
+        the unchanged global sticky `choose()` whenever neither mode applies —
+        so a non-Claude-Code client, or an unidentifiable request, behaves
+        exactly as it did before this feature existed."""
+        # `distribute_sessions_default` makes every session behave as if it had
+        # been launched with --distribute. OR-ed, never assigned: the setting
+        # can only turn distribution on, so a session that asked for it still
+        # gets it while the setting is off. Read per request (the pool is
+        # already loaded), so toggling it takes effect without a restart.
+        distribute = distribute or pool.settings.distribute_sessions_default
+        forced_profile = self._forced_subagent_profile(pool) if is_subagent else None
+        if key is None or not (distribute or forced_profile is not None):
+            return choose(snapshot, now)
+
+        pinned = self._live_pin(key, attempted)
+        if pinned is not None:
+            # Same account as last turn -> its prompt cache is still warm.
+            return RoutingDecision(profile_id=pinned, reason="branch_pinned")
+        # A pin that is still in the map here is live but unusable (its
+        # Profile isn't ELIGIBLE, or failed this request): re-assigning it is a
+        # move, reported through `moves`. Expired pins were already dropped.
+        prior = self._branch_pins.get(key)
+
+        def _note_move(to_id: Optional[str]) -> None:
+            if moves is not None and may_create_pin and prior is not None and to_id and to_id != prior.profile_id:
+                moves.append((prior.profile_id, to_id))
+
+        # Needs an account. A subagent prefers the forced Profile; otherwise
+        # (including when that Profile is unavailable — the owner-specified
+        # fallback) branches spread across eligible accounts.
+        if forced_profile is not None and forced_profile.id not in attempted:
+            runtime = self._runtime.get(forced_profile.id)
+            if runtime is not None and runtime.state == ProfileState.ELIGIBLE:
+                _note_move(forced_profile.id)
+                if may_create_pin:
+                    self._remember_pin(key, forced_profile.id, parent_agent_id)
+                return RoutingDecision(profile_id=forced_profile.id, reason="subagent_forced")
+
+        decision = choose_for_new_branch(snapshot, now, self._branch_counts(),
+                                          exclude=frozenset(attempted))
+        _note_move(decision.profile_id)
+        if decision.profile_id is not None and may_create_pin:
+            self._remember_pin(key, decision.profile_id, parent_agent_id)
+        return decision
+
+    def usage_observed_at(self) -> dict:
+        """Profile id -> epoch seconds of its last usage reading."""
+        with self._lock:
+            return dict(self._usage_observed_at)
+
+    def live_agent_counts(self) -> dict:
+        """Live branch pins per Profile id, for the Dashboard: how many agents
+        (main agents and subagents) each account is serving right now. Needed
+        because branch-routed traffic never moves current_profile_id."""
+        with self._lock:
+            return self._branch_counts()
+
+    def branch_pins(self) -> list[dict]:
+        """Read-only view for the Dashboard: which branches are pinned where."""
+        cutoff = _pin_clock() - BRANCH_PIN_TTL_SECONDS
+        with self._lock:
+            return [
+                {"session_id": key[0], "agent_id": pin.agent_id,
+                 "parent_agent_id": pin.parent_agent_id, "profile_id": pin.profile_id}
+                for key, pin in self._branch_pins.items() if pin.last_touch > cutoff
+            ]
+
     def _mark_profile_idle(self, profile_id: str) -> None:
         """Moves a Profile out of `_in_flight` and starts its "Used now"
         grace period — call with `self._lock` held. Centralized so every
@@ -1543,3 +1792,5 @@ class Gateway:
         snapshot = PoolSnapshot(profiles=list(self._runtime.values()), current_profile_id=self._current_profile_id)
         updated = observe(snapshot, profile_id, observation, now)
         self._runtime = {rt.profile_id: rt for rt in updated.profiles}
+        if isinstance(observation, UsageSnapshot):
+            self._usage_observed_at[profile_id] = time.time()

@@ -119,7 +119,7 @@ def _validate_field_types(**changes) -> None:
     _num("token_threshold", kind=int, minimum=0, allow_none=True)
     _num("monthly_budget_cap", kind=(int, float), minimum=0, allow_none=True)
 
-    for key in ("enabled", "automatic"):
+    for key in ("enabled", "automatic", "forced_for_subagents"):
         if key in changes and not isinstance(changes[key], bool):
             raise ValidationError(f"{key} must be true or false.")
 
@@ -231,6 +231,7 @@ def create_profile(
     codex_home: Optional[str] = None,
     codex_model: Optional[str] = None,
     codex_reasoning_effort: Optional[str] = None,
+    forced_for_subagents: bool = False,
     credential_already_encoded: bool = False,
 ) -> Profile:
     _validate(name, kind, base_url, auth_mode, tag_color)
@@ -243,6 +244,7 @@ def create_profile(
         default_model=default_model, tag_color=tag_color, plan=plan,
         codex_model=codex_model, codex_reasoning_effort=codex_reasoning_effort,
         claude_config_dir=claude_config_dir, codex_home=codex_home,
+        forced_for_subagents=forced_for_subagents,
     )
     if priority is not None:
         _validate_field_types(priority=priority)
@@ -281,6 +283,7 @@ def create_profile(
         codex_home=codex_home,
         codex_model=codex_model,
         codex_reasoning_effort=codex_reasoning_effort,
+        forced_for_subagents=forced_for_subagents,
     )
 
     if credential_already_encoded:
@@ -308,6 +311,13 @@ def create_profile(
 
     with CONFIG_LOCK:
         pool = load_pool()
+        released: list[Profile] = []
+        if profile.forced_for_subagents:
+            try:
+                pool.profiles, released = _claim_forced_subagents(pool.profiles, profile)
+            except ValidationError:
+                secret_store.delete_token(profile.id)
+                raise
         pool.profiles.append(profile)
         try:
             save_pool(pool)
@@ -316,6 +326,7 @@ def create_profile(
             raise ProfileRepositoryError(f"Could not save profile metadata, rolled back Keychain entry: {exc}") from exc
 
     activity.record("config", f"{profile.name} added", meta=f"kind={profile.kind}")
+    _record_released_forced_subagents(released, profile)
     return profile
 
 
@@ -365,11 +376,38 @@ def upsert_codex_profile(*, name: str, account_id: str, encoded_credential: str,
     return profile, False
 
 
+def _claim_forced_subagents(others: list[Profile], claimant: Profile) -> tuple[list[Profile], list[Profile]]:
+    """Make `claimant` the one forced-subagent Profile, given every OTHER Profile.
+
+    "Every subagent goes here" has no meaning if two Profiles claim it. An
+    ENABLED holder is refused rather than silently demoted — it is routing
+    subagents right now, so the message names it and the user decides. A
+    DISABLED holder routes nothing, so refusing would only send the user off
+    to edit an account they already turned off; its mark moves to the claimant.
+
+    Returns (others with any released holder cleared, the released holders)."""
+    holder = next((p for p in others if p.forced_for_subagents and p.enabled), None)
+    if holder is not None:
+        raise ValidationError(
+            f"{holder.name} is already the forced subagent profile. "
+            "Turn it off there first — only one profile can hold it.")
+    released = [p for p in others if p.forced_for_subagents]
+    cleared = [replace(p, forced_for_subagents=False) if p.forced_for_subagents else p for p in others]
+    return cleared, released
+
+
+def _record_released_forced_subagents(released: list[Profile], claimant: Profile) -> None:
+    for p in released:
+        activity.record("config", f"{p.name} no longer forced in subagents",
+                        meta=f"moved to {claimant.name} (it was disabled)")
+
+
 def update_profile(profile_id: str, **changes) -> Profile:
     allowed = {
         "name", "priority", "switch_threshold", "enabled", "automatic",
         "default_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
         "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
+        "forced_for_subagents",
     }
     unknown = set(changes) - allowed
     if unknown:
@@ -384,12 +422,19 @@ def update_profile(profile_id: str, **changes) -> Profile:
 
         updated = replace(existing, **changes)
         _validate(updated.name, updated.kind, updated.base_url, updated.auth_mode, updated.tag_color)
-
-        pool.profiles = [updated if p.id == profile_id else p for p in pool.profiles]
+        released: list[Profile] = []
+        if updated.forced_for_subagents:
+            others, released = _claim_forced_subagents(
+                [p for p in pool.profiles if p.id != profile_id], updated)
+            by_id = {p.id: p for p in others}
+            pool.profiles = [updated if p.id == profile_id else by_id[p.id] for p in pool.profiles]
+        else:
+            pool.profiles = [updated if p.id == profile_id else p for p in pool.profiles]
         save_pool(pool)
 
     changed = ", ".join(f"{k}={v}" for k, v in changes.items())
     activity.record("config", f"{updated.name} updated", meta=changed)
+    _record_released_forced_subagents(released, updated)
     return updated
 
 

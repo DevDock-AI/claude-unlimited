@@ -195,7 +195,12 @@
      hiding either number. */
   .profiles.cells-view .bar-visual { padding-top: 12px; padding-bottom: 13px; }
   .profiles.cells-view .bar-group { min-width: 110px; }
-  .profiles.cells-view .p-foot { margin-top: 8px; gap: 8px; }
+  /* Grid cells stretch every card to the tallest in its row, so the footer
+     has to be pushed down or it floats mid-card on the shorter ones (11px of
+     dead space below it on one card, 34px on its neighbour). The list view
+     needs neither rule: one card per row, height driven by its own content. */
+  .profiles.cells-view .p-card { display: flex; flex-direction: column; }
+  .profiles.cells-view .p-foot { margin-top: auto; padding-top: 8px; gap: 8px; }
   .p-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px;
             position: relative; overflow: hidden; animation: fade-up 400ms ease-out both;
             transition: border-color 250ms ease; }
@@ -454,6 +459,36 @@
     border-radius: 7px; background: var(--bad-soft); color: var(--bad); cursor: pointer;
     transition: background .12s, color .12s, border-color .12s; }
   .parity-del svg { width: 15px; height: 15px; }
+  /* Activation warning for "always use this profile for subagents" — it changes
+     routing for every session, so it states plainly what it does. */
+  .forced-subagents-warning { display: flex; gap: 9px; align-items: flex-start;
+    margin: -4px 0 4px; padding: 10px 12px; border: 1px solid var(--warn-border);
+    border-radius: 9px; background: var(--warn-soft); color: var(--warn);
+    font-size: var(--fs-micro); line-height: 1.5; }
+  .forced-subagents-warning svg { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
+  /* Card/row tag marking the profile that holds it. */
+  .subagent-tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px;
+    border: 1px solid var(--accent-border); border-radius: 999px; background: var(--accent-soft);
+    color: var(--accent); font-size: var(--fs-micro); font-weight: 600; white-space: nowrap; }
+  .subagent-tag svg { width: 11px; height: 11px; }
+  .live-agents-pill { display: inline-flex; align-items: center; padding: 2px 7px;
+    border: 1px solid var(--border); border-radius: 999px; background: var(--bg-panel-alt);
+    color: var(--text-dim); font-size: var(--fs-micro); font-weight: 600; white-space: nowrap;
+    font-variant-numeric: tabular-nums; }
+  /* Settings → Session routing: the explanation under the balance toggle. */
+  .routing-explainer { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 10px;
+    font-size: var(--fs-micro); line-height: 1.55; color: var(--text-dim); }
+  .routing-example { padding: 9px 11px; border: 1px solid var(--border-soft);
+    border-radius: 9px; background: var(--bg-panel-alt); }
+  .routing-example-title { font-weight: 700; color: var(--text); margin-bottom: 3px; }
+  .routing-example-body { color: var(--text-dim); }
+  /* The one thing people misread about balancing: it is assignment-time only. */
+  .routing-when { padding: 9px 11px; border: 1px solid var(--accent-border); border-radius: 9px;
+    background: var(--accent-soft); color: var(--text); }
+  /* No inline <code> here: applyTranslations() writes textContent, so any
+     markup inside a [data-i18n] element is discarded at render time. */
+  .routing-note { color: var(--text-faint); }
   .parity-del:hover { background: var(--bad); color: #fff; border-color: var(--bad); }
   #parityAddBtn { background: var(--good-soft); color: var(--good); border-color: var(--good);
     font-weight: 600; transition: background .12s, color .12s; }
@@ -1161,6 +1196,35 @@
       </div>
     </div>
 
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.routing.title">Session routing</div>
+        <div class="section-sub" data-i18n="settings.routing.sub">How new sessions and their subagents are placed on your accounts</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.routing.distribute_label">Balance sessions and subagents across accounts</div>
+            <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the least-busy account. Same as launching every session with --distribute. Off by default.</div>
+          </div>
+          <div class="toggle off" id="distributeDefaultToggle" data-field="distribute_sessions_default"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="routing-explainer">
+          <div data-i18n="settings.routing.explainer">A Claude Code session is not one caller: the agent you type at (the "main agent") and every subagent it spawns send their own requests. Normally they all share one account, chosen by rotation. Turn this on and each new agent goes to the account with the fewest agents already working on it, across all your sessions — ties go to your priority order, then to the least-used account. Over time this spreads your usage across accounts instead of draining one first.</div>
+          <div class="routing-when" data-i18n="settings.routing.when">Balancing happens only when an agent starts — a new session, or a new subagent. It never rebalances mid-session: once an agent is on an account it stays there, so its prompt cache stays warm. It moves only if that account reaches its switch threshold or a usage limit, becomes unavailable, or the agent sits idle for an hour. It spreads by how many agents each account is serving, not by usage percentage, so usage evens out roughly rather than exactly.</div>
+          <div class="routing-example">
+            <div class="routing-example-title" data-i18n="settings.routing.example_off_title">Setting OFF (default) — one account at a time</div>
+            <div class="routing-example-body" data-i18n="settings.routing.example_off">Example: you ask Claude Code to audit three services, and it spawns two subagents to read them in parallel. All three — the agent you type at, and both subagents — send their requests to Personal Max. When Personal Max reaches its switch threshold, all three move together to Work Max. This is how Claude Unlimited has always worked.</div>
+          </div>
+          <div class="routing-example">
+            <div class="routing-example-title" data-i18n="settings.routing.example_on_title">Setting ON — agents spread across accounts</div>
+            <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. The agent you type at starts on Personal Max, the first subagent on Work Max, the second on Codex — all three at the same time, each on the account that was least busy when it started. Each stays on its own account until it finishes. If Work Max reaches its threshold mid-task, only the subagent on Work Max moves; the other two stay where they are.</div>
+          </div>
+          <div class="routing-note" data-i18n="settings.routing.note">Still available per session either way: cu code --distribute turns balancing on for one session while this is off. cu code --profile &lt;name&gt; always wins over both and pins everything to one account. A profile marked "Forced in subagents" still takes every subagent, whatever this is set to.</div>
+        </div>
+      </div>
+    </div>
+
     <div class="section" id="modelParitySection" style="display:none">
       <div class="section-head with-actions">
         <div class="section-title" data-i18n="settings.parity.title">Models parity</div>
@@ -1212,6 +1276,14 @@
             <div class="field-sub" data-i18n="settings.daemon.autostart_sub">Registers a launchd agent (macOS)</div>
           </div>
           <div class="toggle" id="autostartToggle"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.daemon.usage_fresh_label">Keep usage up to date</div>
+            <div class="field-sub" data-i18n="settings.daemon.usage_fresh_sub">While you're active, reads each subscription account's usage every 5–10 minutes from the providers' read-only usage endpoints — no messages are sent. Pauses after 30 minutes idle, and waits longer whenever a provider pushes back.</div>
+          </div>
+          <div class="toggle" id="usageFreshToggle" data-field="keep_usage_fresh"><div class="toggle-knob"></div></div>
         </div>
       </div>
     </div>
@@ -1476,13 +1548,13 @@
         <div class="cmd-row">
           <div class="code-row">
             <code id="cmd-code">cu code</code>
-            <span class="cmd-optional">[--profile &lt;name&gt;] [-- claude args]</span>
+            <span class="cmd-optional">[--profile &lt;name&gt; | --distribute] [-- claude args]</span>
             <div class="copy-btn" data-copy-target="cmd-code">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. Any extra arguments pass straight through to claude.</div>
+          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. --distribute instead balances the session across accounts: the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. Any other extra arguments pass straight through to claude.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -1506,6 +1578,41 @@
           </div>
           <div class="field-sub" data-i18n="help.cmd.status">Reports whether the daemon is installed as a background service and currently running, and its pid.</div>
         </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.routing.title">Which account a session uses</div>
+        <div class="section-sub" data-i18n="help.routing.sub">Four ways to decide, in order of precedence</div>
+      </div>
+      <div class="section-body">
+        <table class="model-map-table">
+          <thead><tr>
+            <th data-i18n="help.routing.col_how">How</th>
+            <th data-i18n="help.routing.col_what">What happens</th>
+          </tr></thead>
+          <tr>
+            <td class="mono">cu code --profile &lt;name&gt;</td>
+            <td data-i18n="help.routing.r_profile">Everything in that terminal — main agent and subagents — goes to that one account. Beats every other rule.</td>
+          </tr>
+          <tr>
+            <td data-i18n="help.routing.r_forced_how">Profile menu → "Force in subagents"</td>
+            <td data-i18n="help.routing.r_forced">Every subagent, in every session, goes to that profile; the main agent keeps rotating normally. One profile at a time. If it runs out, subagents spread across the rest.</td>
+          </tr>
+          <tr>
+            <td class="mono">cu code --distribute</td>
+            <td data-i18n="help.routing.r_distribute">The main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. No rebalancing mid-session.</td>
+          </tr>
+          <tr>
+            <td data-i18n="help.routing.r_setting_how">Settings → Session routing</td>
+            <td data-i18n="help.routing.r_setting">"Balance sessions and subagents across accounts" makes the line above the default for every session, with no flag. Off by default.</td>
+          </tr>
+          <tr>
+            <td data-i18n="help.routing.r_default_how">Nothing set (default)</td>
+            <td data-i18n="help.routing.r_default">Normal rotation: every agent shares the account with the lowest priority number, until it hits its threshold or runs out, then all of them move to the next one.</td>
+          </tr>
+        </table>
       </div>
     </div>
 
@@ -1860,6 +1967,17 @@
               </div>
               <div class="toggle" id="f_automatic_toggle"><div class="toggle-knob"></div></div>
             </div>
+            <div class="toggle-row">
+              <div class="toggle-row-text">
+                <div class="toggle-row-title" data-i18n="modal.add_profile.forced_subagents_label">Always use this profile for subagents</div>
+                <div class="toggle-row-sub" data-i18n="modal.add_profile.forced_subagents_sub">Route every subagent here, whatever rotation would pick. The main agent is unaffected.</div>
+              </div>
+              <div class="toggle" id="f_forced_subagents_toggle"><div class="toggle-knob"></div></div>
+            </div>
+            <div class="forced-subagents-warning" id="f_forced_subagents_warning" hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>
+              <div data-i18n="modal.add_profile.forced_subagents_warning">Heads up: every subagent in every Claude Code session will be routed to this profile, ignoring priority and rotation. Your main agent keeps rotating normally — that's the point (a Claude orchestrator with GPT subagents, for example). If this profile runs out or becomes unavailable, subagents fall back to alternating across your other accounts. Only one profile can hold this, and you can turn it off any time.</div>
+            </div>
             <div class="field-group">
               <div class="field-label" data-i18n="modal.add_profile.tag_color_label">Tag color</div>
               <div class="tag-row" id="f_tag_row"></div>
@@ -2163,6 +2281,17 @@
           <div class="field-sub" id="pd_automatic_sub"></div>
         </div>
         <div class="toggle" id="pd_automatic_toggle"><div class="toggle-knob"></div></div>
+      </div>
+      <div class="field-row">
+        <div class="field-text">
+          <div class="field-title" data-i18n="modal.add_profile.forced_subagents_label">Always use this profile for subagents</div>
+          <div class="field-sub" data-i18n="modal.add_profile.forced_subagents_sub">Route every subagent here, whatever rotation would pick. The main agent is unaffected.</div>
+        </div>
+        <div class="toggle" id="pd_forced_subagents_toggle"><div class="toggle-knob"></div></div>
+      </div>
+      <div class="forced-subagents-warning" id="pd_forced_subagents_warning" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>
+        <div data-i18n="modal.add_profile.forced_subagents_warning">Heads up: every subagent in every Claude Code session will be routed to this profile, ignoring priority and rotation. Your main agent keeps rotating normally — that's the point (a Claude orchestrator with GPT subagents, for example). If this profile runs out or becomes unavailable, subagents fall back to alternating across your other accounts. Only one profile can hold this, and you can turn it off any time.</div>
       </div>
       <div class="field-group">
         <div class="field-label" data-i18n="modal.add_profile.tag_color_label">Tag color</div>

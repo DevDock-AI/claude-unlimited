@@ -236,3 +236,31 @@ def test_importing_settings_does_not_reset_fields_the_bundle_never_carried(env):
     assert settings.update_mode == "manual"     # what the bundle asked for
     assert settings.language == "ro"            # untouched, not reset to "en"
     assert settings.notifications_enabled is False
+
+
+def _round_trip_bundle():
+    return ei.build_export_bundle(include_profiles=True, include_settings=False,
+                                  include_activity=False, passphrase="hunter22")
+
+
+def test_forced_in_subagents_survives_an_export_import_round_trip(env):
+    profile_repo.create_profile(name="GPT", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="acct-1", forced_for_subagents=True)
+    bundle = _round_trip_bundle()
+    profile_repo.reset_all_profiles()
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True, import_settings=False)
+    assert [p.forced_for_subagents for p in profile_repo.list_profiles()] == [True]
+
+
+def test_importing_a_second_forced_profile_keeps_the_holder_already_routing(env):
+    # Used to fail inside save_pool() with two holders, aborting the import.
+    profile_repo.create_profile(name="Old", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="acct-1", forced_for_subagents=True)
+    bundle = _round_trip_bundle()
+    profile_repo.reset_all_profiles()
+    profile_repo.create_profile(name="Current", kind="oauth", credential="sk-ant-87654321",
+                                account_uuid="acct-2", forced_for_subagents=True)
+
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True, import_settings=False)
+    assert {p.name: p.forced_for_subagents for p in profile_repo.list_profiles()} == {"Current": True, "Old": False}
+

@@ -52,7 +52,10 @@ kind is not verified on the others — this is the project's most repeated defec
 - `openai_translate.py` — pure Anthropic ⇄ OpenAI shape mapping, both directions.
 - `wire_formats.py` — which endpoint shape a Profile speaks, and how to translate to it.
 - `usage_tracking.py` — tees the response to count tokens without altering a byte of it.
-- `session_tokens.py` — the per-session credential behind `code --profile`.
+- `session_tokens.py` — the per-session credential behind `code --profile` and
+  `code --distribute`. Resolves to a `SessionGrant`: a pin, or distribute mode.
+- `project_attribution.py` — what a request says about itself: the project it came from,
+  the session it belongs to, and whether a subagent or the main agent sent it.
 
 **State**
 
@@ -102,6 +105,75 @@ kind is not verified on the others — this is the project's most repeated defec
 - When a window resets, the Profile rejoins rotation automatically.
 - An account whose credential was rejected shows "needs re-auth" and tries its own refresh
   token to recover, rather than waiting for a manual re-login.
+
+## Branches: sessions and subagents
+
+A Claude Code session is not one caller. The main agent and every subagent it spawns issue
+their own requests, and Claude Code labels them: `x-claude-code-agent-id` is sent **only by
+a subagent** (absence means the main agent), and it is stable for that subagent's whole
+life. The session id — body `metadata.user_id.session_id`, header as fallback — is shared
+by the whole lineage. Together they form a **branch key**: `(session_id, agent_id)`, with
+`agent_id = "main"` for the main agent.
+
+Branches matter because the prompt cache is per-account. Rotating a branch to a different
+account costs a full cache miss; keeping a branch on one account keeps it warm. So the
+gateway holds `_branch_pins`: a bounded, TTL'd `branch key → profile` map (1 h, 512
+entries, LRU). It is a routing preference, never a guarantee — a pin whose Profile went
+ineligible, was already attempted this request, or was deleted is dropped, and the request
+falls through to normal rotation.
+
+Precedence for one request, first match wins:
+
+1. **Session pin** (`code --profile`) — every request in the terminal, main and subagents
+   alike, goes to that one Profile.
+2. **Live branch pin** — this branch already has a warm account. (`branch_pinned`)
+3. **Forced-for-subagents Profile** — if a subagent sent this and some Profile carries
+   `forced_for_subagents`, and it is eligible. (`subagent_forced`)
+4. **New branch assignment** — `router.choose_for_new_branch()` picks the least-loaded
+   eligible Profile and the choice is remembered as this branch's pin. Only in distribute
+   mode, or for a subagent when a forced Profile exists but is not currently eligible.
+   (`branch_assigned`)
+5. **Normal rotation** — `router.choose()`, sticky-until-threshold.
+
+Distribute mode is `grant.distribute OR settings.distribute_sessions_default` — the
+per-session `code --distribute` flag, or the global Settings toggle. OR-ed, never assigned,
+so the setting can only turn distribution on; `_branch_decision` reads it from the pool it
+already loaded, so toggling takes effect on the next request without a restart. `cli.code()`
+reads the same setting, only so the interactive profile picker doesn't pin a session that
+was meant to distribute.
+
+`forced_for_subagents` is a per-Profile flag, at most one holder pool-wide (`config.py`
+refuses a second on save, and `load_pool` normalizes a file carrying several to the first
+enabled holder — the one routing uses — so a bad file can't wedge every later save).
+Claiming it is refused while another *enabled* Profile holds it; a disabled holder routes
+nothing, so its flag moves to the claimant. It is asymmetric on purpose: it steers subagents only, so a
+Claude orchestrator can run its subagents on a Codex account. If that account is
+exhausted or disabled, subagents fall to step 4 rather than failing.
+
+Branch routing bypasses the "Rotated" global-pointer update the way a session pin does: a
+branch choosing its own account must not move the pointer every other session follows.
+Because that traffic never moves `current_profile_id`, the Dashboard reads
+`Gateway.live_agent_counts()` (`live_agents` in `/api/status` and `/api/profiles`) to show
+which accounts are actually serving agents. When a live pin has to be re-assigned because
+its account stopped being eligible, `_record_branch_move` logs every move and fires the
+"rotated" notification at most once per source account every
+`BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS`. The branch key itself — a full JSON parse of the
+request body — is only computed when a per-branch mode can apply to the request.
+
+## Usage freshness checks
+
+`usage_probe.py` reads subscription usage from the providers' read-only endpoints —
+`api.anthropic.com/api/oauth/usage` for oauth Profiles, `chatgpt.com/backend-api/wham/usage`
+for subscription codex Profiles — and converts each response into the same rate-limit
+headers a real response carries, so `daemon._record_ping` feeds it through the ordinary
+observation path. `Scheduler` decides who is due: only while the user is present (proxied
+traffic or `POST /api/presence` from real Dashboard input, idle after 30 minutes), one read
+per account every 5–10 minutes counted from its last reading from *any* source
+(`Gateway.usage_observed_at`), at most two per 30-second tick. A 429 backs off 15 min → 6 h
+and pauses the provider; 401/403 backs off 1 h → 24 h without touching the Profile's state;
+other failures 5 min → 1 h. Backoff persists in `usage_probe_state.json`. Tokens are
+refreshed only through the existing per-Profile refresh clocks. Off switch:
+`Settings.keep_usage_fresh`.
 
 ## Usage tracking
 

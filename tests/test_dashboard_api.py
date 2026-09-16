@@ -203,3 +203,51 @@ def test_update_endpoint_reports_state_without_touching_the_network(running_serv
     assert "update_mode" in body and "available" in body
     assert not called, "GET /api/update must not run a check"
 
+
+def test_add_profile_accepts_the_dashboard_form_payload(running_server):
+    """The Add Profile form always sends forced_for_subagents. create_profile
+    once had no such parameter, so every profile added from the Dashboard
+    failed with a 400 — no test sent the form's real payload."""
+    base, token = running_server
+    headers = {"X-CSRF-Token": token, "Content-Type": "application/json"}
+    form = {"kind": "api", "credential": "sk-ant-api-12345678", "switch_threshold": 98,
+            "automatic": True, "auth_mode": "api_key"}
+
+    status, body = _request(f"{base}/api/profiles", "POST",
+                            {**form, "name": "Console", "priority": 1, "forced_for_subagents": False}, headers=headers)
+    assert status == 201, body
+    status, body = _request(f"{base}/api/profiles", "POST",
+                            {**form, "name": "Subagents", "priority": 2, "forced_for_subagents": True}, headers=headers)
+    assert status == 201, body
+    assert body["profile"]["forced_for_subagents"] is True
+
+    status, body = _request(f"{base}/api/profiles")
+    assert [p["live_agents"] for p in body["profiles"]] == [0, 0]
+
+
+def test_presence_needs_csrf_and_marks_the_user_active(running_server, monkeypatch, tmp_path):
+    import claude_unlimited.usage_probe as usage_probe
+    scheduler = usage_probe.Scheduler(state_file=tmp_path / "ups.json")
+    monkeypatch.setattr(daemon, "_usage_probe", scheduler)
+    base, token = running_server
+
+    status, _ = _request(f"{base}/api/presence", "POST", {})
+    assert status == 403 and scheduler.is_active() is False
+
+    status, body = _request(f"{base}/api/presence", "POST", {}, headers={"X-CSRF-Token": token})
+    assert status == 200 and body == {"active": True}
+    assert scheduler.is_active() is True
+
+
+def test_keep_usage_fresh_is_on_by_default_round_trips_and_must_be_boolean(running_server):
+    base, token = running_server
+    headers = {"X-CSRF-Token": token, "Content-Type": "application/json"}
+    status, body = _request(f"{base}/api/settings")
+    assert body["settings"]["keep_usage_fresh"] is True
+
+    status, body = _request(f"{base}/api/settings", "PATCH", {"keep_usage_fresh": False}, headers=headers)
+    assert status == 200 and body["settings"]["keep_usage_fresh"] is False
+
+    status, _ = _request(f"{base}/api/settings", "PATCH", {"keep_usage_fresh": "no"}, headers=headers)
+    assert status == 400
+

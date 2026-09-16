@@ -1,6 +1,6 @@
 """Per-project usage attribution: best-effort and local-only.
 
-It rests on two facts about Claude Code:
+It rests on three facts about Claude Code:
   1. It sends its own session id in a `X-Claude-Code-Session-Id` request
      header (and, redundantly, inside the `metadata.user_id` JSON string
      proxy.py already parses for the account_uuid rewrite, under the key
@@ -8,6 +8,14 @@ It rests on two facts about Claude Code:
   2. It maintains local session transcripts at
      ~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl for its resume
      feature, independent of the network request.
+  3. A SUBAGENT's requests carry an `x-claude-code-agent-id` header (and
+     `x-claude-code-parent-agent-id` when nested); the MAIN agent sends
+     neither, so header absence is itself the "this is the main branch"
+     signal. Verified live against Claude Code 2.1.267 through this daemon:
+     the id is stable for the whole life of one subagent (every turn it
+     takes), and the session id above is lineage-stable — main and all its
+     subagents share it. That pair is what identifies a conversation
+     *branch* for per-branch account pinning (see gateway.py's branch pins).
 
 Correlating the two attributes a request to a project directory using only a
 header value and a local filename; no request body or conversation content is
@@ -22,18 +30,77 @@ resolve to no attribution rather than an error.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SESSION_ID_HEADER = "x-claude-code-session-id"
+AGENT_ID_HEADER = "x-claude-code-agent-id"
+PARENT_AGENT_ID_HEADER = "x-claude-code-parent-agent-id"
+
+# The branch id used when no agent-id header is present: Claude Code's MAIN
+# agent sends none, so absence is the signal rather than a missing value.
+MAIN_BRANCH = "main"
+
+
+def _header(headers: dict, name: str) -> Optional[str]:
+    for k, v in headers.items():
+        if k.lower() == name:
+            return v or None
+    return None
 
 
 def session_id_from_headers(headers: dict) -> Optional[str]:
-    for k, v in headers.items():
-        if k.lower() == SESSION_ID_HEADER:
-            return v or None
-    return None
+    return _header(headers, SESSION_ID_HEADER)
+
+
+def agent_id_from_headers(headers: dict) -> str:
+    """The requesting branch's agent id, or MAIN_BRANCH when absent.
+
+    Absence is meaningful, not missing data: Claude Code attaches this header
+    only for subagents (fact 3 above), so no header == the main agent."""
+    return _header(headers, AGENT_ID_HEADER) or MAIN_BRANCH
+
+
+def parent_agent_id_from_headers(headers: dict) -> Optional[str]:
+    """Only present for nested subagents. Display/telemetry only — a branch is
+    keyed by its OWN agent id, never its parent's."""
+    return _header(headers, PARENT_AGENT_ID_HEADER)
+
+
+def is_subagent(headers: dict) -> bool:
+    return _header(headers, AGENT_ID_HEADER) is not None
+
+
+def lineage_session_id(headers: dict, body: bytes = b"") -> Optional[str]:
+    """The session id shared by a whole conversation tree (main + subagents).
+
+    Prefers the body's `metadata.user_id.session_id`, which Claude Code keeps
+    lineage-stable across subagents AND across a resumed session, and falls
+    back to the header. Best-effort by construction, like everything else
+    here: any parse failure returns None, and the caller then routes the
+    request exactly as it would have before (never an error)."""
+    if body:
+        try:
+            user_id = json.loads(body).get("metadata", {}).get("user_id")
+            if isinstance(user_id, str):
+                session_id = json.loads(user_id).get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    return session_id
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError, TypeError):
+            pass
+    return session_id_from_headers(headers)
+
+
+def branch_key(headers: dict, body: bytes = b"") -> Optional[tuple]:
+    """`(lineage_session_id, agent_id)` — the identity of one conversation
+    branch, or None when this isn't identifiable Claude Code traffic (in which
+    case the request must route unpinned, through the normal path)."""
+    session_id = lineage_session_id(headers, body)
+    if not session_id:
+        return None
+    return (session_id, agent_id_from_headers(headers))
 
 
 def resolve_project(session_id: str) -> Optional[str]:

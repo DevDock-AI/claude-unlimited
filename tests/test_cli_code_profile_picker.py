@@ -152,6 +152,93 @@ def test_code_non_interactive_stdin_never_prompts_even_with_multiple_profiles(mo
     assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "placeholder-tok"
 
 
+def _two_profiles():
+    from claude_unlimited.config import Pool, Profile, save_pool
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="Alice", kind="oauth", enabled=True),
+        Profile(id="b", name="Bob", kind="oauth", enabled=True),
+    ]))
+
+
+def test_code_with_distribute_fetches_a_distribute_token(monkeypatch, code_env):
+    _two_profiles()
+    monkeypatch.setattr(cli, "_fetch_distribute_token", lambda host, port, timeout=2.0: "distribute-tok")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+
+    def boom(*a, **kw):
+        raise AssertionError("must not fetch the shared placeholder token when --distribute is given")
+
+    monkeypatch.setattr(cli, "_fetch_placeholder_token", boom)
+
+    assert cli.code(4317, [], distribute=True) == 0
+    assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "distribute-tok"
+
+
+def test_distribute_never_prompts_for_a_profile(monkeypatch, code_env):
+    """--distribute has already answered "which account?" — a prompt here would
+    pin the session and silently undo the flag."""
+    _two_profiles()
+    monkeypatch.setattr(cli, "_fetch_distribute_token", lambda host, port, timeout=2.0: "distribute-tok")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+
+    def boom(prompt):
+        raise AssertionError("must not prompt when --distribute is given")
+
+    monkeypatch.setattr("builtins.input", boom)
+
+    assert cli.code(4317, [], distribute=True) == 0
+    assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "distribute-tok"
+
+
+def test_distribute_says_so_in_the_launch_banner(monkeypatch, code_env, capsys):
+    _two_profiles()
+    monkeypatch.setattr(cli, "_fetch_distribute_token", lambda host, port, timeout=2.0: "distribute-tok")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+
+    assert cli.code(4317, [], distribute=True) == 0
+    assert "balancing across accounts" in capsys.readouterr().out
+
+
+def test_the_global_setting_makes_plain_code_distribute(monkeypatch, code_env):
+    """Settings → "Balance sessions and subagents across accounts" has to reach the CLI too: the
+    daemon would distribute anyway, but the picker below would pin the session
+    and silently override it."""
+    from claude_unlimited.config import Pool, Profile, Settings, save_pool
+    save_pool(Pool(profiles=[Profile(id="a", name="Alice", kind="oauth", enabled=True),
+                             Profile(id="b", name="Bob", kind="oauth", enabled=True)],
+                   settings=Settings(distribute_sessions_default=True)))
+    monkeypatch.setattr(cli, "_fetch_distribute_token", lambda host, port, timeout=2.0: "distribute-tok")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+
+    def boom(prompt):
+        raise AssertionError("must not prompt when sessions distribute by default")
+
+    monkeypatch.setattr("builtins.input", boom)
+
+    assert cli.code(4317, [], profile_arg=None) == 0
+    assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "distribute-tok"
+
+
+def test_profile_flag_still_overrides_the_global_setting(monkeypatch, code_env):
+    from claude_unlimited.config import Pool, Profile, Settings, save_pool
+    save_pool(Pool(profiles=[Profile(id="a", name="Alice", kind="oauth", enabled=True),
+                             Profile(id="b", name="Bob", kind="oauth", enabled=True)],
+                   settings=Settings(distribute_sessions_default=True)))
+    monkeypatch.setattr(cli, "_fetch_session_token",
+                        lambda host, port, profile_id, timeout=2.0: f"session-tok-for-{profile_id}")
+
+    assert cli.code(4317, [], profile_arg="Bob") == 0
+    assert cli.os.environ["ANTHROPIC_AUTH_TOKEN"] == "session-tok-for-b"
+
+
+def test_profile_and_distribute_are_mutually_exclusive_on_the_command_line():
+    """Pinning to one account and spreading across all of them contradict each
+    other, so argparse must refuse the pair rather than silently pick one."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["code", "--profile", "Alice", "--distribute"])
+    assert exc.value.code == 2  # argparse's usage error, not some later failure
+
+
 def test_code_self_heals_the_cli_launchers(monkeypatch, code_env):
     """Running `code` must (best-effort) create any missing CLI launcher — this
     is the reliable path that puts `cu` on PATH after an update, since it runs

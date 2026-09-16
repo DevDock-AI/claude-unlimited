@@ -346,6 +346,7 @@ itself.
 
 ```bash
 claude-unlimited code --profile "Personal Max"   # pin this session to one account
+claude-unlimited code --distribute               # balance agents across accounts
 claude-unlimited code --model opus               # any extra args pass through to claude
 ```
 
@@ -362,6 +363,68 @@ The dashboard URL stays in Claude Code's status line while you work.
 
 A brief rate-limit blip never causes a switch — only a real threshold crossing or genuine
 exhaustion does.
+
+### Keeping usage numbers fresh
+
+Usage normally arrives with real responses, so an account nobody has used lately would show
+a stale number or *not yet observed*. While you're active — sending requests through Claude
+Unlimited or using the dashboard — each Claude and ChatGPT-subscription account's usage is
+read every **5–10 minutes** from the provider's own read-only usage endpoint (the one Claude
+Code's `/usage` and the Codex CLI read). No messages are sent.
+
+- **Pauses after 30 minutes idle**, and resumes the moment you're back.
+- **Skips an account that real traffic just refreshed.**
+- **Backs off hard.** A rate limit waits at least 15 minutes (or the provider's
+  `Retry-After`), doubling up to 6 hours, and pauses that whole provider. A refused
+  credential waits hours and never marks the account broken. Backoff survives restarts.
+- API-key profiles are skipped — they have no subscription windows to read.
+
+Turn it off in **Settings → Daemon → Keep usage up to date**.
+
+### Balancing sessions and subagents across accounts
+
+A Claude Code session isn't one caller: the main agent and every subagent it spawns send
+their own requests, and Claude Code labels each one. Claude Unlimited can route them
+separately.
+
+**`code --distribute`** balances the session across your pool. Each new agent — the main
+agent when the session starts, and each subagent when it's spawned — goes to the account
+with the **fewest agents already working on it**, counted across all your sessions (ties go
+to your priority order, then to the least-used account). It then *stays* there, so it keeps
+its own prompt cache warm instead of paying a cache miss on every rotation.
+
+> **Balancing happens only when an agent starts — never mid-session.** An agent moves only
+> if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
+> off, cooling down, needs re-auth), or the agent sits idle for an hour. It balances by how
+> many agents each account is serving, not by usage percentage, so usage evens out roughly
+> over many sessions rather than exactly.
+
+While agents are spread out, each profile on the dashboard shows how many it is serving
+(**Agents: N**), and every agent moved off an unavailable account is logged in Activity.
+
+**Settings → Session routing → "Balance sessions and subagents across accounts"** makes that
+the default for every session, with no flag to remember. **Off by default**, because it changes how your
+accounts are consumed. The flag still works while it's off, and turning it on never
+overrides a `--profile` pin.
+
+**Forced in subagents** is a per-account switch — on the Profiles list, in each profile's
+⋮ menu or its edit modal. Turn it on for one account and every subagent, in every session,
+goes to it — while the main agent keeps rotating normally. That's how you run, say, a
+Claude model as the orchestrator with all its subagents on a Codex/GPT account. Only one
+account can hold it at a time, and if that account is exhausted or disabled, subagents fall
+back to spreading across the pool rather than failing. If the account holding it is
+disabled, turning it on elsewhere simply moves it; an enabled holder has to be switched off
+first.
+
+Which one wins, in order:
+
+| How | What happens |
+|---|---|
+| `cu code --profile <name>` | That terminal's main agent **and** subagents all use that account. |
+| "Force in subagents" on a profile | Every subagent goes there; the main agent rotates normally. |
+| `cu code --distribute` | Main agent and each subagent start on the least-busy account and stay there, that session. |
+| Settings → "Balance sessions and subagents across accounts" | Same as above, for every session, no flag needed. |
+| *nothing set (default)* | Normal rotation — everyone shares one account until it's spent. |
 
 ### Using the Claude desktop app
 
@@ -555,6 +618,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 |---|---|
 | `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
+| `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. |
 | `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |
 | `claude-unlimited start` | Run the daemon in this terminal (Ctrl-C to stop). |

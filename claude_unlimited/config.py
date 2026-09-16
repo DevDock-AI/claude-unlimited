@@ -77,6 +77,13 @@ class Profile:
     codex_home: Optional[str] = None  # codex kind only: an isolated CODEX_HOME holding this Profile's auth.json, the counterpart of claude_config_dir. Every Codex invocation is scoped to it, so it never touches another Codex login on this machine.
     codex_model: Optional[str] = None  # codex kind only: overrides openai_models.py's mapping; None uses the automatic Claude-model -> Codex-model mapping.
     codex_reasoning_effort: Optional[str] = None  # codex kind only: overrides the reasoning-effort tier the mapping would pick (low|medium|high|xhigh|max|ultra); None uses the mapping's per-model default.
+    # Route EVERY subagent (any Claude Code branch carrying an agent-id header)
+    # to this Profile, whatever rotation would otherwise pick. The main agent is
+    # untouched — that asymmetry is the feature: a Claude orchestrator driving
+    # GPT subagents, say. At most one Profile may hold this (validated on save).
+    # If it becomes unavailable, subagents fall back to the balanced branch
+    # selector rather than failing. See gateway.py's branch pinning.
+    forced_for_subagents: bool = False
 
 
 UPDATE_MODES = ("auto_install", "auto_download", "manual")
@@ -96,6 +103,19 @@ class Settings:
     notify_rotated: bool = False
     notify_quota_reset: bool = False
     notify_needs_attention: bool = True
+    # Make `code --distribute` the default for every session (UI: "Balance
+    # sessions and subagents across accounts"): each new agent starts on the
+    # least-busy account and stays there. OFF by default — it changes how
+    # accounts are consumed, so it must be chosen, never inherited. The flag
+    # stays available per-session either way; the two are OR-ed, so this
+    # setting can only ever turn distribution ON, never override a `--profile`
+    # pin (which outranks both).
+    distribute_sessions_default: bool = False
+    # Read each subscription account's usage from the providers' read-only
+    # usage endpoints every 5-10 minutes while the user is active (see
+    # usage_probe.py for the idle pause and backoff). On by default: it sends
+    # no messages, and the Dashboard is wrong without it.
+    keep_usage_fresh: bool = True
     # The editable model-parity list: an ORDERED list of rows
     # [{"claude_model", "model"?, "effort"?, "claude_effort"?}, ...] that IS the
     # set of models Claude Code's /model picker offers for Codex-served
@@ -128,6 +148,21 @@ def ensure_app_dir() -> None:
         pass
 
 
+def normalize_forced_subagents(profiles: List[Profile]) -> List[Profile]:
+    """At most one Profile may hold `forced_for_subagents` — save_pool()
+    refuses more. A file can still carry several (hand-edited, or written by
+    another build), and then EVERY later save would fail while routing kept
+    quietly using one of them. Keep the holder routing already uses (the first
+    enabled one, else the first) and clear the rest, so the next save writes
+    exactly what was being routed."""
+    holders = [p for p in profiles if p.forced_for_subagents]
+    if len(holders) <= 1:
+        return profiles
+    keep = next((p for p in holders if p.enabled), holders[0])
+    return [replace(p, forced_for_subagents=False) if p.forced_for_subagents and p.id != keep.id else p
+            for p in profiles]
+
+
 def load_pool() -> Pool:
     ensure_app_dir()
     if not CONFIG_FILE.exists():
@@ -155,9 +190,11 @@ def load_pool() -> Pool:
             codex_home=p.get("codex_home"),
             codex_model=p.get("codex_model"),
             codex_reasoning_effort=p.get("codex_reasoning_effort"),
+            forced_for_subagents=bool(p.get("forced_for_subagents", False)),
         )
         for p in data.get("profiles", [])
     ]
+    profiles = normalize_forced_subagents(profiles)
     settings_data = data.get("settings", {})
     settings = Settings(
         update_mode=settings_data.get("update_mode", "auto_download"),
@@ -168,6 +205,8 @@ def load_pool() -> Pool:
         notify_rotated=bool(settings_data.get("notify_rotated", False)),
         notify_quota_reset=bool(settings_data.get("notify_quota_reset", False)),
         notify_needs_attention=bool(settings_data.get("notify_needs_attention", True)),
+        distribute_sessions_default=bool(settings_data.get("distribute_sessions_default", False)),
+        keep_usage_fresh=bool(settings_data.get("keep_usage_fresh", True)),
         model_parity=settings_data.get("model_parity") or {},
     )
 
@@ -178,7 +217,20 @@ def load_pool() -> Pool:
     )
 
 
+class TooManySubagentProfilesError(ValueError):
+    """More than one Profile claimed `forced_for_subagents`."""
+
+
 def save_pool(pool: Pool) -> None:
+    # At most one Profile may be the forced subagent target: "every subagent
+    # goes here" has no meaning if two Profiles claim it. Refused outright
+    # rather than silently picking one, so the caller can tell the user which
+    # Profile already holds it.
+    forced = [p for p in pool.profiles if getattr(p, "forced_for_subagents", False)]
+    if len(forced) > 1:
+        raise TooManySubagentProfilesError(
+            "Only one profile can be forced for subagents; already set on: "
+            + ", ".join(p.name for p in forced))
     ensure_app_dir()
     payload = {
         "profiles": [asdict(p) for p in pool.profiles],
@@ -197,7 +249,7 @@ def save_pool(pool: Pool) -> None:
 _SETTINGS_FIELDS = {
     "update_mode", "language", "notifications_enabled", "notify_update_available",
     "notify_approaching_threshold", "notify_rotated", "notify_quota_reset", "notify_needs_attention",
-    "model_parity",
+    "distribute_sessions_default", "keep_usage_fresh", "model_parity",
 }
 
 
@@ -286,6 +338,8 @@ def validated_settings_changes(changes: dict) -> dict:
     if unknown:
         raise ValueError(f"Cannot change settings fields: {sorted(unknown)}")
     changes = dict(changes)
+    if "keep_usage_fresh" in changes and not isinstance(changes["keep_usage_fresh"], bool):
+        raise ValueError("keep_usage_fresh must be true or false")
     if "update_mode" in changes and changes["update_mode"] not in UPDATE_MODES:
         raise ValueError(f"update_mode must be one of {UPDATE_MODES}")
     if "model_parity" in changes:

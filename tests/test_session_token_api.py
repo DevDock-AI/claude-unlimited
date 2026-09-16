@@ -88,3 +88,32 @@ def test_session_token_reuses_the_same_token_on_repeated_calls(running_server):
     status1, body1 = _get(f"{running_server}/api/session-token?profile_id={p.id}")
     status2, body2 = _get(f"{running_server}/api/session-token?profile_id={p.id}")
     assert body1["token"] == body2["token"]
+
+
+def test_distribute_mode_mints_a_token_without_a_profile_id(running_server):
+    status, body = _get(f"{running_server}/api/session-token?mode=distribute")
+    assert status == 200
+    grant = session_tokens.resolve_grant(body["token"])
+    assert grant.distribute is True
+    assert grant.forced_profile_id is None
+
+
+def test_distribute_mode_reuses_the_same_token_on_repeated_calls(running_server):
+    _, first = _get(f"{running_server}/api/session-token?mode=distribute")
+    _, second = _get(f"{running_server}/api/session-token?mode=distribute")
+    assert first["token"] == second["token"]
+
+
+def test_distribute_mode_and_a_pin_mint_different_tokens(running_server):
+    p = profile_repo.create_profile(name="X", kind="api", credential="tok-long-enough-key")
+    _, pinned = _get(f"{running_server}/api/session-token?profile_id={p.id}")
+    _, distributed = _get(f"{running_server}/api/session-token?mode=distribute")
+    assert pinned["token"] != distributed["token"]
+    assert session_tokens.resolve(pinned["token"]) == p.id
+    assert session_tokens.resolve(distributed["token"]) is None
+
+
+def test_an_unknown_mode_still_requires_a_profile_id(running_server):
+    status, body = _get(f"{running_server}/api/session-token?mode=nonsense")
+    assert status == 400
+    assert body["error"] == "bad_request"
