@@ -107,3 +107,102 @@ def test_a_newer_schema_degrades_rather_than_guessing(env):
 
     assert db.connect() is None
     assert "newer than this build" in (db.degraded_reason() or "")
+
+
+# ---- one-shot import of the JSONL logs the store replaces -----------------
+
+def _write_jsonl(path, rows):
+    import json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _usage_row(ts, tokens=10, **kw):
+    row = {"timestamp": ts, "profile_id": "p1", "project_id": "-Users-a-app", "model": "claude-sonnet-5",
+           "input_tokens": tokens, "output_tokens": 2, "cache_creation_input_tokens": 0,
+           "cache_read_input_tokens": 0, "cost_usd": 0.01}
+    row.update(kw)
+    return row
+
+
+def test_import_moves_both_logs_into_the_store(env):
+    _write_jsonl(env / db.LEGACY_USAGE_BASENAME,
+                 [_usage_row("2026-09-01T10:00:00+00:00"),
+                  _usage_row("2026-09-01T11:00:00+00:00", model="gpt-6-astra",
+                             requested_model="claude-fable-5-1")])
+    _write_jsonl(env / db.LEGACY_ACTIVITY_BASENAME,
+                 [{"timestamp": "2026-09-01T10:00:00+00:00", "category": "rotation",
+                   "text": "Rotated A -> B", "meta": None}])
+
+    result = db.import_legacy_logs()
+
+    assert result["ok"] and result["usage_imported"] == 2 and result["activity_imported"] == 1
+    rows = db.query("SELECT * FROM usage_event ORDER BY ts")
+    assert [r["model"] for r in rows] == ["claude-sonnet-5", "gpt-6-astra"]
+    assert rows[1]["requested_model"] == "claude-fable-5-1"
+    assert rows[0]["project_id"] == "-Users-a-app" and rows[0]["cost_usd"] == 0.01
+    assert db.query("SELECT text FROM activity_event")[0]["text"] == "Rotated A -> B"
+
+
+def test_importing_twice_cannot_double_count(env):
+    """The gate for this phase: a re-run, or a user restoring a backup of the
+    old log, must not duplicate a single row."""
+    rows = [_usage_row("2026-09-01T10:00:00+00:00"), _usage_row("2026-09-01T11:00:00+00:00")]
+    _write_jsonl(env / db.LEGACY_USAGE_BASENAME, rows)
+    db.import_legacy_logs()
+
+    _write_jsonl(env / db.LEGACY_USAGE_BASENAME, rows)  # the same file is back
+    second = db.import_legacy_logs()
+
+    assert second["usage_imported"] == 0 and second["usage_skipped"] == 2
+    assert len(db.query("SELECT * FROM usage_event")) == 2
+
+
+def test_sources_are_retired_not_deleted(env):
+    _write_jsonl(env / db.LEGACY_USAGE_BASENAME, [_usage_row("2026-09-01T10:00:00+00:00")])
+    db.import_legacy_logs()
+
+    assert not (env / db.LEGACY_USAGE_BASENAME).exists()
+    retired = env / (db.LEGACY_USAGE_BASENAME + db.IMPORTED_SUFFIX)
+    assert retired.exists() and "2026-09-01" in retired.read_text()
+
+
+def test_an_existing_imported_file_is_never_overwritten(env):
+    keep = env / (db.LEGACY_USAGE_BASENAME + db.IMPORTED_SUFFIX)
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    keep.write_text("an earlier import's history\n")
+    _write_jsonl(env / db.LEGACY_USAGE_BASENAME, [_usage_row("2026-09-02T10:00:00+00:00")])
+
+    db.import_legacy_logs()
+
+    assert keep.read_text() == "an earlier import's history\n"  # untouched
+    assert len(list(env.glob(db.LEGACY_USAGE_BASENAME + db.IMPORTED_SUFFIX + "*"))) == 2
+
+
+def test_corrupt_lines_are_skipped_and_the_rest_import(env):
+    source = env / db.LEGACY_USAGE_BASENAME
+    _write_jsonl(source, [_usage_row("2026-09-01T10:00:00+00:00")])
+    with source.open("a", encoding="utf-8") as f:
+        f.write("not json at all\n")
+        f.write('{"timestamp": null, "profile_id": "p1"}\n')  # unusable key
+
+    result = db.import_legacy_logs()
+
+    assert result["usage_imported"] == 1 and result["usage_skipped"] == 1
+    assert len(db.query("SELECT * FROM usage_event")) == 1
+
+
+def test_a_degraded_store_imports_nothing_and_keeps_the_sources(env):
+    db.close_this_thread()
+    db.path().write_text("this is not a database")
+    _write_jsonl(env / db.LEGACY_USAGE_BASENAME, [_usage_row("2026-09-01T10:00:00+00:00")])
+
+    result = db.import_legacy_logs()
+
+    assert result["ok"] is False and result["usage_imported"] == 0
+    assert (env / db.LEGACY_USAGE_BASENAME).exists()  # history stays exactly where it was
+
+
+def test_import_with_no_legacy_files_is_a_no_op(env):
+    result = db.import_legacy_logs()
+    assert result["ok"] and result["usage_imported"] == 0 and result["retired"] == []

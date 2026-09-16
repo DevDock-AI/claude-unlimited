@@ -28,8 +28,10 @@ connection is not safe to share across threads, so each thread gets its own
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -196,3 +198,119 @@ def close_this_thread() -> None:
             pass
         _local.entry = None
     _clear_degraded()
+
+
+# ---- one-shot import of the JSONL logs this store replaces ----------------
+
+LEGACY_USAGE_BASENAME = "usage_history.jsonl"
+LEGACY_ACTIVITY_BASENAME = "activity.jsonl"
+IMPORTED_SUFFIX = ".imported"
+
+
+def _json_lines(source: Path):
+    """Every well-formed object in a JSONL file. A corrupt line is skipped, not
+    fatal — the same rule the JSONL readers already followed."""
+    try:
+        raw = source.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            yield data
+
+
+def _int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _retire(source: Path) -> Optional[str]:
+    """Rename an imported log aside. NEVER deletes, and never overwrites an
+    existing `.imported` file — if one is there, this run's file keeps a
+    distinct name so no history can be lost."""
+    target = source.with_suffix(source.suffix + IMPORTED_SUFFIX)
+    if target.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        target = source.with_suffix(f"{source.suffix}{IMPORTED_SUFFIX}.{stamp}")
+    try:
+        source.replace(target)
+        return target.name
+    except OSError:
+        return None
+
+
+def import_legacy_logs() -> dict:
+    """Move `usage_history.jsonl` and `activity.jsonl` into the store, once.
+
+    Idempotent by construction: a row already present (same timestamp, and the
+    fields that identify the event) is skipped, so running this twice — or
+    after a user restores a backup of the old file — cannot double-count.
+    Sources are renamed aside only after their rows are in; a failure leaves
+    them exactly where they were, because an upgrade must never be able to
+    destroy history.
+    """
+    result = {"usage_imported": 0, "usage_skipped": 0,
+              "activity_imported": 0, "activity_skipped": 0,
+              "retired": [], "ok": True}
+    if connect() is None:
+        result["ok"] = False
+        return result
+
+    usage_source = config.APP_DIR / LEGACY_USAGE_BASENAME
+    if usage_source.exists():
+        seen = {(r["ts"], r["profile_id"], r["model"], r["input_tokens"], r["output_tokens"])
+                for r in query("SELECT ts, profile_id, model, input_tokens, output_tokens FROM usage_event")}
+        for row in _json_lines(usage_source):
+            key = (row.get("timestamp"), row.get("profile_id"), row.get("model"),
+                   _int(row.get("input_tokens")), _int(row.get("output_tokens")))
+            if not key[0] or not key[1] or key in seen:
+                result["usage_skipped"] += 1
+                continue
+            inserted = execute(
+                """INSERT INTO usage_event (ts, profile_id, project_id, model, input_tokens, output_tokens,
+                                            cache_creation_input_tokens, cache_read_input_tokens, cost_usd,
+                                            requested_model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (row.get("timestamp"), row.get("profile_id"), row.get("project_id"), row.get("model"),
+                 _int(row.get("input_tokens")), _int(row.get("output_tokens")),
+                 _int(row.get("cache_creation_input_tokens")), _int(row.get("cache_read_input_tokens")),
+                 row.get("cost_usd"), row.get("requested_model")))
+            if inserted is None:
+                result["ok"] = False
+                return result  # leave the source untouched
+            seen.add(key)
+            result["usage_imported"] += 1
+        retired = _retire(usage_source)
+        if retired:
+            result["retired"].append(retired)
+
+    activity_source = config.APP_DIR / LEGACY_ACTIVITY_BASENAME
+    if activity_source.exists():
+        seen_activity = {(r["ts"], r["category"], r["text"], r["meta"])
+                         for r in query("SELECT ts, category, text, meta FROM activity_event")}
+        for row in _json_lines(activity_source):
+            key = (row.get("timestamp"), row.get("category"), row.get("text"), row.get("meta"))
+            if not key[0] or not key[1] or key in seen_activity:
+                result["activity_skipped"] += 1
+                continue
+            inserted = execute("INSERT INTO activity_event (ts, category, text, meta) VALUES (?, ?, ?, ?)",
+                               (row.get("timestamp"), row.get("category"), row.get("text", ""), row.get("meta")))
+            if inserted is None:
+                result["ok"] = False
+                return result
+            seen_activity.add(key)
+            result["activity_imported"] += 1
+        retired = _retire(activity_source)
+        if retired:
+            result["retired"].append(retired)
+
+    return result
