@@ -9,48 +9,23 @@ for free rather than a figure this module would have to invent.
 
 from __future__ import annotations
 
-import json
-import threading
+from . import db
+from .config import APP_DIR
 
-from .config import APP_DIR, ensure_app_dir
-
+# Kept for db.import_legacy_logs(), the only thing that still reads this file.
 USAGE_FILE = APP_DIR / "project_usage.json"
-
-# The daemon serves requests on a thread per connection and this runs in the
-# proxy hot path, so the read-modify-write below needs a lock or concurrent
-# requests lose increments.
-_lock = threading.Lock()
 
 
 def record_request(project_id: str) -> None:
-    ensure_app_dir()
-    with _lock:
-        data = _load()
-        data[project_id] = data.get(project_id, 0) + 1
-        _save(data)
+    """One UPSERT rather than a read-modify-write: SQLite serializes it, so
+    concurrent proxy threads can no longer lose increments."""
+    db.execute("INSERT INTO project_request (project_id, count) VALUES (?, 1)"
+               " ON CONFLICT(project_id) DO UPDATE SET count = count + 1", (project_id,))
 
 
 def get_counts() -> dict:
-    with _lock:
-        return _load()
+    return {r["project_id"]: r["count"] for r in db.query("SELECT project_id, count FROM project_request")}
 
 
 def reset() -> None:
-    with _lock:
-        _save({})
-
-
-def _load() -> dict:
-    if not USAGE_FILE.exists():
-        return {}
-    try:
-        return json.loads(USAGE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save(data: dict) -> None:
-    ensure_app_dir()
-    tmp = USAGE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(USAGE_FILE)
+    db.execute("DELETE FROM project_request")

@@ -41,6 +41,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
+from . import db
 from . import usage_probe
 from . import activity
 from . import anthropic_oauth
@@ -1591,6 +1592,15 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
     # happens here at all: refreshing is driven by `code` session launches
     # (POST /api/models/refresh) and the hourly update-loop tick.
     model_catalogue.initialize()
+    # Move the JSONL logs into the store, once. Idempotent and best-effort: a
+    # failure leaves the sources exactly where they were (see db.py).
+    try:
+        imported = db.import_legacy_logs()
+        if imported["usage_imported"] or imported["activity_imported"]:
+            activity.record("config", "Statistics moved into the local database",
+                            meta=f"{imported['usage_imported']} usage + {imported['activity_imported']} activity rows")
+    except Exception:
+        pass
     # Self-heal the CLI launchers on startup. The auto-updater only self-heals
     # from the release AFTER the fix (the OLD updater installs the new tree),
     # so a new command name — `cu`, added in 1.2.6 — would otherwise not reach

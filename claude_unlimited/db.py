@@ -38,7 +38,7 @@ from typing import Any, Optional, Sequence
 from . import config
 
 DB_BASENAME = "claude_unlimited.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 
 _local = threading.local()
@@ -118,7 +118,21 @@ def _migrate_to_1(conn: sqlite3.Connection) -> None:
     )
 
 
-_MIGRATIONS = [_migrate_to_1]  # index 0 takes the schema from version 0 to 1
+def _migrate_to_2(conn: sqlite3.Connection) -> None:
+    """Per-project request counters. A plain GROUP BY over usage_event would
+    undercount: project_usage counts every attributed request, including the
+    ones that never yield a usage row (token counting, errors)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS project_request (
+          project_id TEXT PRIMARY KEY,
+          count INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+
+
+_MIGRATIONS = [_migrate_to_1, _migrate_to_2]  # index 0 takes the schema from version 0 to 1
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -204,6 +218,7 @@ def close_this_thread() -> None:
 
 LEGACY_USAGE_BASENAME = "usage_history.jsonl"
 LEGACY_ACTIVITY_BASENAME = "activity.jsonl"
+LEGACY_PROJECT_BASENAME = "project_usage.json"
 IMPORTED_SUFFIX = ".imported"
 
 
@@ -292,6 +307,24 @@ def import_legacy_logs() -> dict:
         retired = _retire(usage_source)
         if retired:
             result["retired"].append(retired)
+
+    project_source = config.APP_DIR / LEGACY_PROJECT_BASENAME
+    if project_source.exists():
+        try:
+            counts = json.loads(project_source.read_text())
+        except (OSError, json.JSONDecodeError):
+            counts = {}
+        if isinstance(counts, dict):
+            for project_id, count in counts.items():
+                if not isinstance(project_id, str):
+                    continue
+                # DO NOTHING on conflict: re-importing must not add to a counter
+                # the daemon has been incrementing since the first import.
+                execute("INSERT INTO project_request (project_id, count) VALUES (?, ?)"
+                        " ON CONFLICT(project_id) DO NOTHING", (project_id, _int(count)))
+            retired = _retire(project_source)
+            if retired:
+                result["retired"].append(retired)
 
     activity_source = config.APP_DIR / LEGACY_ACTIVITY_BASENAME
     if activity_source.exists():
