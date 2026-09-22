@@ -7,11 +7,23 @@ this way on a real Windows box.
 """
 
 import ctypes
+import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import claude_unlimited.daemon as daemon
 
+# `resource` is POSIX-only and daemon.py imports it conditionally, so on
+# Windows `daemon.resource` does not exist at all and these two fail at the
+# monkeypatch rather than on an assertion. They are testing POSIX byte math;
+# skipping is the honest result, and it keeps the Windows run's failures
+# meaningful. The Windows case below fakes windll and runs everywhere.
+posix_only = pytest.mark.skipif(os.name == "nt",
+                                reason="POSIX-only: daemon.resource is not imported on Windows")
 
+
+@posix_only
 def test_memory_mb_darwin_divides_by_bytes_per_mb(monkeypatch):
     monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
     fake_usage = MagicMock(ru_maxrss=200 * 1024 * 1024)  # macOS: bytes
@@ -19,6 +31,7 @@ def test_memory_mb_darwin_divides_by_bytes_per_mb(monkeypatch):
     assert daemon._memory_mb() == 200.0
 
 
+@posix_only
 def test_memory_mb_linux_divides_by_kb_per_mb(monkeypatch):
     monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
     fake_usage = MagicMock(ru_maxrss=200 * 1024)  # Linux: KB

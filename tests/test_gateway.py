@@ -1,3 +1,4 @@
+import json
 import time
 import time as real_time
 from datetime import datetime, timedelta, timezone
@@ -317,6 +318,10 @@ def test_reauthenticating_a_profile_clears_stuck_auth_invalid_state(pool_env):
     recovered = gw.handle("POST", "/v1/messages", {}, b"{}")
     assert recovered.status == 200
     assert recovered.profile_id == "a"
+    # And its usage is read straight away, not at the next scheduled read, so
+    # the Dashboard fills in the moment the account is back.
+    assert gw.take_usage_recheck_requests() == {"a"}
+    assert gw.usage_recheck_wakeup.is_set()
     assert transport.calls == 2  # the refreshed credential got tried
 
 
@@ -361,10 +366,13 @@ def test_auth_invalid_oauth_profile_self_recovers_via_refresh_token_on_sync(pool
 
     monkeypatch.setattr(gateway_module.oauth_login, "refresh_access_token", fake_refresh)
 
+    gw.runtime_snapshot()              # a poll schedules the check...
+    gw.wait_for_credential_checks()    # ...which runs off the request thread
     snapshot = gw.runtime_snapshot()  # a bare sync, with no request and no manual re-auth
 
     assert refresh_calls == ["ref-a"]
     assert snapshot["a"].state == gateway_module.ProfileState.ELIGIBLE
+    assert gw.take_usage_recheck_requests() == {"a"}   # its usage is read now
     persisted = oauth_credential.decode(fake_store.tokens["a"])
     assert persisted.access_token == "tok-recovered"
 
@@ -1211,7 +1219,10 @@ def test_an_auth_invalid_codex_profile_recovers_via_its_refresh_token(pool_env, 
     gw._observe("a", AuthInvalid(), datetime(2026, 1, 1, tzinfo=timezone.utc))
     assert gw._runtime["a"].state == ProfileState.AUTH_INVALID
 
+    gw.runtime_snapshot()
+    gw.wait_for_credential_checks()
     assert gw.runtime_snapshot()["a"].state == ProfileState.ELIGIBLE
+    assert gw.take_usage_recheck_requests() == {"a"}   # codex too: read its usage now
     assert calls == ["a"], "the refresh was never attempted for a codex profile"
 
 
@@ -1439,3 +1450,409 @@ def test_a_preventive_refresh_stays_responsive(pool_env, monkeypatch):
     except gw_mod.oauth_login.OAuthLoginError:
         pass
     assert gw._refresh_check_not_before["a"] - now[0] == Gateway._REFRESH_CHECK_COOLDOWN_SECONDS
+
+
+def test_the_gateway_lock_is_free_while_a_credential_refresh_runs(pool_env, monkeypatch):
+    """The refresh reads the keychain (a subprocess on macOS) and calls the
+    provider's token endpoint. Holding the gateway lock across that made every
+    Dashboard and widget poll queue behind it — 20-45s on a loaded machine,
+    with the widget falling back to "loading" each time."""
+    import claude_unlimited.oauth_credential as oauth_credential
+    import claude_unlimited.oauth_login as oauth_login
+    import claude_unlimited.profiles as profile_repo
+
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True)]))
+
+    class SettableFakeSecretStore(FakeSecretStore):
+        def set_token(self, profile_id, token):
+            self.tokens[profile_id] = token
+
+    expiring = oauth_credential.encode(oauth_credential.StoredOAuthCredential(
+        access_token="tok-old", refresh_token="ref-a", expires_at=1))
+    store = SettableFakeSecretStore({"a": expiring})
+    monkeypatch.setattr(gateway_module, "secret_store", store)
+    monkeypatch.setattr(profile_repo, "secret_store", store)
+
+    gw = Gateway(transport=lambda req: fake_response(200))
+    lock_free_during_refresh = []
+    keychain_lock_free = []
+
+    def watching_get_token(profile_id, _real=store.get_token):
+        keychain_lock_free.append(gw._lock.acquire(blocking=False))
+        if keychain_lock_free[-1]:
+            gw._lock.release()
+        return _real(profile_id)
+
+    monkeypatch.setattr(store, "get_token", watching_get_token)
+
+    def fake_refresh(refresh_token, timeout=30.0):
+        # Whoever holds the lock here blocks every other caller for as long
+        # as this network call takes.
+        lock_free_during_refresh.append(gw._lock.acquire(blocking=False))
+        if lock_free_during_refresh[-1]:
+            gw._lock.release()
+        return oauth_login.LoginTokens(access_token="tok-new", refresh_token="ref-a",
+                                        expires_at=9_999_999_999_999)
+
+    monkeypatch.setattr(gateway_module.oauth_login, "refresh_access_token", fake_refresh)
+
+    gw.runtime_snapshot()            # schedules the check on a background thread
+    gw.wait_for_credential_checks()  # and here it finishes, off this thread
+    assert lock_free_during_refresh == [True], "the token refresh ran while holding the gateway lock"
+    assert all(keychain_lock_free), "the keychain was read while holding the gateway lock"
+
+
+def test_a_test_can_never_write_the_users_real_config(monkeypatch):
+    """The backstop for what actually happened: a credential-check thread
+    outlived its test, monkeypatch restored the real CONFIG_FILE, and the
+    thread wrote its test pool over four live Profiles."""
+    import claude_unlimited.config as config
+    from pathlib import Path
+
+    monkeypatch.setattr(config, "CONFIG_FILE", Path.home() / ".claude-unlimited" / "config.json")
+    with pytest.raises(RuntimeError, match="refusing to write the real config"):
+        config.save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth")]))
+
+
+# ---- "everything is out of capacity" is said once, and says what it means --
+
+def _exhausted_pool_gateway(monkeypatch, percent=99.0):
+    """One enabled Profile, at its limit, with a known reset time."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True,
+                                     switch_threshold=98.0)]))
+    resets = datetime.now(timezone.utc) + timedelta(minutes=30)
+
+    def transport(req):
+        # The shape Anthropic actually sends when a window is spent: the
+        # explicit "rejected" status, not just a high utilization.
+        return fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected",
+                                   "anthropic-ratelimit-unified-5h-utilization": str(percent / 100),
+                                   "anthropic-ratelimit-unified-5h-reset": str(int(resets.timestamp()))})
+
+    gw = Gateway(transport=transport)
+    gw.handle("POST", "/v1/messages", {}, b"{}")  # the request that uses it up
+    return gw, resets
+
+
+def test_exhaustion_is_announced_once_however_many_requests_are_rejected(monkeypatch, pool_env):
+    recorded = []
+    monkeypatch.setattr("claude_unlimited.gateway.activity.record",
+                        lambda category, text, meta=None: recorded.append(text))
+    notified = []
+    monkeypatch.setattr("claude_unlimited.gateway.notifications.notify_if_enabled",
+                        lambda kind, title, body, settings: notified.append(body))
+    gw, _ = _exhausted_pool_gateway(monkeypatch)
+
+    for _ in range(25):
+        result = gw.handle("POST", "/v1/messages", {}, b"{}")
+        assert result.status == 503
+
+    assert len([t for t in recorded if "out of capacity" in t]) == 1, recorded
+    assert len(notified) == 1
+
+
+def test_an_exhausted_pool_says_so_specifically_and_when_it_comes_back(pool_env):
+    gw, resets = _exhausted_pool_gateway(None)
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert result.status == 503
+    assert result.error == "all_profiles_exhausted"
+    assert "all profiles are out of capacity" in result.error_detail.lower()
+    assert f"{resets.astimezone():%H:%M}" in result.error_detail
+    # Retry-After, so a client that honours it waits for real capacity.
+    assert 0 < int(result.headers["retry-after"]) <= 30 * 60
+
+
+def test_a_pool_that_is_merely_unreachable_is_not_reported_as_exhausted(pool_env):
+    """A cooldown from a refused connection is not a quota problem, and must
+    not tell the user they are out of capacity."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(ConnectionRefusedError("refused")))
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+    assert result.error == "no_eligible_profile" and result.error_detail is None
+
+
+def test_capacity_coming_back_is_recorded_and_re_arms_the_announcement(monkeypatch, pool_env):
+    recorded = []
+    monkeypatch.setattr("claude_unlimited.gateway.activity.record",
+                        lambda category, text, meta=None: recorded.append(text))
+    monkeypatch.setattr("claude_unlimited.gateway.notifications.notify_if_enabled",
+                        lambda kind, title, body, settings: None)
+    gw, _ = _exhausted_pool_gateway(monkeypatch)   # announces
+    gw.handle("POST", "/v1/messages", {}, b"{}")   # stays quiet
+
+    # The window reopens and a request succeeds: the runtime's reset time is
+    # in the past by then, so the Profile recovers on the next request.
+    gw._transport = lambda req: fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1"})
+    for rt in gw._runtime.values():
+        rt.resets_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        rt.cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").status == 200
+    assert any("Capacity is back" in t for t in recorded), recorded
+
+    # Out again: the next outage is announced afresh, not swallowed.
+    recorded.clear()
+    gw._transport = lambda req: fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected",
+                                                    "anthropic-ratelimit-unified-5h-utilization": "0.99"})
+    gw.handle("POST", "/v1/messages", {}, b"{}")
+    gw.handle("POST", "/v1/messages", {}, b"{}")
+    assert len([t for t in recorded if "out of capacity" in t]) == 1, recorded
+
+
+# ---- a request must never carry an empty text block upstream ---------------
+
+def test_an_empty_text_block_in_the_history_is_dropped_before_forwarding(pool_env):
+    """Anthropic rejects the whole request with "400 messages: text content
+    blocks must be non-empty". A client re-sends its entire conversation every
+    turn, so one empty block recorded in a session breaks every later request
+    in it — including on accounts that never produced it."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body))
+        return fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1"})
+
+    body = json.dumps({
+        "model": "claude-sonnet-5",
+        "system": [{"type": "text", "text": "be helpful"}, {"type": "text", "text": ""}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            # What the Codex bridge used to write: a reply that went straight
+            # to a tool call, recorded as an empty text block.
+            {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "  "},
+                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]},
+        ],
+    }).encode()
+
+    result = Gateway(transport=transport).handle("POST", "/v1/messages", {}, body)
+    assert result.status == 200
+
+    forwarded = sent[0]
+    assert forwarded["system"] == [{"type": "text", "text": "be helpful"}]
+    # The message that was nothing but an empty block is gone; the one that
+    # also carried a tool_use keeps it, so the tool_result still has its pair.
+    assert [m["role"] for m in forwarded["messages"]] == ["user", "assistant", "user"]
+    assert [b["type"] for b in forwarded["messages"][1]["content"]] == ["tool_use"]
+    assert forwarded["messages"][2]["content"][0]["tool_use_id"] == "toolu_1"
+
+
+def test_a_request_with_no_empty_blocks_is_forwarded_byte_for_byte(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    sent = []
+
+    def transport(req):
+        sent.append(req.body)
+        return fake_response(200, {"anthropic-ratelimit-unified-5h-utilization": "0.1"})
+
+    body = json.dumps({"model": "claude-sonnet-5",
+                       "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}).encode()
+    Gateway(transport=transport).handle("POST", "/v1/messages", {}, body)
+    assert sent[0] == body
+
+
+# ---------------------------------------------------------------------------
+# Issue #4 — returning to the highest-priority account after a failover.
+# ---------------------------------------------------------------------------
+
+_OK_HEADERS = {"anthropic-ratelimit-unified-5h-utilization": "0.4",
+               "anthropic-ratelimit-unified-5h-reset": "1787191800"}
+
+
+def _two_profiles(**settings_kwargs):
+    from claude_unlimited.config import Settings
+    return Pool(profiles=[
+        Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
+        Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
+    ], settings=Settings(**settings_kwargs))
+
+
+def _drain(result):
+    """A Profile stays marked in-flight until its response body is read to the
+    end, and an in-flight request means the pool is NOT idle. A test that
+    leaves the body unread is a pool that never goes idle."""
+    list(result.body_chunks or ())
+    return result
+
+
+def _fail_over_to_b(gw, calls):
+    """Drive the pool onto the fallback, then let A recover."""
+    result = _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert result.profile_id == "b", "the failover itself did not happen"
+    # A's quota window has reset; it is eligible again.
+    gw._runtime["a"].state = gateway_module.ProfileState.ELIGIBLE
+    gw._runtime["a"].resets_at = None
+
+
+def _transport_failing_a_once():
+    calls = []
+
+    def transport(req):
+        calls.append(req.headers.get("Authorization"))
+        if calls[-1] == "Bearer tok-a" and len(calls) == 1:
+            return fake_response(429, {"anthropic-ratelimit-unified-5h-status": "rejected"})
+        return fake_response(200, _OK_HEADERS)
+
+    return transport, calls
+
+
+def test_the_pool_stays_on_the_fallback_by_default(pool_env):
+    """The sticky behaviour issue #4 reports is deliberate — it keeps the
+    prompt cache warm — so it must be what happens with the setting off."""
+    save_pool(_two_profiles())
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+
+    assert _drain(gw.handle("POST", "/v1/messages", {}, b"{}")).profile_id == "b"
+
+
+def test_an_idle_pool_returns_to_the_preferred_account_when_asked(pool_env):
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+
+    # Nothing has been served for longer than the idle gate.
+    for pid in list(gw._last_active):
+        gw._last_active[pid] -= gw._RETURN_TO_PREFERRED_IDLE_SECONDS + 1
+    assert _drain(gw.handle("POST", "/v1/messages", {}, b"{}")).profile_id == "a"
+
+
+def test_a_busy_pool_is_never_moved_mid_session(pool_env):
+    """The whole risk in this feature is yanking a live session off its
+    account. The idle gate is what prevents it."""
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+
+    # The last request was seconds ago, not ten minutes.
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").profile_id == "b"
+
+
+def test_take_over_outranks_the_return(pool_env):
+    """A standing manual override is an explicit choice made now; the setting
+    is a preference made once."""
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    _fail_over_to_b(gw, calls)
+    gw._manual_profile_id = "b"
+    for pid in list(gw._last_active):
+        gw._last_active[pid] -= gw._RETURN_TO_PREFERRED_IDLE_SECONDS + 1
+
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").profile_id == "b"
+
+
+def test_the_return_never_moves_down_the_priority_order(pool_env):
+    """It only ever goes UP. With the preferred account still spent, an idle
+    pool must stay exactly where it is rather than churn."""
+    save_pool(_two_profiles(return_to_preferred=True))
+    transport, calls = _transport_failing_a_once()
+    gw = Gateway(transport=transport)
+    result = _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert result.profile_id == "b"
+    # A is left EXHAUSTED this time — no recovery.
+    for pid in list(gw._last_active):
+        gw._last_active[pid] -= gw._RETURN_TO_PREFERRED_IDLE_SECONDS + 1
+
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").profile_id == "b"
+
+
+# ---------------------------------------------------------------------------
+# Rejection-triggered usage re-read.
+#
+# Polling gives up to ~10 minutes of staleness, during which requests for a
+# spent model keep landing on the account that cannot serve them. A 429 the
+# ACCOUNT-level windows cannot explain is the event that says "the data is
+# already wrong", so the usage endpoint is worth re-reading now.
+# ---------------------------------------------------------------------------
+
+def _rate_limited_transport():
+    def transport(req):
+        # 429 with no retry-after and no "rejected" status: a ShortRateLimit,
+        # not a quota exhaustion.
+        return fake_response(429, {})
+    return transport
+
+
+def test_a_429_the_account_windows_cannot_explain_asks_for_a_usage_reread(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw.runtime_snapshot()
+    with gw._lock:
+        # Comfortably below the switch threshold: nothing we already know
+        # explains a refusal.
+        gw._runtime["a"].last_usage_percent = 12.0
+        gw._runtime["a"].last_usage_percent_7d = 20.0
+
+    _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert gw.take_usage_recheck_requests() == {"a"}
+
+
+def test_a_429_on_an_account_near_its_threshold_asks_for_nothing(pool_env):
+    """The numbers we already hold explain this one, so a re-read would tell
+    us nothing — and an account being rate-limited is the last one to send
+    extra requests to."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw.runtime_snapshot()
+    with gw._lock:
+        gw._runtime["a"].last_usage_percent = 97.0   # inside the approaching band
+        gw._runtime["a"].last_usage_percent_7d = 10.0
+
+    _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert gw.take_usage_recheck_requests() == set()
+
+
+def test_a_successful_request_asks_for_nothing(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=lambda req: fake_response(200, _OK_HEADERS))
+    _drain(gw.handle("POST", "/v1/messages", {}, b"{}"))
+    assert gw.take_usage_recheck_requests() == set()
+
+
+def test_at_most_one_reread_per_profile_per_interval(pool_env):
+    """The point is to replace a scheduled read, not to add a burst of them."""
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw.runtime_snapshot()
+    with gw._lock:
+        gw._runtime["a"].last_usage_percent = 5.0
+
+    assert gw._request_usage_recheck("a") is True
+    assert gw._request_usage_recheck("a") is False     # immediately after
+    assert gw.take_usage_recheck_requests() == {"a"}
+    # Draining does NOT reset the clock: a honoured request still counts.
+    assert gw._request_usage_recheck("a") is False
+    assert gw.take_usage_recheck_requests() == set()
+
+
+def test_the_interval_eventually_allows_another_reread(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    assert gw._request_usage_recheck("a") is True
+
+    base = real_time.monotonic()
+    monkeypatch.setattr(gateway_module.time, "monotonic",
+                        lambda: base + gw._USAGE_RECHECK_MIN_INTERVAL + 1)
+    assert gw._request_usage_recheck("a") is True
+
+
+def test_draining_is_one_shot(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True)]))
+    gw = Gateway(transport=_rate_limited_transport())
+    gw._request_usage_recheck("a")
+    assert gw.take_usage_recheck_requests() == {"a"}
+    assert gw.take_usage_recheck_requests() == set()

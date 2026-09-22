@@ -57,7 +57,10 @@ dashboard's activity log is the only place you'll find out it happened.
 | **[Models parity](#which-gpt-model-runs-your-claude-model)** | Which GPT model runs each Claude model |
 | **[Usage](#usage)** | Daily driving |
 | **[The Claude desktop app](#using-the-claude-desktop-app)** | Route the app through your pool too |
+| **[Your own app](#calling-the-daemon-from-your-own-app)** | Anything that speaks the Messages API |
 | **[The dashboard](#the-dashboard)** | What you can see and control |
+| **[ECO](#eco--efficient-context-optimization)** | Fewer tokens for the same work |
+| **[HUD - Heads-Up Display](#hud---heads-up-display-macos)** | Your pool at a glance, on macOS |
 | **[Notifications](#notifications)** | Know before you run out |
 | **[Updates](#updates)** | How new versions reach you |
 | **[Command reference](#command-reference)** | Every command |
@@ -95,8 +98,14 @@ Anthropic API keys, your own gateway — and treats them as one continuous suppl
 | <img src="docs/logos/claude.png" height="14" alt=""><img src="docs/logos/openai.png" height="14" alt=""> | **Mixed pools** — Claude subscriptions, ChatGPT/Codex, and API keys side by side, each with its own priority and threshold. |
 | <img src="docs/logos/openai.png" height="14" alt=""> | **Claude Code, powered by GPT** — a Codex account is translated to and from the Anthropic API shape, with real token-level streaming. Claude Code can't tell. |
 | 🎚️ | **[Models parity](#which-gpt-model-runs-your-claude-model)** — you decide which GPT model and reasoning effort each Claude model maps to, and what it costs your Codex quota. |
+| 🧠 | **[The 1M context window, through the pool](#the-1m-context-window)** — Claude Code normally drops to 200K behind a proxy; `cu code` gets the million back, and a ChatGPT account in the pool is guarded turn by turn instead of costing you the window. |
+| ⚖️ | **[Balanced sessions](#balancing-sessions-and-subagents-across-accounts)** — `cu code --distribute` spreads the main agent and each subagent across accounts, each staying put so its prompt cache stays warm. |
+| ⏳ | **[Per-model limits](#when-fable-runs-out-but-the-account-hasnt)** — when a plan's Fable week runs out before the account does, the session can move on instead of failing every Fable request. |
 | 🖥️ | **[The Claude desktop app too](#using-the-claude-desktop-app)** — not just the terminal. One command points it at your pool, and `--revert` puts it back. |
 | 📊 | **A dashboard you'll actually open** — live usage bars, cost tracking, model split, per-project attribution, activity log. |
+| 📈 | **[Statistics](#the-dashboard)** — spend and tokens over time as line charts, broken down by model, project and account, plus what each request *asked for* versus what served it. |
+| 🌿 | **[ECO](#eco--efficient-context-optimization)** — shortens what tools printed before it is sent, so the same work costs fewer tokens. Off by default; only tool output is ever rewritten. |
+| 🎛️ | **[HUD - Heads-Up Display](#hud---heads-up-display-macos)** — a floating macOS dock showing every account's usage at a glance, always on top if you want it. |
 | 🔒 | **100% local** — no account, no telemetry, no cloud. Your credentials never leave your machine. |
 | ⚙️ | **One command to work** — `claude-unlimited code` and you're routed. |
 | 🔔 | **Notifications** — told before you run out, not after. |
@@ -270,6 +279,22 @@ to and from OpenAI's transparently, streaming included.
 
 Also isolated: your existing `codex` login is left alone.
 
+### Purchased credits
+
+A ChatGPT account can hold purchased credits on top of its plan. Claude Unlimited reads the
+balance from the account's own responses and shows it on the profile card, so an account
+sitting idle at 100% while you have credits on it is no longer a mystery.
+
+By default those credits are **not** spent: when the plan window runs out the account is
+rotated away from and comes back when the window resets, exactly as before. Your plan window
+is already paid for; credits are charged per request, and a pool that started spending them
+on its own would be a bad surprise. **Settings → ChatGPT credits** turns it
+on. While it is on, an account running on credits is marked **On credits** with its balance
+on the card, in the table and in the HUD, so you can see what is costing money.
+
+The setting appears only if you have a ChatGPT account in the pool, and affects no Claude
+account.
+
 ### Which GPT model runs your Claude model
 
 Claude Code asks for a Claude model. When the request lands on a Codex account, something
@@ -278,7 +303,7 @@ has to decide which GPT model actually answers — and how hard it thinks. That'
 
 | Claude model | Claude effort | Runs as (Codex) | Codex effort |
 |---|---|---|---|
-| Claude Fable 5.1 | Automatic | `gpt-6-astra` | high |
+| Claude Fable 5.1 | Automatic | `gpt-5.6-sol` | medium |
 | Claude Opus 5 | Automatic | `gpt-5.6-terra` | high |
 | Claude Sonnet 5 | Automatic | `gpt-5.6-terra` | medium |
 | Claude Haiku 4.5 | Automatic | `gpt-5.6-luna` | low |
@@ -292,15 +317,19 @@ has to decide which GPT model actually answers — and how hard it thinks. That'
   account; *Claude effort* is applied when a Claude account serves it (`output_config.effort`
   — leave it **Automatic** to keep Claude Code's own choice). Haiku-class and older Sonnet
   models don't accept it, so it's simply ignored there.
+- **Nothing maps to `gpt-6-astra` out of the box.** Claude Code picks Fable on its own for
+  ordinary work, so making Fable the flagship's row meant spending top-tier Codex quota you
+  never asked for. It's still in the dropdown — one edit away — just not a default.
 - **Dropdowns list the priciest/most-capable first**, drawn live from the model catalogue.
 - **Names and prices are live.** The lineup comes from the model catalogue refreshed at each
   session launch, so `gpt-6-astra` / Fable 5.1 show up without a release.
 
 **Effort is the expensive dial, not model size.** A Codex plan's quota is spent on
-reasoning tokens produced, multiplied by the model's tier — not on how much context you
-send. Turning a row up to `high` costs noticeably more of your weekly allowance than
-leaving it at `medium`; resending a long conversation costs nothing extra. That's
-measured behaviour, not a guess — see
+reasoning tokens produced, multiplied by the model's tier. Turning a row up to `high` costs
+noticeably more of your weekly allowance than leaving it at `medium`, and the cheapest
+setting of all is **`none`**, which turns reasoning off: the model answers straight away and
+produces zero reasoning tokens. Good for mechanical work, worse for anything that needs
+thinking through. That's measured behaviour, not a guess — see
 [`docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md`](docs/adr/0007-codex-quota-is-driven-by-reasoning-not-context.md).
 
 The list applies to Codex profiles left on **Automatic**. A profile with its own model
@@ -364,6 +393,14 @@ The dashboard URL stays in Claude Code's status line while you work.
 A brief rate-limit blip never causes a switch — only a real threshold crossing or genuine
 exhaustion does.
 
+**Coming back.** Once it has switched, the pool stays on the new account for as long as that
+account works — even after your first-choice one refills. That is on purpose: moving back
+throws away a warm prompt cache, and with session pinning it would move agents that are
+mid-task. If you would rather it came back, **Settings → Session routing → "Go back to your
+first-choice account when it's free"** does exactly that, and only while the pool has been
+idle for ten minutes, so no session is ever moved out from under you. **Take over** still
+wins over it, and a pinned branch keeps its own account until that account stops serving it.
+
 ### Keeping usage numbers fresh
 
 Usage normally arrives with real responses, so an account nobody has used lately would show
@@ -378,8 +415,109 @@ Code's `/usage` and the Codex CLI read). No messages are sent.
   `Retry-After`), doubling up to 6 hours, and pauses that whole provider. A refused
   credential waits hours and never marks the account broken. Backoff survives restarts.
 - API-key profiles are skipped — they have no subscription windows to read.
+- **Per-model limits.** A Claude account can have a weekly limit for one model on top of its
+  overall windows — Fable, for example, which can run out while the account still looks
+  healthy. The same read picks these up; they show as an extra bar (*Fable weekly*) on the
+  profile card and in its details, beside the account name in the Profiles table, and as a
+  third meter in the widget's detail card — and a profile can be set to **leave when its
+  Fable week is spent** (see below).
 
 Turn it off in **Settings → Daemon → Keep usage up to date**.
+
+### When Fable runs out but the account hasn't
+
+A plan can put a single model on its own weekly clock. You can burn through your Fable week
+while the account's 5h and overall weekly windows still look healthy — and then every Fable
+request fails on an account the pool has every reason to think is fine.
+
+Each profile has a switch for it: **"Leave this profile when its Fable limit is spent"**, in
+the profile's details (and in the Add-profile form). **Off by default.**
+
+- **Off**: the account keeps serving exactly as it always has. Fable requests get the
+  provider's own limit error; every other model keeps working on that account.
+- **On**: the moment the account's Fable weekly limit is spent, the **whole session moves** to
+  another account — every model, not just Fable requests — and rotation skips the account
+  until the limit resets or a fresh usage read shows room. Nothing about the account's own
+  state changes: it is not marked exhausted, because it isn't.
+
+**Settings → Session routing → "Switch every profile when its Fable limit is spent"** turns
+the switch on for every profile at once (off by default). While it is off, each profile's own
+switch decides.
+
+Whichever way it is set:
+
+- A **pinned session** (`cu code --profile`) and a standing **Take over** are honoured: you
+  named an account, so you get it, and the provider's own limit error with it. One line in
+  Activity says why.
+- A **pinned branch** moves for good rather than being diverted once, so its prompt cache
+  follows the work — and only once another account can actually take it.
+- If **no** other account can take the session, it stays where it is and you get the
+  provider's real error — we don't invent a local one.
+
+**ChatGPT accounts are covered too**, with the difference the two providers force on us.
+Anthropic tells us a *percentage* per model ("Fable, 43% of your week"), so a Claude account
+counts as spent when that crosses its switch threshold. OpenAI only tells us *whether* a model
+is usable right now — there is no percentage anywhere in what it reports — so a ChatGPT
+account counts as spent when the GPT model your Fable maps to is reported unavailable, and
+comes back when the provider says it has returned. Same behaviour, coarser signal, because that
+is all the provider gives.
+
+API-key profiles report no per-model limits at all; the switch is hidden for them and they
+route exactly as they always have.
+
+### The 1M context window
+
+Several Claude models hold a million tokens: **Sonnet 5**, **Opus 4.7 / 4.8 / 5**, **Fable 5
+and 5.1**, **Mythos 5 and 5.1**. Claude Code only uses that window when it is talking
+straight to `api.anthropic.com`. Pointed anywhere else — including this daemon on your own
+machine — it falls back to **200K**, because it has no way to tell what is on the other end
+of that address.
+
+For a Claude or Anthropic-API account that caution is unnecessary: the daemon relays to
+Anthropic with your own credential, so the full window really is there. Claude Unlimited says
+so on your behalf, and you get the million back:
+
+| Model | `cu code`, before | `cu code`, now |
+|---|---|---|
+| Opus 5 | 200,000 | **1,000,000** |
+| Sonnet 5 | 200,000 | **1,000,000** |
+
+**A ChatGPT/Codex account in the pool no longer costs you the window.** A ChatGPT account
+answers with a GPT model whose own window is about **272K** tokens, so the daemon sizes every
+turn before routing it: a ChatGPT account takes the turns that fit its window (about 226K
+estimated input tokens, leaving room for the reply and its reasoning), and longer turns go to
+a Claude account. When no account that may take the request can hold it — say the Claude
+accounts are out of capacity and a 400K conversation arrives — the daemon answers exactly the
+"prompt is too long" error Claude Code reacts to, and Claude Code compacts and carries on.
+The one visible sign of this in a mixed pool is a compaction that comes earlier than it would
+on Claude accounts alone. The budget is 272K rather than the backend's 872K ceiling because
+past 272K a ChatGPT subscription is charged at a higher usage rate for the whole request, and
+this daemon does not spend that silently.
+
+The rules the guard follows: an explicit choice — `cu code --profile <ChatGPT account>` or
+**Take over** — is honoured and never substituted, but an oversized turn gets that same
+"prompt is too long" instead of being sent to fail. A branch pinned to a ChatGPT account whose
+conversation outgrew it moves to a Claude account and stays there. A profile marked "Forced in
+subagents" falls back to normal balancing for a subagent whose conversation it cannot hold. A
+GPT model this build has not met is assumed at 272K and said so, in the Activity log and in
+Settings — never excluded on a guess.
+
+**It still stays quiet when it cannot be sure**: when only ChatGPT/Codex accounts can take the
+session (nothing there holds more than 272K, so 1M would only mean compacting sooner), when an
+API profile points somewhere other than Anthropic, or when your Claude Code version has not
+been checked for it. The launch prints why, and Settings shows the same verdict together with
+each ChatGPT account's window.
+
+**Settings → 1M context window** has four choices: **Auto** (the default),
+**Claude Code default**, **Prefer 200K**, and **Force 1M**. Force 1M sets the window on every
+session whatever the route — a ChatGPT-only pool, a pinned ChatGPT account, an API profile
+pointing elsewhere, even an unverified Claude Code version. The capacity guard stays on under
+it, it cannot enlarge a model that is not natively 1M (Sonnet 4.6 and Haiku 4.5 stay at 200K),
+and a backend you pointed it at may reject what the client now sends. Your own
+`CLAUDE_CODE_DISABLE_1M_CONTEXT` always wins over all four.
+
+A bigger window is not a bigger quota. It does not buy you more usage — it means a long
+session compacts far less often, which is usually what you actually wanted.
 
 ### Balancing sessions and subagents across accounts
 
@@ -493,6 +631,43 @@ says so when it happens. Nothing else in `env` is touched, and no file is modifi
 > claude.ai-hosted connectors are disabled for that session. Locally-configured MCP
 > servers are unaffected.
 
+### Calling the daemon from your own app
+
+Anything that speaks the Anthropic Messages API can use the pool: point its base URL at
+`http://127.0.0.1:4317` and give it the local token from **Settings → Network** as the API
+key. No SDK change, no wrapper.
+
+One thing to add, though. Claude Code labels every request with the session and agent it
+came from, and that label is what keeps a conversation on one account. Your app sends no
+such label, so by default each request is routed on its own — and a batch of requests can
+land on several accounts, each one paying a fresh cache miss. Send a stable id instead:
+
+```http
+x-claude-unlimited-session: cv-screening-worker-1
+```
+
+Every request carrying that id is treated as one session: it stays on the account it
+started on for as long as that account can serve it, keeping its prompt cache warm, and
+rotates only when the account hits its threshold, runs out, or becomes unavailable — the
+same rules as a Claude Code session. Give each worker, conversation or job its own id and
+they spread across your pool instead of piling onto one account.
+
+**Take over** — from the dashboard or the HUD — still wins over all of it, and holds every
+request on the account you picked until you release it.
+
+**Knowing when the pool is free.** To hold a batch job back until nobody is working, read
+`GET /api/status`:
+
+```json
+{ "idle_seconds": 412.5, "serving_now": [] }
+```
+
+`idle_seconds` is how long since any account last served a request — `null` when the daemon
+has served none since it started, and `0` while a request is open. `serving_now` lists the
+accounts serving one at this instant. Don't use `in_use_now` from `/api/profiles` for this:
+it deliberately stays true for 15 minutes after the last request so the dashboard's
+"Used now" light doesn't flicker between polls, which reads as a false busy.
+
 ---
 
 ## The dashboard
@@ -507,9 +682,12 @@ says so when it happens. Nothing else in `env` is touched, and no file is modifi
 <br>
 
 - **Overview** — account cards (roomy list or compact cells), live usage and cost, model
-  breakdown, per-project attribution, recent activity.
+  breakdown, per-project attribution, and recent activity.
 - **Profiles** — the full table: search, filter, sort, drag to reorder priority, and a
   menu to edit, test, disable, or remove.
+- **Statistics** — cost and tokens over time, by model, project and account, over ranges
+  from today to all time. Also shows which model each request asked for against the one
+  that actually served it, an activity grid of calls per day, and what ECO has saved.
 - **Activity** — every rotation, session, and config change, filterable and exportable.
 - **Settings** — updates, [models parity](#which-gpt-model-runs-your-claude-model),
   auto-start, process controls, notifications, export/import, language.
@@ -518,12 +696,14 @@ says so when it happens. Nothing else in `env` is touched, and no file is modifi
 Numbers update live, without refreshing. Usage bars shift amber then red as an account
 nears its threshold, so you see it coming.
 
-Every view has its own URL — `/profiles`, `/activity`, `/settings`, `/help` — so you can
+Every view has its own URL — `/profiles`, `/stats`, `/activity`, `/settings`, `/help` — so you can
 bookmark one, reload without losing your place, and use the browser's back button.
 
 <details>
-<summary>More screenshots — activity log, settings, help, light theme</summary>
+<summary>More screenshots — statistics, activity log, settings, help, light theme</summary>
 <br>
+<img src="docs/screenshots/statistics.png" alt="Statistics — spend over time, by model, project and account">
+<br><br>
 <img src="docs/screenshots/activity.png" alt="Activity log">
 <br><br>
 <img src="docs/screenshots/settings.png" alt="Settings">
@@ -532,6 +712,168 @@ bookmark one, reload without losing your place, and use the browser's back butto
 <br><br>
 <img src="docs/screenshots/overview-light.png" alt="Light theme">
 </details>
+
+---
+
+## ECO — Efficient Context Optimization
+
+Claude Code re-sends the whole conversation every turn, so a long tool output is paid for
+again on every subsequent turn. ECO rewrites **what a tool printed** into a shorter form
+before the request leaves the daemon, so the same work costs fewer input tokens.
+
+**Off by default.** It changes what the model sees, so it has to be chosen, never inherited.
+Turn it on in **Settings → ECO**.
+
+| Mode | What it does |
+|---|---|
+| **Off** | Nothing is rewritten. The default. |
+| **Light** | Collapses repetition and groups long lists. Every error is kept and every cut leaves a count behind. |
+| **Aggressive** | Everything in Light, plus it discards detail the model cannot reconstruct. |
+
+Every rewrite, by mode:
+
+| Output | Mode | What ECO does |
+|---|---|---|
+| Repeated lines | Light | 40 identical lines become one line plus `… (39 duplicate lines, ECO)`. Logs over 2,000 lines are capped and the rest counted. JSON and source code are skipped — there, repeated lines are values. |
+| Build and test logs | Light | Every error line kept in place; the first 5 warnings and 3 deprecation notices kept; `Compiling …` lines become `Compiled 84 packages`. |
+| `git status` | Light | A count per group (staged, modified, untracked) with the first 10 paths of each. |
+| Search results | Light | `path:line` matches grouped by file, first 10 per file, then `… +27 more`. |
+| Very long output | Aggressive | 250+ lines: the first 120 and last 60 kept, `… +N lines truncated (ECO)` in between. |
+| `git diff` | Aggressive | One summary line per file with its added/removed counts (`+42 -7`); each hunk keeps its first 100 lines and the rest is counted. |
+| `git log` | Aggressive | Commit headers and messages kept; embedded diffs dropped. |
+| `tree`, `ls`, `find` | Aggressive | `tree` capped at 200 lines; `ls -l` loses its permission/owner/size/date columns, with `node_modules`, `.git` and similar counted rather than listed; `find` grouped by folder, 10 names each. |
+
+What ECO **never** touches: your messages, the model's replies, the system prompt, tool
+*inputs*, any tool result marked as an error — an error trace is exactly what the model
+needs in full — and any output under 500 characters. It runs before an account is chosen,
+so it behaves the same for Claude, Codex and API profiles.
+
+What it guarantees:
+
+- **Deterministic** — the same output is rewritten the same way on every turn, so the prompt
+  cache keeps hitting.
+- **Never worse** — a rewrite that does not make the output shorter is discarded and the
+  original is sent. Never empty.
+- **Counted** — every cut says how much went (`… +27 more`, `(39 duplicate lines, ECO)`), and
+  running ECO again over text it already shortened changes nothing.
+- **Fails open** — if anything inside ECO fails, the original request is sent.
+
+How savings are counted: the **bytes** removed are exact, recorded per request. **Tokens** are
+estimated from what that same request was actually billed, and **cost** from that model's
+input price, so Statistics marks both as approximate. Settings → ECO shows this same list.
+
+### Primitive speech
+
+ECO shrinks what goes **in**; primitive speech shrinks what comes **out**. Turn it on in
+**Settings → ECO → Primitive speech** and the model answers you in fewer words, keeping every
+technical fact. It works by adding one short instruction to each agent turn, plus a one-line reminder
+on each message you type — the reminder is what makes the style hold against the agent's own
+formatting habits. Nothing already written is reworded, and no reply is edited.
+
+| Level | Style |
+|---|---|
+| **Off** | Normal replies. The default. |
+| **Lite** | Full sentences, no filler, hedging or pleasantries. |
+| **Full** | Fragments, no articles, no headings or bold: *"Bug in auth middleware. Expiry check uses < not <=. Fix:"* |
+| **Ultra** | As short as stays unambiguous — usually a few plain lines. |
+
+- **Always kept exactly:** code, commands, file paths, error messages, numbers, and words that
+  flip meaning (*not*, *only*, *unless*). Security warnings and destructive or irreversible
+  steps are written in full sentences. Replies stay in your language.
+- **Written normally at every level:** files, code comments, commits, documentation, and pull
+  request or issue text.
+- **No narration** of the model's own reasoning ("Privately…", "Let me…").
+- **Everywhere at once:** every session, subagent and account type, Codex included — nothing to
+  install per agent. Helper calls (titles, summaries, token counting) are left alone.
+- **Cache-safe:** the instruction is the last system block, after Claude Code's own, and each
+  message gets the same reminder on every turn, so prompt caching keeps working; changing the
+  level mid-session costs one uncached turn.
+- **Measured:** each reply records the level it was written under, and **Statistics** shows
+  output tokens per reply with and without it (a rough comparison — different requests).
+
+Adapted from the [Caveman](https://github.com/juliusbrussee/caveman) skill by Julius Brussee
+(MIT License). Not affiliated with it; "Caveman" is its author's trademark.
+
+---
+
+## HUD - Heads-Up Display (macOS)
+
+A small floating dock that shows every account as a circle with its usage rings, so you can
+see the state of your pool without opening the dashboard.
+
+**On macOS you get it automatically.** Installing or updating Claude Unlimited installs
+`HUD - Heads-Up Display.app` into `~/Applications`, registers it to start when you log in,
+and opens it — nothing to build, nothing to run. It also appears in the menu bar, showing
+the account currently serving and how close it is to rotating.
+
+<p align="center">
+<img src="docs/screenshots/hud-floating-vertical.png" height="300" alt="HUD floating, vertical">
+<img src="docs/screenshots/hud-card-dark.png" height="300" alt="HUD detail card">
+<img src="docs/screenshots/hud-docked-right.png" height="300" alt="HUD docked to the right edge">
+</p>
+<p align="center">
+<img src="docs/screenshots/hud-docked-top.png" width="360" alt="HUD docked to the top edge">
+<img src="docs/screenshots/hud-floating-horizontal.png" width="360" alt="HUD floating, horizontal">
+</p>
+<p align="center">
+<img src="docs/screenshots/hud-card-light.png" height="300" alt="HUD light theme with a Codex account's card">
+</p>
+
+```bash
+cu hud status     # is it installed, does it start at login, which version
+cu hud install    # fetch and install it again, e.g. after deleting it
+cu hud remove     # take it away (app and login item) and keep it away until `cu hud install`
+```
+
+The download is verified against a checksum shipped in the source tree before anything is
+unpacked, so a bad or tampered file installs nothing and leaves the copy you have alone. If
+the download fails — you updated while offline, say — the daemon tries again in the
+background, a little less often each time, until it succeeds. It runs on macOS 13 or later,
+on both Apple Silicon and Intel Macs.
+
+Building it yourself from a checkout still works and is what you want while changing it:
+
+```bash
+cd macos-widget && ./build.sh
+```
+
+That builds and installs the bundle to `~/Applications` and launches it (and removes
+the old `CapacityWidget.app`, the name it had before, keeping your saved position and settings).
+
+- Drag it anywhere; **Always on top** keeps it above other windows. Drag it near a screen edge and it
+  is **pulled onto the edge** and holds there as you keep dragging — slide it along the edge freely;
+  pull it about 40 points away to let go. Release it while it is stuck and it **docks**: flush against the edge, its ends curving
+  out into it like the display notch, vertical on the left or right, horizontal along the top or bottom, remembered across restarts and display
+  changes. **Undock** in the cog menu floats it again.
+- An account that is serving lights up from inside, in its provider's colour; several can be lit
+  at once. Each account has **two rings**: the outer one is the 5-hour window — green, then amber,
+  then red as it nears the switch threshold, the same bands as the Dashboard's bars — and the
+  thinner inner one is the weekly window, blue until 90% and red from there. An account whose
+  provider reports only one window gets a single ring.
+- The number under each account names its window with a small subscript (`5h` or `w`). An
+  account that needs re-authentication shows **Reauth** in red instead.
+- The logo in the middle takes the colour you gave the account on the Profiles page.
+- It refreshes every 5 seconds (every 2 while the pointer is over it).
+- Hover a profile for its detail card: plan, usage windows, reset times, today's spend, and a
+  session line — while it is serving, how many agents are on it and for how long; otherwise when
+  it was last used. Under that, the model and project of its latest request (a Codex account
+  shows the Claude model it translated, e.g. `opus-5 → gpt-5.6-terra`).
+- Right-click (or Control-click) a profile to **Take over**, to **Enable** or **Disable** it, or
+  to choose whether its percentage shows the **5-hour** or the **weekly** window (**Percentage
+  shows**). The choice is remembered per profile; a window the provider does not report is greyed
+  out, and the detail card marks the meter the percentage is showing.
+- The cog appears on hover: size, orientation, background and transparency. Background is
+  **Dark**, **Light**, or — on macOS 26 and later — **Liquid Glass**, which follows the system
+  appearance: light glass with dark text on a light desktop, dark glass on a dark one. With
+  *Reduce transparency* turned on in System Settings, Liquid Glass falls back to the frosted
+  background in whichever direction it resolved. On a light dock the usage colours, the
+  provider marks and the percentages darken so they still read against white.
+- Closed it? Reopen from the dashboard — the button directly above the language selector.
+
+It is **read-only apart from "Take over" and Enable/Disable** — the same
+`POST /api/profiles/<id>/take-over` and `PATCH /api/profiles/<id>` the Dashboard sends,
+authorised with the per-run CSRF token the daemon serves on `/api/status`. It talks only to
+`127.0.0.1:4317`, and is currently **macOS only and English only**.
 
 ---
 
@@ -638,6 +980,7 @@ Auto-start on login — the same thing **Settings → Daemon** controls.
 | `claude-unlimited uninstall` | Stop starting on login. |
 | `claude-unlimited service-start` | Start the background daemon now. |
 | `claude-unlimited service-stop` | Stop it. |
+| `claude-unlimited hud install` / `status` / `remove` | macOS only. The HUD installs and updates itself, so this is rarely needed: `install` brings it back (or re-downloads it), `status` shows whether it is installed and starts at login, `remove` takes it away **and keeps it away** until you run `install`. |
 | `claude-unlimited restart` | Stop and start the daemon, service-managed or not. Needed after an update replaces the code, since a running process keeps serving the version it started with. |
 
 </details>
@@ -649,7 +992,7 @@ Auto-start on login — the same thing **Settings → Daemon** controls.
 
 | Command | What it's for |
 |---|---|
-| `claude-unlimited purge` | Removes everything: stored credentials, config, usage history, the app and its virtualenv, the CLI symlink, and the service registration. If the Claude desktop app was routed through the pool, its own settings are restored first. Asks for confirmation first. `~/.claude` is never touched. |
+| `claude-unlimited purge` | Removes everything: stored credentials, config, usage history, the app and its virtualenv, the CLI symlink, the service registration, and on macOS the HUD. If the Claude desktop app was routed through the pool, its own settings are restored first. Asks for confirmation first. `~/.claude` is never touched. |
 
 Credentials are deleted from your OS keystore *before* the config goes, since
 the config is the only record of which Profiles exist.
@@ -661,12 +1004,31 @@ the config is the only record of which Profiles exist.
 ## Troubleshooting
 
 <details>
+<summary><b>"Claude Unlimited — all profiles are out of capacity"</b></summary>
+<br>
+
+Every enabled account has used up its window. Requests are answered with **503** and that
+message, plus a `Retry-After` header saying how many seconds until the first window
+reopens — the dashboard shows the same reset time on each account.
+
+It is said **once** per outage: one line in Activity and one notification, no matter how
+many requests get rejected in the meantime. When an account comes back, Activity records
+*Capacity is back*, and the next outage is announced afresh.
+
+Nothing to fix if you are simply out of quota — add or enable another account to keep
+working. A pool whose accounts are all *disabled* or *need re-auth* reports the different
+message *No eligible Profile is available*, because that one is a configuration problem.
+</details>
+
+<details>
 <summary><b>An account says "needs re-auth"</b></summary>
 <br>
 
 Usually it fixes itself — tokens are refreshed in the background whether or not an account
 is currently in rotation. If it doesn't, run `claude-unlimited reauth`: it lists whichever
 accounts actually need it, so there's no guessing.
+Once it is signed back in, its usage is read straight away, so the Dashboard and the HUD
+show real numbers for it within seconds instead of at the next scheduled read.
 </details>
 
 <details>
@@ -717,8 +1079,7 @@ was skipped.
 |---|---|
 | Credentials | macOS Keychain / Linux Secret Service / Windows DPAPI — never plaintext on disk |
 | Account configuration | `~/.claude-unlimited/config.json` |
-| Usage history | `~/.claude-unlimited/usage_history.jsonl` (capped at 20,000 events) |
-| Project attribution | `~/.claude-unlimited/project_usage.json` |
+| Usage history, activity log, project attribution | `~/.claude-unlimited/claude_unlimited.db` — one local SQLite file, kept in full (older `*.jsonl` logs are imported once on first start and renamed `*.imported`) |
 | Logs | `~/.claude-unlimited/logs/` |
 | Your Claude Code setup | `~/.claude` — untouched |
 
@@ -734,9 +1095,11 @@ Full threat model and vulnerability reporting: [`SECURITY.md`](SECURITY.md).
 ## Requirements
 
 - **macOS, Linux, or Windows** — macOS is verified on real hardware; the Linux and Windows
-  backends are a real but **unverified first cut**
+  service backends are a real but **unverified first cut** (the test suite itself runs on
+  macOS and Linux in CI)
   ([details](docs/adr/0005-windows-linux-backends-unverified-first-cut.md)).
 - **Python 3.10+**, **git**, and the **`claude`** CLI.
+- The HUD needs **macOS 13** or later; everything else runs without it.
 
 ## A note on Terms of Service
 
@@ -758,6 +1121,8 @@ python3 -m pytest tests/
 
 `pytest` is the only extra the `dev` install adds — the daemon itself still
 needs nothing but the standard library and `cryptography`.
+
+The HUD's pure logic (edge snapping) has its own tests: `cd macos-widget && swift test`.
 
 No frontend build step — `claude_unlimited/static/` is plain HTML/CSS/JS.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module map, and
@@ -784,6 +1149,9 @@ Bug reports and PRs welcome — especially from Linux and Windows users.
 ## License
 
 [MIT](LICENSE) — do whatever you'd like with it.
+
+<sub>Statistics charts use <a href="https://github.com/leeoniya/uPlot">uPlot</a> © Leon Sorokin,
+MIT (<a href="claude_unlimited/static/vendor/LICENSE">license</a>).</sub>
 
 <div align="center">
 <br>

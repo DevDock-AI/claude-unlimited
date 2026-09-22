@@ -46,6 +46,9 @@ def install(port: int) -> None:
         "RunAtLoad": True,
         "KeepAlive": True,
         "ProcessType": "Background",
+        # Without this, stdout is block-buffered and daemon.out.log lags a
+        # whole run — the log is only useful if it is written as it happens.
+        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
         "StandardOutPath": str(LOG_DIR / "daemon.out.log"),
         "StandardErrorPath": str(LOG_DIR / "daemon.err.log"),
     }

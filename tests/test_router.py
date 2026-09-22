@@ -11,7 +11,12 @@ from claude_unlimited.router import (
     PoolSnapshot,
     ProfileRuntime,
     ProfileState,
+    RequestFit,
     choose,
+    choose_for_new_branch,
+    fable_spent,
+    fits,
+    must_leave,
     observe,
     recover_expired_cooldowns,
 )
@@ -203,3 +208,242 @@ def test_recover_expired_exhausted_clears_usage_percent():
     recovered = recover_expired_cooldowns(pool, NOW)
     assert recovered.profiles[0].state == ProfileState.ELIGIBLE
     assert recovered.profiles[0].last_usage_percent is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2 (reworked) — "leave this profile when its Fable limit is spent".
+#
+# Per profile, off by default. While the resolved switch is on and the Fable
+# bucket is spent, the WHOLE session leaves the account — every model — and
+# the account is not a candidate until the bucket resets. Derived per request,
+# never written into `state`.
+# ---------------------------------------------------------------------------
+
+def _rt_with_fable(pid, priority, percent, *, threshold=98.0, resets_at=None,
+                   state=None, leave=True):
+    from claude_unlimited.observation import ModelWindow
+
+    rt = ProfileRuntime(profile_id=pid, priority=priority, switch_threshold=threshold,
+                        automatic=True, state=state or ProfileState.ELIGIBLE,
+                        leave_on_fable_limit=leave)
+    rt.model_usage = (ModelWindow(name="Fable", percent=percent, resets_at=resets_at),)
+    return rt
+
+
+LATER = datetime(2030, 1, 1, tzinfo=timezone.utc)
+EARLIER = datetime(2020, 1, 1, tzinfo=timezone.utc)
+NOW_ = datetime(2026, 9, 20, tzinfo=timezone.utc)
+
+
+def test_fable_spent_reads_the_fable_window_only():
+    spent = _rt_with_fable("a", 1, 100.0, resets_at=LATER)
+    assert fable_spent(spent, NOW_) is True
+    # Not a state change: the account itself is fine.
+    assert spent.state == ProfileState.ELIGIBLE
+
+    from claude_unlimited.observation import ModelWindow
+    other = ProfileRuntime(profile_id="b", priority=1, switch_threshold=98.0, automatic=True)
+    other.model_usage = (ModelWindow(name="Opus", percent=100.0, resets_at=LATER),)
+    assert fable_spent(other, NOW_) is False, "a different model's bucket is not Fable"
+    # The provider's display name is matched case-insensitively.
+    lower = _rt_with_fable("c", 1, 100.0, resets_at=LATER)
+    lower.model_usage = (ModelWindow(name="fable", percent=100.0, resets_at=LATER),)
+    assert fable_spent(lower, NOW_) is True
+
+
+def test_an_account_with_no_fable_bucket_is_never_spent():
+    """Parity across kinds: an api account reports no per-model buckets and
+    must route exactly as it does today."""
+    plain = ProfileRuntime(profile_id="b", priority=2, switch_threshold=98.0, automatic=True,
+                           leave_on_fable_limit=True)
+    assert fable_spent(plain, NOW_) is False
+    assert must_leave(plain, NOW_) is False
+
+
+def test_a_bucket_past_its_own_reset_is_stale_not_spent():
+    """Holding an account back on a window that has already refilled would be
+    wrong in the unsafe direction — it idles capacity that exists."""
+    stale = _rt_with_fable("a", 1, 100.0, resets_at=EARLIER)
+    assert fable_spent(stale, NOW_) is False
+    assert must_leave(stale, NOW_) is False
+
+
+def test_a_bucket_below_the_threshold_is_not_spent():
+    assert fable_spent(_rt_with_fable("a", 1, 97.9, resets_at=LATER), NOW_) is False
+    assert fable_spent(_rt_with_fable("a", 1, 98.0, resets_at=LATER), NOW_) is True
+
+
+def test_a_codex_account_is_spent_through_its_blocked_models():
+    """OpenAI reports availability by GPT id; the gateway resolves that into
+    Claude base ids. A blocked Fable model means the account is spent; a
+    blocked model of another family does not."""
+    codex = ProfileRuntime(profile_id="c", priority=1, switch_threshold=98.0, automatic=True,
+                           leave_on_fable_limit=True, blocked_models=frozenset({"claude-fable-5"}))
+    assert fable_spent(codex, NOW_) is True
+    assert must_leave(codex, NOW_) is True
+    opus_only = ProfileRuntime(profile_id="c", priority=1, switch_threshold=98.0, automatic=True,
+                               leave_on_fable_limit=True, blocked_models=frozenset({"claude-opus-5"}))
+    assert fable_spent(opus_only, NOW_) is False
+
+
+def test_with_the_switch_off_a_spent_fable_week_changes_nothing():
+    """Off by default: the account stays exactly as it always was — sticky,
+    a candidate, and a place for new branches."""
+    a = _rt_with_fable("a", 1, 100.0, resets_at=LATER, leave=False)
+    b = _rt_with_fable("b", 2, 10.0, resets_at=LATER, leave=False)
+    assert fable_spent(a, NOW_) is True
+    assert must_leave(a, NOW_) is False
+    pool = PoolSnapshot(profiles=[a, b], current_profile_id="a")
+    assert choose(pool, NOW_) == choose(pool, NOW_)
+    assert choose(pool, NOW_).profile_id == "a"
+    assert choose(pool, NOW_).reason == "sticky"
+    assert choose_for_new_branch(PoolSnapshot(profiles=[a, b]), NOW_, {}).profile_id == "a"
+
+
+def test_with_the_switch_on_the_whole_session_moves():
+    """Not just Fable requests: choose() takes no model at all, so the same
+    decision applies to a Sonnet turn, a Haiku helper call, anything."""
+    pool = PoolSnapshot(profiles=[_rt_with_fable("a", 1, 100.0, resets_at=LATER),
+                                  _rt_with_fable("b", 2, 10.0, resets_at=LATER)],
+                        current_profile_id="a")
+    decision = choose(pool, NOW_)
+    assert decision.profile_id == "b"
+    # Not "rotated": the account did not run out, its Fable week did.
+    assert decision.reason == "fable_limit_handover"
+    # And it is not a candidate for anything new either.
+    assert choose_for_new_branch(PoolSnapshot(profiles=pool.profiles), NOW_, {}).profile_id == "b"
+
+
+def test_the_global_override_turns_it_on_for_a_profile_whose_own_flag_is_off():
+    """router.py sees only the RESOLVED value (gateway._sync_snapshot ORs the
+    profile flag with Settings.fable_limit_all_profiles). A runtime built
+    with the resolved True leaves; the same account resolved False stays."""
+    resolved_on = _rt_with_fable("a", 1, 100.0, resets_at=LATER, leave=True)
+    resolved_off = _rt_with_fable("a", 1, 100.0, resets_at=LATER, leave=False)
+    b = _rt_with_fable("b", 2, 10.0, resets_at=LATER, leave=False)
+    assert choose(PoolSnapshot(profiles=[resolved_on, b], current_profile_id="a"), NOW_).profile_id == "b"
+    assert choose(PoolSnapshot(profiles=[resolved_off, b], current_profile_id="a"), NOW_).profile_id == "a"
+
+
+def test_with_no_alternative_the_session_stays_and_is_served_anyway():
+    """Decision 8: degrade honestly. Refusing locally invents an error; going
+    ahead gets the user the provider's own."""
+    pool = PoolSnapshot(profiles=[_rt_with_fable("a", 1, 100.0, resets_at=LATER),
+                                  _rt_with_fable("b", 2, 100.0, resets_at=LATER)],
+                        current_profile_id="a")
+    decision = choose(pool, NOW_)
+    assert decision.profile_id == "a"
+    assert decision.reason == "fable_limit_no_alternative"
+    # With no current pointer at all, the best-ranked spent account is used.
+    fresh = PoolSnapshot(profiles=pool.profiles, current_profile_id=None)
+    assert choose(fresh, NOW_).profile_id == "a"
+    assert choose(fresh, NOW_).reason == "fable_limit_no_alternative"
+    # ...and a new branch is still placed rather than refused.
+    assert choose_for_new_branch(fresh, NOW_, {}).profile_id is not None
+
+
+def test_a_spent_account_becomes_a_candidate_again_when_its_bucket_shows_room():
+    """Nothing is written into `state`, so a fresh usage read is all it takes."""
+    from claude_unlimited.observation import ModelWindow, UsageSnapshot
+
+    a = _rt_with_fable("a", 1, 100.0, resets_at=LATER)
+    b = _rt_with_fable("b", 2, 10.0, resets_at=LATER)
+    pool = PoolSnapshot(profiles=[a, b], current_profile_id="a")
+    assert choose(pool, NOW_).profile_id == "b"
+    refreshed = observe(pool, "a", UsageSnapshot(
+        percent=10.0, resets_at=LATER, confidence="measured",
+        model_windows=(ModelWindow(name="Fable", percent=5.0, resets_at=LATER),)), NOW_)
+    assert must_leave(refreshed.profiles[0], NOW_) is False
+    assert choose(refreshed, NOW_).profile_id == "a"
+
+
+def test_an_exhausted_spent_account_is_not_revived_by_the_fable_rule():
+    """must_leave() is ANDed onto the ordinary ELIGIBLE filter, never a
+    replacement for it."""
+    pool = PoolSnapshot(profiles=[_rt_with_fable("a", 1, 10.0, resets_at=LATER, state=ProfileState.EXHAUSTED),
+                                  _rt_with_fable("b", 2, 100.0, resets_at=LATER)],
+                        current_profile_id="a")
+    decision = choose(pool, NOW_)
+    assert decision.profile_id == "b"
+    assert decision.reason == "fable_limit_no_alternative"
+
+
+# --- the per-request capacity fit (docs/adr/0009) ---------------------------
+
+def _over(*ids, tokens=300_000) -> RequestFit:
+    return RequestFit(estimated_tokens=tokens, over_capacity=frozenset(ids))
+
+
+def test_no_fit_means_fits_everywhere_and_changes_nothing():
+    pool = PoolSnapshot(profiles=[rt("c"), rt("a", priority=2)], current_profile_id="c")
+    assert fits(rt("c"), None)
+    assert choose(pool, NOW, None) == choose(pool, NOW)
+    assert choose(pool, NOW, RequestFit()).profile_id == "c"
+
+
+def test_the_sticky_current_is_not_sticky_when_it_cannot_hold_the_request():
+    """The account is fine for every smaller conversation; this one moves,
+    and the reason says why rather than "rotated" (which reads as ran out)."""
+    pool = PoolSnapshot(profiles=[rt("c", priority=1), rt("a", priority=2)], current_profile_id="c")
+    decision = choose(pool, NOW, _over("c"))
+    assert (decision.profile_id, decision.reason) == ("a", "window_handover")
+
+
+def test_an_over_capacity_account_is_never_chosen_even_by_priority():
+    pool = PoolSnapshot(profiles=[rt("c", priority=1), rt("a", priority=2)], current_profile_id=None)
+    decision = choose(pool, NOW, _over("c"))
+    assert (decision.profile_id, decision.reason) == ("a", "rotated")
+
+
+def test_when_nothing_fits_the_reason_is_distinct_from_no_eligible_profile():
+    """Capacity exists — the gateway turns this into the prompt-too-long
+    the client compacts on, NOT the 503 it would hold ten minutes for."""
+    pool = PoolSnapshot(profiles=[rt("c"), rt("d")], current_profile_id="c")
+    decision = choose(pool, NOW, _over("c", "d"))
+    assert (decision.profile_id, decision.reason) == (None, "no_profile_fits_request")
+    empty = PoolSnapshot(profiles=[rt("c", state=ProfileState.EXHAUSTED)], current_profile_id=None)
+    assert choose(empty, NOW, _over("c")).reason == "no_eligible_profile"
+
+
+def test_over_capacity_is_not_a_fable_style_serve_anyway_degrade():
+    """A spent Fable week has "serve anyway, the provider says no" as its
+    honest degrade; an overflow has none (the backend's 400 is one the client
+    cannot recover from). So the no-alternative path never lands on an
+    over-capacity account, current or otherwise."""
+    pool = PoolSnapshot(profiles=[rt("c", leave_on_fable_limit=True, blocked_models=frozenset({"claude-fable-5"})),
+                                  rt("a", priority=2)],
+                         current_profile_id="c")
+    # a fits but must leave; c is over capacity: a is still the only choice.
+    decision = choose(pool, NOW, _over("c"))
+    assert decision.profile_id == "a"
+    both_leaving = PoolSnapshot(
+        profiles=[rt("c", leave_on_fable_limit=True, blocked_models=frozenset({"claude-fable-5"})),
+                  rt("a", priority=2, leave_on_fable_limit=True, blocked_models=frozenset({"claude-fable-5"}))],
+        current_profile_id="c")
+    decision = choose(both_leaving, NOW, _over("c"))
+    assert (decision.profile_id, decision.reason) == ("a", "fable_limit_no_alternative")
+
+
+def test_a_manual_only_current_over_capacity_hands_over_to_an_automatic_one():
+    pool = PoolSnapshot(profiles=[rt("c", automatic=False), rt("a", priority=2)], current_profile_id="c")
+    assert choose(pool, NOW, _over("c")).profile_id == "a"
+
+
+def test_a_new_branch_never_lands_on_an_over_capacity_account():
+    pool = PoolSnapshot(profiles=[rt("c", priority=1), rt("a", priority=2)])
+    decision = choose_for_new_branch(pool, NOW, {}, fit=_over("c"))
+    assert (decision.profile_id, decision.reason) == ("a", "branch_assigned")
+    nothing = choose_for_new_branch(pool, NOW, {}, fit=_over("c", "a"))
+    assert (nothing.profile_id, nothing.reason) == (None, "no_profile_fits_request")
+    assert choose_for_new_branch(pool, NOW, {}, exclude=frozenset({"c", "a"}), fit=_over("c")).reason \
+        == "no_eligible_profile"
+
+
+def test_a_new_branch_prefers_a_fitting_account_over_a_leaving_one_that_fits():
+    """Both filters compose: fit first (hard), then the soft must_leave."""
+    pool = PoolSnapshot(profiles=[
+        rt("c", priority=1),
+        rt("a", priority=2, leave_on_fable_limit=True, blocked_models=frozenset({"claude-fable-5"})),
+        rt("b", priority=3),
+    ])
+    assert choose_for_new_branch(pool, NOW, {}, fit=_over("c")).profile_id == "b"

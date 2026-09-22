@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -92,6 +92,9 @@ class ProbeResult:
     status: Optional[int]           # None: no HTTP response at all
     headers: Optional[dict] = None  # synthesized rate-limit headers, on a readable 200
     retry_after: Optional[float] = None
+    # Per-model windows. Headers cannot express these, so they ride beside
+    # them. None when the source has none.
+    model_windows: Optional[tuple] = None
 
 
 @dataclass(frozen=True)
@@ -142,7 +145,8 @@ def fetch_anthropic_usage(access_token: str) -> ProbeResult:
     })
     if status != 200:
         return ProbeResult(status=status, retry_after=retry_after)
-    return ProbeResult(status=200, headers=anthropic_usage_headers(body))
+    return ProbeResult(status=200, headers=anthropic_usage_headers(body),
+                       model_windows=anthropic_model_windows(body))
 
 
 def fetch_codex_usage(credential) -> ProbeResult:
@@ -159,7 +163,8 @@ def fetch_codex_usage(credential) -> ProbeResult:
     status, retry_after, body = _get(CODEX_USAGE_URL, headers)
     if status != 200:
         return ProbeResult(status=status, retry_after=retry_after)
-    return ProbeResult(status=200, headers=codex_usage_headers(body))
+    return ProbeResult(status=200, headers=codex_usage_headers(body),
+                       model_windows=codex_model_windows(body))
 
 
 # ---- response -> the headers the existing classifiers read ------------------
@@ -189,6 +194,108 @@ def anthropic_usage_headers(body) -> Optional[dict]:
             except ValueError:
                 pass
     return headers if "anthropic-ratelimit-unified-5h-utilization" in headers else None
+
+
+def anthropic_model_windows(body) -> tuple:
+    """`limits[]` rows of kind `weekly_scoped` with a model display name ->
+    ModelWindow, e.g. Fable at 26%. The same numbers Claude Code's `/usage`
+    prints as "Current week (Fable)".
+
+    `percent` is already 0-100 here. `scope.model.id` is null upstream, so the
+    display name is the only identifier and is kept verbatim. Anything
+    unreadable is skipped — never an exception, never a guessed name."""
+    from .observation import ModelWindow
+
+    if not isinstance(body, dict) or not isinstance(body.get("limits"), list):
+        return ()
+    windows = []
+    seen = set()
+    for row in body["limits"]:
+        if not isinstance(row, dict) or row.get("kind") != "weekly_scoped":
+            continue
+        scope = row.get("scope") if isinstance(row.get("scope"), dict) else {}
+        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        name = model.get("display_name")
+        percent = _number(row.get("percent"))
+        if not isinstance(name, str) or not name.strip() or percent is None:
+            continue
+        name = name.strip()
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        resets_at = None
+        if isinstance(row.get("resets_at"), str):
+            try:
+                resets_at = datetime.fromisoformat(row["resets_at"].replace("Z", "+00:00"))
+                if resets_at.tzinfo is None:
+                    resets_at = resets_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                resets_at = None
+        windows.append(ModelWindow(name=name, percent=round(percent, 2), resets_at=resets_at,
+                                   active=row.get("is_active") is True))
+    return tuple(windows)
+
+
+def codex_model_windows(body) -> tuple:
+    """`model_usage` from `/wham/usage` -> ModelWindow, the Codex counterpart
+    of anthropic_model_windows().
+
+    The two providers report fundamentally different things and the shape here
+    reflects that. Anthropic gives a PERCENTAGE per model; OpenAI gives only
+    availability:
+
+        "model_usage": {"gpt-6-astra": {"available": true,
+                                         "available_at": null,
+                                         "credits_would_enable": false}}
+
+    There is no "astra is at 62%" anywhere in that payload, so a Codex bucket
+    is binary: 0 when the model is available, 100 when it is not. That still
+    drives the same "is this model blocked on this account" question the
+    routing rule asks — the percentage is merely how an Anthropic bucket
+    answers it.
+
+    Named by the OpenAI model id, because that is what the provider said is
+    unavailable and what a user needs to see. Anything unreadable is skipped;
+    never an exception."""
+    from .observation import ModelWindow
+
+    if not isinstance(body, dict) or not isinstance(body.get("model_usage"), dict):
+        return ()
+    windows = []
+    for name, entry in body["model_usage"].items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(entry, dict):
+            continue
+        available = entry.get("available")
+        if not isinstance(available, bool):
+            continue  # unknown availability is not the same as unavailable
+        windows.append(ModelWindow(
+            name=name.strip(),
+            percent=0.0 if available else 100.0,
+            resets_at=_epoch_or_iso(entry.get("available_at")),
+            # The provider naming a model unavailable IS the binding limit on
+            # this account, which is what `active` means for the display.
+            active=not available,
+        ))
+    return tuple(windows)
+
+
+def _epoch_or_iso(value) -> Optional[datetime]:
+    """`available_at` has been seen as null on an unconstrained account and is
+    undocumented otherwise, so accept both an epoch number and an ISO string
+    rather than guessing one and dropping the other."""
+    number = _number(value)
+    if number is not None:
+        try:
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return None
 
 
 def codex_usage_headers(body) -> Optional[dict]:

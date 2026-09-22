@@ -10,19 +10,22 @@ from claude_unlimited.openai_models import (
 
 
 def test_known_claude_models_map_to_their_confirmed_parity_target():
-    # The expensive model is reserved for the top tier on purpose: quota is
-    # spent on reasoning output weighted by model tier (docs/adr/0007), so the
-    # default session must not land on it.
-    assert map_model("claude-fable-5") == OpenAIModelTarget("gpt-6-astra", "high")
+    # No tier maps to the flagship by default: quota is spent on reasoning
+    # output weighted by model tier (docs/adr/0007), and Claude Code chooses
+    # Fable on its own, so a user who never picked the expensive model must
+    # not end up paying for it.
+    assert map_model("claude-fable-5") == OpenAIModelTarget("gpt-5.6-sol", "medium")
     assert map_model("claude-opus-5") == OpenAIModelTarget("gpt-5.6-terra", "high")
     assert map_model("claude-sonnet-5") == OpenAIModelTarget("gpt-5.6-terra", "medium")
     assert map_model("claude-haiku-4-5-20251001") == OpenAIModelTarget("gpt-5.6-luna", "low")
 
 
-def test_only_the_top_tier_reaches_the_expensive_model():
+def test_no_tier_reaches_the_expensive_model_by_default():
+    # It stays selectable in the parity table; it is simply never the shipped
+    # target for any tier.
     expensive = "gpt-6-astra"
-    on_expensive = [c for c, t in _MODEL_MAP.items() if t.model == expensive]
-    assert on_expensive == ["claude-fable-5"]
+    assert [c for c, t in _MODEL_MAP.items() if t.model == expensive] == []
+    assert expensive in _MODEL_LADDER
 
 
 def test_unknown_model_falls_back_to_the_balanced_default():
@@ -34,7 +37,7 @@ def test_family_prefix_fallback_for_an_unrecognized_but_familiar_id():
     # A dated id the table has no exact entry for, but which still names a
     # recognizable tier by substring.
     assert map_model("claude-opus-4-1-20260101") == OpenAIModelTarget("gpt-5.6-terra", "high")
-    assert map_model("claude-fable-legacy") == OpenAIModelTarget("gpt-6-astra", "high")
+    assert map_model("claude-fable-legacy") == OpenAIModelTarget("gpt-5.6-sol", "medium")
     assert map_model("claude-haiku-legacy") == OpenAIModelTarget("gpt-5.6-luna", "low")
 
 
@@ -50,7 +53,7 @@ def test_per_profile_model_override_wins_outright():
 
 def test_per_profile_reasoning_effort_override_alone_keeps_the_mapped_model():
     target = map_model("claude-fable-5", override_reasoning_effort="ultra")
-    assert target.model == "gpt-6-astra"
+    assert target.model == "gpt-5.6-sol"
     assert target.reasoning_effort == "ultra"
 
 
@@ -127,8 +130,8 @@ def test_a_profile_override_still_beats_the_parity_map():
 
 
 def test_parity_reaches_a_dated_model_id_through_the_family_fallback():
-    parity = {"claude-opus-5": {"effort": "minimal"}}
-    assert map_model("claude-opus-4-1-20260101", parity=parity).reasoning_effort == "minimal"
+    parity = {"claude-opus-5": {"effort": "none"}}
+    assert map_model("claude-opus-4-1-20260101", parity=parity).reasoning_effort == "none"
 
 
 def test_untouched_rows_follow_the_shipped_defaults():
@@ -150,3 +153,30 @@ def test_automatic_mapping_marks_overridden_rows():
     assert rows["claude-opus-5"]["reasoning_effort"] == "max"
     assert rows["claude-opus-5"]["default_effort"] == _MODEL_MAP["claude-opus-5"].reasoning_effort
     assert rows["claude-sonnet-5"]["overridden"] is False
+
+
+def test_the_effort_list_matches_what_the_backend_accepts():
+    """Verified live (2026-09-17) against gpt-5.6-terra and gpt-5.6-sol:
+    "Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and
+    'max'." `none` returns 0 reasoning tokens — the thing a Codex subscription
+    is charged for (ADR 0007). `minimal` is rejected outright, so offering it
+    only ever produced a failed request."""
+    from claude_unlimited.openai_models import VALID_REASONING_EFFORTS
+    assert "none" in VALID_REASONING_EFFORTS
+    assert "minimal" not in VALID_REASONING_EFFORTS
+    assert set(VALID_REASONING_EFFORTS) >= {"none", "low", "medium", "high", "xhigh", "max"}
+
+
+def test_none_reaches_the_request_body_as_the_effort():
+    import json
+    from claude_unlimited.openai_models import map_model
+    from claude_unlimited.openai_translate import anthropic_request_to_openai
+    target = map_model("claude-opus-5", override_reasoning_effort="none")
+    assert target.reasoning_effort == "none"
+    body = anthropic_request_to_openai({"messages": [], "model": "claude-opus-5"}, target)
+    assert body["reasoning"] == {"effort": "none"}
+
+
+def test_a_profile_can_be_saved_with_reasoning_off():
+    from claude_unlimited.profiles import _validate_field_types
+    _validate_field_types(codex_reasoning_effort="none")

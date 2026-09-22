@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+# >=77, not 68: the [project] table below uses PEP 639 license syntax
+# (license = "MIT" + license-files), which setuptools only accepts from 77.
+# With 68 the build dies at metadata generation with an opaque
+# "project.license must be valid exactly by one definition" error — which
+# is what `pip install --no-build-isolation .` hit on setuptools 75.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -60,6 +65,14 @@ cu = "claude_unlimited.cli:main"
 # compares the git tag against __version__.
 version = { attr = "claude_unlimited.__version__" }
 
+[tool.pytest.ini_options]
+# Collect ONLY from tests/. Without this pytest walks the package too and
+# grabs claude_unlimited/connection_test.py — a real runtime module (it sends
+# a live probe request for a Profile), whose public function
+# `test_connection(profile_id, ...)` looks like a test wanting a `profile_id`
+# fixture. Scoping collection fixes it without renaming a shipped API.
+testpaths = ["tests"]
+
 [tool.setuptools]
 packages = ["claude_unlimited", "claude_unlimited.secret_store", "claude_unlimited.daemon_installer"]
 
@@ -70,4 +83,10 @@ packages = ["claude_unlimited", "claude_unlimited.secret_store", "claude_unlimit
 # daemon would start, but / and /app.js would 404 and i18n would have
 # nothing to load. Caught before it ever shipped, by actually building the
 # install rather than assuming `packages` alone covers it.
-claude_unlimited = ["static/*", "locales/*", "data/*"]
+# NOTE: these globs do NOT recurse. "static/*" matches the `vendor`
+# DIRECTORY entry but none of the files inside it, so the vendored chart
+# library was absent from an installed build: /vendor/charts.js would 404,
+# the chart global would be undefined and the Statistics chart would silently
+# fail to render. Same class of bug the comment above records — it needs a
+# glob per directory level.
+claude_unlimited = ["static/*", "static/vendor/*", "locales/*", "data/*"]

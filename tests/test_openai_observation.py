@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from claude_unlimited.observation import AuthInvalid, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot
-from claude_unlimited.openai_observation import classify
+from claude_unlimited.openai_observation import ALLOWED_HEADERS, classify, parse_credits
 
 NOW = datetime(2026, 8, 24, 0, 0, tzinfo=timezone.utc)
 
@@ -138,3 +138,47 @@ def test_window_duration_tolerance_matches_the_real_clients_5_percent_slack():
     # count: 10080 * 1.04 is within 5%.
     obs = classify(200, {"x-codex-primary-used-percent": "1", "x-codex-primary-window-minutes": "10483"}, NOW)
     assert obs.window_label == "weekly"
+
+
+# --- prepaid credits (issue #6) --------------------------------------------
+
+def test_no_credit_headers_means_unknown_not_zero():
+    """None and Credits(has_credits=False) are different answers: one keeps
+    whatever was last known, the other overwrites it with "none"."""
+    assert parse_credits({}) is None
+    assert parse_credits({"x-codex-primary-used-percent": "40"}) is None
+
+
+def test_credit_headers_are_parsed():
+    credits = parse_credits({"x-codex-credits-has-credits": "true",
+                             "x-codex-credits-balance": "12.50"})
+    assert credits.has_credits is True
+    assert credits.balance == 12.5
+
+
+def test_has_credits_false_with_a_zero_balance_is_a_real_answer():
+    credits = parse_credits({"x-codex-credits-has-credits": "false",
+                             "x-codex-credits-balance": "0"})
+    assert credits.has_credits is False
+    assert credits.balance == 0.0
+
+
+def test_a_balance_alone_answers_the_question():
+    """The issue reports both headers, but a backend that sends only the
+    number should not read as "no credits"."""
+    assert parse_credits({"x-codex-credits-balance": "3.10"}).has_credits is True
+    assert parse_credits({"x-codex-credits-balance": "0"}).has_credits is False
+
+
+def test_an_unparseable_balance_leaves_the_number_unknown():
+    credits = parse_credits({"x-codex-credits-has-credits": "1",
+                             "x-codex-credits-balance": "lots"})
+    assert credits.has_credits is True
+    assert credits.balance is None
+
+
+def test_both_credit_headers_are_in_the_allowlist():
+    """They arrive on every codex response; a header the caller filters out
+    can never reach parse_credits."""
+    assert "x-codex-credits-has-credits" in ALLOWED_HEADERS
+    assert "x-codex-credits-balance" in ALLOWED_HEADERS

@@ -13,13 +13,15 @@ permissions:
 
 jobs:
   test:
-    # The install and service backends are only verified on macOS today (see
-    # docs/adr/0005-*.md). The suite mocks every OS-level call so it runs the
-    # same anywhere, but macOS is what matches a real user's environment.
-    runs-on: macos-latest
+    # macOS is what matches most users' environment; Linux is here because a
+    # test that fakes the platform the wrong way passes on a Mac and fails
+    # everywhere else — one did, caught only by running the suite on Linux by
+    # hand. Windows joins once the suite is green on real Windows hardware.
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-latest, ubuntu-latest]
         python-version: ["3.10", "3.12"]
 
     steps:
@@ -47,5 +49,7 @@ jobs:
       - name: Run the test suite
         run: python -m pytest tests/ -v
 
+      # Only needs to run once; node is preinstalled on both runner images.
       - name: Check JS syntax
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         run: node --check claude_unlimited/static/app.js

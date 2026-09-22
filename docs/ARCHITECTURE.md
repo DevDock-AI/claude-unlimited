@@ -135,6 +135,18 @@ Precedence for one request, first match wins:
    (`branch_assigned`)
 5. **Normal rotation** — `router.choose()`, sticky-until-threshold.
 
+Orthogonal to that order: **"leave this profile when its Fable limit is spent"**
+(`Profile.leave_on_fable_limit`, off by default; `Settings.fable_limit_all_profiles` turns
+it on for every Profile). `_sync_snapshot` resolves the two into
+`ProfileRuntime.leave_on_fable_limit`, and `router.must_leave()` — the resolved switch AND
+`router.fable_spent()` — makes such an account a non-candidate for steps 4 and 5 and for a
+live branch pin (step 2 gives the pin up only when another eligible account can take it).
+It is derived per request from the Fable usage window (Anthropic) or from `blocked_models`
+(Codex: the GPT model Fable maps to is unavailable), never written into `state`. Steps 1
+and 3 and a standing Take over are honoured regardless, with one Activity line; with no
+alternative the session stays put (`fable_limit_no_alternative`). Routing never reads the
+requested model.
+
 Distribute mode is `grant.distribute OR settings.distribute_sessions_default` — the
 per-session `code --distribute` flag, or the global Settings toggle. OR-ed, never assigned,
 so the setting can only turn distribution on; `_branch_decision` reads it from the pool it

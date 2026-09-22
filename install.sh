@@ -132,6 +132,15 @@ else
   nohup "$CLI" start --port "$PORT" >/dev/null 2>&1 &
 fi
 
+# macOS gets the HUD — the floating dock of accounts — without asking for it.
+# Non-fatal on purpose: a failed download is a missing ornament, not a failed
+# install, and `cu hud install` retries it whenever the user wants.
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo
+  echo "Installing HUD - Heads-Up Display…"
+  "$CLI" hud install || echo "The HUD could not be installed right now — try later with: cu hud install"
+fi
+
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
   curl -fsS --max-time 1 "${URL}health" >/dev/null 2>&1 && break
   sleep 0.5

@@ -458,3 +458,27 @@ def test_a_config_with_two_forced_holders_still_loads_and_saves(fake_store):
     assert [p.id for p in config.load_pool().profiles if p.forced_for_subagents] == [b.id]
     profiles.update_profile(a.id, name="Claude renamed")  # used to raise TooManySubagentProfilesError
 
+
+
+# ---- "leave this profile when its Fable limit is spent" --------------------
+
+def test_leave_on_fable_limit_is_off_by_default_and_round_trips(fake_store):
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    assert a.leave_on_fable_limit is False  # off by default — it moves sessions
+
+    assert profiles.update_profile(a.id, leave_on_fable_limit=True).leave_on_fable_limit is True
+    assert profiles.list_profiles()[0].leave_on_fable_limit is True
+    assert profiles.update_profile(a.id, leave_on_fable_limit=False).leave_on_fable_limit is False
+
+    b = profiles.create_profile(name="Work", kind="oauth", credential="sk-ant-87654321",
+                                account_uuid="u2", leave_on_fable_limit=True)
+    assert b.leave_on_fable_limit is True
+    # Unlike forced_for_subagents, any number of profiles may hold it.
+    profiles.update_profile(a.id, leave_on_fable_limit=True)
+    assert [p.leave_on_fable_limit for p in profiles.list_profiles()] == [True, True]
+
+
+def test_leave_on_fable_limit_must_be_a_bool(fake_store):
+    a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
+    with pytest.raises(profiles.ValidationError):
+        profiles.update_profile(a.id, leave_on_fable_limit="yes")

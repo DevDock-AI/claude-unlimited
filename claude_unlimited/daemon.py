@@ -34,7 +34,7 @@ import time
 if platform.system() != "Windows":
     import resource  # POSIX-only stdlib module, absent on Windows
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -46,8 +46,10 @@ from . import usage_probe
 from . import activity
 from . import anthropic_oauth
 from . import connection_test
+from . import context_window
 from . import daemon_installer
 from . import export_import
+from . import hud
 from . import i18n
 from . import model_catalogue
 from . import notifications
@@ -61,8 +63,9 @@ from . import project_usage
 from . import session_tokens
 from . import updater
 from . import usage_history
-from .config import APP_DIR, DEFAULT_SWITCH_THRESHOLD, UPDATE_MODES, ensure_app_dir, load_pool, update_settings
+from .config import APP_DIR, DEFAULT_SWITCH_THRESHOLD, ensure_app_dir, load_pool, update_settings
 from .gateway import Gateway
+from .router import spending_on_credits
 
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 4317
@@ -89,7 +92,7 @@ def _qs_int(qs: dict, key: str, default: int, *, minimum: int, maximum: int) -> 
 # is also a live proxy, and every unknown path falls through to be forwarded
 # upstream. A catch-all here would swallow real traffic.
 _VIEW_ROUTES = frozenset({
-    "/", "/profiles", "/activity", "/settings", "/help",
+    "/", "/profiles", "/stats", "/activity", "/settings", "/help",
 })
 
 _gateway = Gateway()
@@ -98,6 +101,11 @@ _STATIC_DIR = Path(__file__).parent / "static"
 _INDEX_HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 _APP_JS = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
 _FAVICON_SVG = (_STATIC_DIR / "favicon.svg").read_text(encoding="utf-8")
+# Vendored rather than loaded from a CDN: the Dashboard is loopback-only and
+# must keep working offline, and drawing a chart is no reason to tell a third
+# party that this daemon is running.
+_CHARTS_JS = (_STATIC_DIR / "vendor" / "charts.js").read_text(encoding="utf-8")
+_CHARTS_CSS = (_STATIC_DIR / "vendor" / "charts.css").read_text(encoding="utf-8")
 
 # Regenerated every daemon start; lives only in this process's memory.
 _CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -208,6 +216,58 @@ def _window_label_for_display(p, runtime, label_attr: str, resets_attr: str):
         getattr(runtime, resets_attr, None), datetime.now(timezone.utc))
 
 
+_CLIENT_VERSION_CACHE: dict = {}
+_CLIENT_VERSION_TTL_SECONDS = 300.0
+
+
+def _cached_client_version():
+    """The installed Claude Code version, re-read at most every few minutes.
+
+    /api/settings is polled by an open dashboard, and forking `claude
+    --version` on every poll would be absurd. A version only changes when the
+    client updates, so a stale answer for a few minutes is harmless."""
+    now = time.monotonic()
+    cached = _CLIENT_VERSION_CACHE.get("value")
+    if cached is not None and now - _CLIENT_VERSION_CACHE.get("at", 0.0) < _CLIENT_VERSION_TTL_SECONDS:
+        return cached[0]
+    from .cli import _installed_client_version
+
+    try:
+        version = _installed_client_version()
+    except Exception:
+        version = None
+    # Boxed in a tuple so a legitimate None is cached too, rather than
+    # re-forking on every poll for a client that is not installed.
+    _CLIENT_VERSION_CACHE["value"] = (version,)
+    _CLIENT_VERSION_CACHE["at"] = now
+    return version
+
+
+def _context_1m_preview(pool) -> dict:
+    """{"enabled", "reason"[, "guard"]} for a session launched now with no
+    `--profile` and nothing set in the environment — the common case, and the
+    one a user looking at Settings is asking about.
+
+    `guard` is present whenever a codex Profile is in the route: one entry per
+    such account with the window the per-request capacity guard (docs/adr/
+    0009) budgets it at, so the dashboard can say "up to ~226K on this one;
+    longer turns go to a Claude account" — and flag any GPT id whose window
+    is ASSUMED rather than known."""
+    mode = getattr(pool.settings, "context_1m", "auto")
+    version = _cached_client_version() if mode == "auto" else None
+    profiles = pool.enabled_profiles()
+    enabled, reason = context_window._one_million_decision(mode, profiles, None, {}, version)
+    preview = {"enabled": enabled, "reason": reason}
+    codex = context_window.codex_profiles_in_route(profiles, None)
+    if codex:
+        entries = []
+        for p in codex:
+            summary = openai_models.codex_profile_windows(p, pool.settings.model_parity)
+            entries.append({"id": p.id, "name": p.name, **summary})
+        preview["guard"] = {"profiles": entries, "assumed": any(e["assumed"] for e in entries)}
+    return preview
+
+
 def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> dict:
     """The wire shape sent to the browser. Explicit allowlist, not asdict(),
     so a future field added to Profile can't accidentally leak by default.
@@ -247,6 +307,10 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "codex_model": p.codex_model,
         "codex_reasoning_effort": p.codex_reasoning_effort,
         "forced_for_subagents": getattr(p, "forced_for_subagents", False),
+        # "Leave when Fable is spent" — the Profile's OWN switch, as configured.
+        # The pool-wide override (Settings.fable_limit_all_profiles) is not
+        # folded in here: the card shows what this Profile has set.
+        "leave_on_fable_limit": getattr(p, "leave_on_fable_limit", False),
         "state": state_value,
         "status_word": _STATUS_WORDS.get(state_value, state_value),
         "usage_5h_percent": runtime.last_usage_percent if runtime is not None else None,
@@ -261,7 +325,100 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "tokens_total": usage.get("tokens", 0),
         "cost_usd_total": usage.get("cost_usd"),
         "in_use_now": in_use_now,
+        # Per-model weekly windows (e.g. Fable), from usage reads. Empty until
+        # one has run. The Fable one drives "leave when Fable is spent".
+        "model_usage": [
+            {"name": w.name, "percent": w.percent,
+             "resets_at": w.resets_at.isoformat() if w.resets_at else None,
+             "active": w.active}
+            for w in (runtime.model_usage if runtime is not None else ())
+        ],
+        # Prepaid Codex credits (issue #6). `credits_has` is None until a
+        # response has said anything about them — which is every oauth and api
+        # Profile, and a codex one whose backend does not report them — and
+        # that is deliberately not the same as false. `spending_on_credits`
+        # is true only while requests are actually being charged to them, so
+        # money is never spent without the UI saying so.
+        "credits_has": runtime.credits_has if runtime is not None else None,
+        "credits_balance": runtime.credits_balance if runtime is not None else None,
+        "spending_on_credits": spending_on_credits(runtime) if runtime is not None else False,
     }
+
+
+def _merge_deleted_profiles(rows: list[dict], profiles) -> list[dict]:
+    """Collapse rows whose Profile no longer exists into a single entry.
+
+    Deleted accounts still hold spend, so dropping them would make the
+    breakdown disagree with the total beside it. But one row per dead id
+    renders as several identical "deleted profile" lines, which reads as a
+    bug — they are merged instead, and the count is named.
+    """
+    known = {p.id for p in profiles}
+    kept: list[dict] = []
+    gone: list[dict] = []
+    for row in rows:
+        if row.get("other") or row.get("key") in known:
+            kept.append(row)
+        else:
+            gone.append(row)
+    if not gone:
+        return kept
+    merged = {
+        "key": "__deleted__",
+        "cost_usd": round(sum(r.get("cost_usd") or 0 for r in gone), 6),
+        "tokens": sum(r.get("tokens") or 0 for r in gone),
+        "requests": sum(r.get("requests") or 0 for r in gone),
+        "share": round(sum(r.get("share") or 0 for r in gone), 1),
+        "label": f"{len(gone)} deleted profiles" if len(gone) > 1 else "deleted profile",
+        "kind": None,
+        "deleted": True,
+    }
+    kept.append(merged)
+    # Ranked by spend like every other row, so the merged entry lands where
+    # its size says it should rather than always at the bottom.
+    kept.sort(key=lambda r: (r.get("other") is True, -(r.get("cost_usd") or 0)))
+    return kept
+
+
+HUD_NAME = hud.HUD_NAME
+
+
+def _label_projects(rows: list) -> list:
+    """Statistics names a project the way the Overview does. The rows carry
+    Claude Code's sanitized folder id (`-Users-you-Work-app`); without a label
+    the page printed that raw — a full local path, in a screen people share."""
+    for row in rows:
+        if row.get("key") and not row.get("other"):
+            row["label"] = project_attribution.display_name(row["key"])
+    return rows
+
+
+def _widget_bundle() -> Path:
+    """Where the HUD is installed.
+
+    Falls back to the bundle it was installed as before the rename, so the
+    Dashboard's button keeps working for someone whose install predates it."""
+    current = hud.BUNDLE_DIR / hud.BUNDLE_NAME
+    return hud.LEGACY_BUNDLE if not current.is_dir() and hud.LEGACY_BUNDLE.is_dir() else current
+
+
+def _widget_state() -> dict:
+    """What the Dashboard needs to decide whether to offer the reopen button.
+
+    macOS only, and only when the bundle is actually installed — offering a
+    button that cannot work is worse than not offering one.
+    """
+    if sys.platform != "darwin":
+        return {"supported": False, "installed": False, "running": False}
+    bundle = _widget_bundle()
+    running = False
+    try:
+        # pgrep -f, not pkill: this only ever reads.
+        running = subprocess.run(["pgrep", "-f", f"{bundle}/Contents/MacOS/"],
+                                 capture_output=True, timeout=4).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        running = False
+    return {"supported": True, "installed": bundle.is_dir(), "running": running}
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
@@ -274,10 +431,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     # ---- shared request handling ----
 
-    def _send_json(self, status: int, payload) -> None:
+    def _send_json(self, status: int, payload, *, extra_headers: Optional[dict] = None) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
         for k, v in _security_headers().items():
+            self.send_header(k, v)
+        # e.g. Retry-After on a "no capacity" rejection, so a client that
+        # honours it waits for the quota window instead of retrying at once.
+        for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -343,6 +504,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if path in ("/vendor/charts.js", "/vendor/charts.css"):
+            is_js = path.endswith(".js")
+            body = (_CHARTS_JS if is_js else _CHARTS_CSS).encode("utf-8")
+            self.send_response(200)
+            for k, v in _security_headers().items():
+                self.send_header(k, v)
+            self.send_header("Content-Type",
+                             "application/javascript; charset=utf-8" if is_js
+                             else "text/css; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/app.js":
             body = _APP_JS.encode("utf-8")
             self.send_response(200)
@@ -385,18 +560,43 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 # Branch-routed agents never move current_profile_id; this is
                 # what they are actually on (profile id -> live agents).
                 "live_agents": _gateway.live_agent_counts(),
+                # Issue #3: `in_use_now` on /api/profiles is smoothed by a
+                # 15-minute grace so the Dashboard light does not flicker, so
+                # scripts using it as an idle signal see a false busy. These
+                # two are the unsmoothed truth: how long the whole pool has
+                # been idle (null = nothing served since this daemon started)
+                # and whether a request is open right now.
+                "idle_seconds": _gateway.seconds_since_last_activity(),
+                "serving_now": sorted(_gateway.serving_now_ids()),
             })
             return
 
         if path == "/api/profiles":
             runtime_map = _gateway.runtime_snapshot()
-            usage_map = usage_history.usage_by_profile(usage_history.list_events())
+            # Aggregated in SQL, not by loading the table: the Dashboard polls
+            # this once a second and the table grows forever.
+            usage_map = usage_history.totals_by_profile()
             in_flight = _gateway.in_flight_ids()
             items = [_profile_to_public_dict(p, runtime_map.get(p.id), usage_map.get(p.id), p.id in in_flight)
                      for p in profile_repo.list_profiles()]
             live_agents = _gateway.live_agent_counts()
+            on_account = _gateway.agents_on_account_seconds()
+            last_use = usage_history.latest_by_profile()
+            now_utc = datetime.now(timezone.utc)
             for item in items:
                 item["live_agents"] = live_agents.get(item["id"], 0)
+                # The widget's "serving now" block. last_* is the latest
+                # COMPLETED request (usage is recorded once known), so it is
+                # labelled as the latest, never as what is running this second.
+                last = last_use.get(item["id"]) or {}
+                item["last_model"] = last.get("model")
+                item["last_requested_model"] = last.get("requested_model")
+                item["last_used_at"] = last.get("at")
+                item["last_project"] = (project_attribution.display_name(last["project_id"])
+                                        if last.get("project_id") else None)
+                seconds = on_account.get(item["id"])
+                item["agents_since"] = ((now_utc - timedelta(seconds=seconds)).isoformat()
+                                        if seconds is not None else None)
             self._send_json(200, {"profiles": items})
             return
 
@@ -413,12 +613,46 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "reasoning_efforts": list(openai_models.VALID_REASONING_EFFORTS),     # Codex side
                 "claude_efforts": list(openai_models.CLAUDE_REASONING_EFFORTS),       # Claude side
                 "defaults": openai_models.default_parity_rows(),  # for [+] prefill / Reset preview
+                # Claude models the catalogue knows but the saved list does
+                # not offer — the "a new model shipped, decide what it costs
+                # you" signal the Dashboard raises a banner for.
+                "unmapped": openai_models.unmapped_claude_models(load_pool().settings.model_parity),
             })
+            return
+
+        if path == "/api/branch-pins":
+            # Which agent sits on which account. gateway already keeps this as
+            # a read-only view (TTL-filtered); it had no consumer until now, so
+            # the Dashboard could only show a COUNT of live agents and never
+            # which branch was where.
+            pins = _gateway.branch_pins()
+            pool = load_pool()
+            names = {p.id: p.name for p in pool.profiles}
+            for pin in pins:
+                pin["profile_name"] = names.get(pin["profile_id"], "deleted profile")
+                # Claude Code names every subagent with x-claude-code-agent-id
+                # and sends a parent id only for a NESTED one, so the parent
+                # cannot be the test: that marked every direct subagent as a
+                # main agent. The agent id is (MAIN_BRANCH = the one you type at).
+                pin["is_subagent"] = pin.get("agent_id") != project_attribution.MAIN_BRANCH
+            self._send_json(200, {"pins": pins})
+            return
+
+        if path == "/api/widget":
+            self._send_json(200, _widget_state())
             return
 
         if path == "/api/settings":
             pool = load_pool()
-            self._send_json(200, {"settings": asdict(pool.settings)})
+            self._send_json(200, {
+                "settings": asdict(pool.settings),
+                # Why a session launched right now would, or would not, get the
+                # full context window. The real decision happens inside
+                # `cu code`, in another process; this is the same pure function
+                # run over the same pool so the dashboard can answer "why am I
+                # still on 200K?" without the user having to launch anything.
+                "context_1m_preview": _context_1m_preview(pool),
+            })
             return
 
         if path == "/api/locales":
@@ -481,7 +715,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/usage/projects":
             counts = project_usage.get_counts()
             total = sum(counts.values())
-            token_totals = usage_history.tokens_by_project(usage_history.list_events())
+            token_totals = usage_history.totals_by_project()
             items = [
                 {
                     "project_id": pid,
@@ -496,14 +730,74 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"projects": items, "total_requests": total})
             return
 
+        if path == "/api/usage/stats":
+            qs = parse_qs(urlparse(self.path).query)
+            range_key = qs.get("range", [None])[0]
+            if range_key not in usage_history.RANGE_KEYS:
+                range_key = "1m"
+            ranged = usage_history.aggregated_since(range_key)
+            # The line chart carries more points than the bar-based summary.
+            granularity = usage_history.CHART_GRANULARITY[range_key]
+            if granularity == "hour":
+                buckets = usage_history.hourly_totals(ranged, bucket_hours=1)
+            elif granularity == "week":
+                # Enough weeks to span the whole range, or the chart silently
+                # covers less time than the total printed next to it.
+                days = usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30)
+                buckets = usage_history.weekly_totals(ranged, weeks=max(1, -(-days // 7)))
+            elif granularity == "month":
+                buckets = usage_history.monthly_totals(
+                    ranged, months=usage_history.months_to_cover(ranged, range_key))
+            else:
+                buckets = usage_history.daily_totals(ranged, days=usage_history.CHART_TO_DAYS.get(range_key, 30))
+            profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
+            by_profile = usage_history.split_by(ranged, "profile")
+            by_profile = _merge_deleted_profiles(by_profile, load_pool().profiles)
+            for row in by_profile:
+                profile = profiles_by_id.get(row["key"])
+                # An append-only log still holds rows for a deleted Profile;
+                # name it plainly rather than showing a bare internal id.
+                if row.get("deleted"):
+                    # Already named by _merge_deleted_profiles, which knows how
+                    # many ids it folded together; relabelling would discard
+                    # that count and print a bare "deleted profile".
+                    continue
+                row["label"] = profile.name if profile else ("Other" if row.get("other") else "deleted profile")
+                row["kind"] = profile.kind if profile else None
+            self._send_json(200, {
+                "range": range_key,
+                "granularity": granularity,
+                # One cost line per provider kind, sharing the bucket x-axis.
+                "series": usage_history.series_by_kind(
+                    ranged, buckets,
+                    {p.id: p.kind for p in load_pool().profiles}),
+                "totals": usage_history.totals(ranged),
+                "buckets": buckets,
+                "by_model": usage_history.split_by(ranged, "model"),
+                "by_project": _label_projects(usage_history.split_by(ranged, "project")),
+                "by_profile": by_profile,
+                "by_requested_model": usage_history.split_by(ranged, "requested_model"),
+                # What ECO saved in this range. Carries its own "never ran"
+                # signal so the UI never prints "$0.00 saved" for a feature
+                # that was simply switched off.
+                "eco": usage_history.eco_totals(ranged),
+                "speech": usage_history.speech_totals(ranged),
+                # Calls per day for the activity heatmap. Always a day grid,
+                # independent of the chart's granularity: a heatmap of weeks
+                # or months is not a heatmap.
+                "days": usage_history.daily_totals(
+                    ranged, days=min(usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30), 182)),
+                "history_begins": usage_history.history_begins_at(),
+            })
+            return
+
         if path == "/api/usage/summary":
             qs = parse_qs(urlparse(self.path).query)
             range_key = qs.get("range", [None])[0]
             if range_key not in usage_history.RANGE_KEYS:
                 range_key = "1w"
             granularity = usage_history.RANGE_GRANULARITY[range_key]
-            events = usage_history.list_events()
-            ranged_events = usage_history.filter_events_since(events, range_key)
+            ranged_events = usage_history.aggregated_since(range_key)
             bucket_hours = 6  # 4 bars over the last 24h; 24 one-hour bars is too dense for the card
             if granularity == "hour":
                 chart_totals = usage_history.hourly_totals(ranged_events, bucket_hours=bucket_hours)
@@ -517,7 +811,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 chart_totals = usage_history.daily_totals(ranged_events, days=days)
             profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
             by_profile_days = _qs_int(qs, "days", 7, minimum=1, maximum=31)
-            by_profile_totals = usage_history.daily_totals_by_profile(events, days=by_profile_days)
+            by_profile_totals = usage_history.daily_totals_by_profile(
+                usage_history.aggregated_in_last_days(by_profile_days), days=by_profile_days)
             # usage_history is append-only, so it still carries entries for
             # a deleted Profile's id. Drop anything that isn't a current
             # Profile so the chart never shows a bare internal id.
@@ -534,7 +829,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "model_split": usage_history.model_split(ranged_events),
                 "hourly_histogram": usage_history.hourly_histogram(ranged_events),
                 "cost_by_profile": usage_history.cost_by_profile(ranged_events),
-                "total_events": len(events),
+                "total_events": usage_history.event_count(),
                 "pricing_source": pricing.PRICING_SOURCE,
                 "pricing_fetched": pricing.PRICING_FETCHED,
             })
@@ -600,6 +895,28 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if not self._check_csrf():
+            return
+
+        if path == "/api/widget/launch":
+            # Reopens the HUD after it was closed or quit. Launches
+            # ONE fixed local bundle with no caller-supplied input, so there is
+            # nothing here for a request to redirect at something else.
+            state = _widget_state()
+            if not state["supported"]:
+                self._send_json(400, {"error": "unsupported",
+                                      "message": f"{HUD_NAME} is macOS only."})
+                return
+            if not state["installed"]:
+                self._send_json(404, {"error": "not_installed",
+                                      "message": f"{HUD_NAME}.app is not installed."})
+                return
+            try:
+                subprocess.run(["open", "-a", str(_widget_bundle())],
+                               capture_output=True, timeout=10, check=True)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._send_json(500, {"error": "launch_failed", "message": str(exc)})
+                return
+            self._send_json(200, {"launched": True})
             return
 
         if path == "/api/presence":
@@ -1030,16 +1347,26 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "upstream_unreachable": "[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to.",
             }
             message = (
-                "[claude-unlimited] The request body is too large to forward."
-                if result.error == "bad_request"
-                else _FORCED_PROFILE_ERROR_MESSAGES.get(
-                    result.error, "[claude-unlimited] No eligible Profile is available right now.")
+                # What the gateway worked out (which accounts, when the first
+                # one comes back), when it knows more than the code alone.
+                result.error_detail
+                or ("[claude-unlimited] The request body is too large to forward."
+                    if result.error == "bad_request"
+                    else _FORCED_PROFILE_ERROR_MESSAGES.get(
+                        result.error, "[claude-unlimited] No eligible Profile is available right now."))
             )
+            if result.error == "request_exceeds_every_window":
+                # The capacity guard's "prompt is too long" (docs/adr/0009):
+                # Claude Code's reactive compaction keys on the exact
+                # Anthropic envelope and wording, so it is relayed RAW —
+                # invalid_request_error, no [claude-unlimited] prefix.
+                error_type = "invalid_request_error"
+            else:
+                error_type = "overloaded_error" if result.status == 503 else "api_error"
             self._send_json(result.status, {
                 "type": "error",
-                "error": {"type": "overloaded_error" if result.status == 503 else "api_error",
-                          "message": message},
-            })
+                "error": {"type": error_type, "message": message},
+            }, extra_headers=result.headers)
             return
 
         self.send_response(result.status)
@@ -1251,7 +1578,7 @@ def _should_prime_after_update(before, after) -> bool:
     return _is_rotation_candidate(after) and not _is_rotation_candidate(before)
 
 
-def _record_ping(profile, result: dict) -> None:
+def _record_ping(profile, result: dict, model_windows=None) -> None:
     """Feeds a one-off ping's response into the same usage pipeline a real
     request goes through, so the Dashboard reflects it immediately.
 
@@ -1298,6 +1625,11 @@ def _record_ping(profile, result: dict) -> None:
         # credential from the Dashboard.)
         if not isinstance(observation, (UsageSnapshot, AuthInvalid, QuotaExhausted)):
             return
+        if model_windows is not None and isinstance(observation, UsageSnapshot):
+            # The one place the header analogy breaks: per-model windows have
+            # no header form, so a usage read attaches them here.
+            from dataclasses import replace as _replace_snapshot
+            observation = _replace_snapshot(observation, model_windows=tuple(model_windows))
 
         with _gateway._lock:
             _gateway._observe(profile.id, observation, now)
@@ -1469,6 +1801,13 @@ def _note_user_activity() -> None:
 def _usage_probe_candidates(pool) -> list:
     runtime = _gateway.runtime_snapshot()
     observed = _gateway.usage_observed_at()
+    # A Profile that just took a 429 its account-level windows
+    # cannot explain gets its usage re-read now rather than up to ten minutes
+    # from now. Presenting it as "never observed" is the whole mechanism —
+    # Scheduler.due() skips only the INTERVAL gate for those, so the provider
+    # pause and the per-Profile backoff still apply exactly as before. No new
+    # polling loop (invariant 2); this rides the tick that already runs.
+    forced = _gateway.take_usage_recheck_requests()
     candidates = []
     for profile in pool.profiles:
         provider = usage_probe.provider_for(profile)
@@ -1479,7 +1818,8 @@ def _usage_probe_candidates(pool) -> list:
         # would only fail, and failing reads are exactly the noise to avoid.
         if rt is not None and rt.state.value in ("auth_invalid", "disabled"):
             continue
-        candidates.append(usage_probe.Candidate(profile.id, provider, observed.get(profile.id)))
+        observed_at = None if profile.id in forced else observed.get(profile.id)
+        candidates.append(usage_probe.Candidate(profile.id, provider, observed_at))
     return candidates
 
 
@@ -1499,7 +1839,8 @@ def _probe_usage(profile) -> None:
         result = usage_probe.ProbeResult(status=None)
     message = _usage_probe.record(profile.id, provider, result)
     if result.status == 200 and result.headers:
-        _record_ping(profile, {"status": 200, "headers": result.headers})
+        _record_ping(profile, {"status": 200, "headers": result.headers},
+                     model_windows=result.model_windows)
     if message:
         activity.record("error", f"{profile.name} — usage check paused", meta=message)
 
@@ -1525,7 +1866,16 @@ def _run_usage_probe_tick() -> None:
 
 def _usage_probe_loop() -> None:
     while True:
-        time.sleep(usage_probe.TICK_SECONDS)
+        woken = _gateway.usage_recheck_wakeup.wait(usage_probe.TICK_SECONDS)
+        _gateway.usage_recheck_wakeup.clear()
+        if woken:
+            # Only a re-auth sets this (see Gateway._queue_recovered_usage_read)
+            # — someone just signed an account back in, which is use, so the
+            # idle gate must not swallow the read they are waiting to see.
+            try:
+                _usage_probe.note_activity()
+            except Exception:  # noqa: BLE001
+                pass
         _run_usage_probe_tick()
 
 
@@ -1611,6 +1961,12 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
         updater.ensure_cli_aliases()
     except Exception:
         pass
+    # Same self-heal, same reason, for the macOS HUD: an update is applied by
+    # the OLD updater, so the only way the HUD reaches an existing install is
+    # for the NEW code to put it there. On a background thread — it downloads,
+    # and nothing about the dashboard should wait for that.
+    threading.Thread(target=hud.keep_installed, args=(__version__,),
+                     daemon=True, name="hud-install").start()
     threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
     threading.Thread(target=_usage_probe_loop, daemon=True, name="usage-probe").start()
@@ -1630,6 +1986,10 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
         pass
     finally:
         server.server_close()
+        # Closes the store's connection, which truncates the write-ahead log.
+        # Left open across a restart, that log is what the next start has to
+        # rebuild an index over before its first read.
+        db.close_this_thread()
         try:
             PID_FILE.unlink(missing_ok=True)
         except OSError:

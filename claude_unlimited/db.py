@@ -21,9 +21,19 @@ Three properties this module owes the rest of the daemon:
   a newer build migrates, an older build sees a version it doesn't know and
   degrades rather than corrupting.
 
-Threading: the daemon serves a thread per connection, and a `sqlite3`
-connection is not safe to share across threads, so each thread gets its own
-(WAL mode, so readers never block the writer).
+Threading: **one connection for the whole process**, shared across threads and
+serialized by a lock. This module used to give each thread its own handle,
+which looks right until you remember that the daemon serves a *thread per HTTP
+connection*: every Dashboard poll, every widget tick and every proxied request
+opened a new database handle that was never closed. Those handles pile up (76
+were live on one real install), and in WAL mode each one holds a read mark,
+so SQLite cannot checkpoint past the oldest of them — the write-ahead log grew
+to 17 MB and every *new* handle then had to rebuild its index over that log
+before its first read. The symptom was a Dashboard that took 10-20 seconds to
+show any Profile, worst when the machine was busy.
+
+A single connection cannot leak, keeps the WAL checkpointing normally, and
+costs a lock around statements that take tens of milliseconds at most.
 """
 
 from __future__ import annotations
@@ -38,14 +48,18 @@ from typing import Any, Optional, Sequence
 from . import config
 
 DB_BASENAME = "claude_unlimited.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5000
 
-_local = threading.local()
+# The one connection, and the path it was opened for. Guarded by _open_lock.
+_entry: Optional[tuple] = None
 # Opening and migrating are serialized: the daemon starts several threads at
 # once, and on a brand-new database they would otherwise all run the first
 # migration concurrently — one wins, the rest hit "table already exists".
 _open_lock = threading.RLock()
+# Held around every statement, because the one connection is shared. Reentrant:
+# import_legacy_logs() calls query() and execute() while already inside it.
+_use_lock = threading.RLock()
 # Degraded state is per database FILE, not per process. A poisoned file in one
 # APP_DIR must not disable a perfectly good store in another (the test suite
 # swaps APP_DIR constantly, and a global flag made one bad file disable the
@@ -132,7 +146,26 @@ def _migrate_to_2(conn: sqlite3.Connection) -> None:
     )
 
 
-_MIGRATIONS = [_migrate_to_1, _migrate_to_2]  # index 0 takes the schema from version 0 to 1
+def _migrate_to_3(conn: sqlite3.Connection) -> None:
+    """Which primitive speech level a reply was written under (speech.py), so
+    its effect on output tokens is measured from real requests."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_event)")}
+    if "speech_mode" not in columns:
+        conn.execute("ALTER TABLE usage_event ADD COLUMN speech_mode TEXT")
+
+
+def _migrate_to_4(conn: sqlite3.Connection) -> None:
+    """Per-request Codex quota evidence: reasoning tokens (what ADR 0007 found
+    drives the 5h window) and the 5h percentage the backend reported when the
+    request started, so the window's movement can be attributed to requests."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_event)")}
+    if "reasoning_tokens" not in columns:
+        conn.execute("ALTER TABLE usage_event ADD COLUMN reasoning_tokens INTEGER")
+    if "quota_5h_percent" not in columns:
+        conn.execute("ALTER TABLE usage_event ADD COLUMN quota_5h_percent REAL")
+
+
+_MIGRATIONS = [_migrate_to_1, _migrate_to_2, _migrate_to_3, _migrate_to_4]  # index 0 takes the schema from version 0 to 1
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -150,19 +183,31 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def connect() -> Optional[sqlite3.Connection]:
-    """This thread's connection, opened and migrated on first use. None when
+    """The process's connection, opened and migrated on first use. None when
     the store is unusable — callers treat that as "no storage", never as an
-    error to raise."""
+    error to raise.
+
+    Shared across threads (see the module docstring), so every caller must run
+    its statements under `_use_lock` — which `execute()` and `query()` do.
+    """
+    global _entry
     target = path()
-    cached = getattr(_local, "entry", None)
-    if cached is not None and cached[0] == target:
-        return cached[1]
-    if not available():
-        return None
     with _open_lock:
+        cached = _entry
+        if cached is not None and cached[0] == target:
+            return cached[1]
+        if cached is not None:
+            # APP_DIR moved (the test suite does this per test). Close the old
+            # handle rather than leaving it open on the previous file.
+            _close_entry(cached[1])
+            _entry = None
+        if not available():
+            return None
         try:
             config.ensure_app_dir()
-            conn = sqlite3.connect(target, timeout=BUSY_TIMEOUT_MS / 1000)
+            # check_same_thread=False: one connection, many threads, every
+            # statement serialized by _use_lock.
+            conn = sqlite3.connect(target, timeout=BUSY_TIMEOUT_MS / 1000, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
@@ -170,47 +215,65 @@ def connect() -> Optional[sqlite3.Connection]:
         except (sqlite3.Error, OSError) as exc:
             _degrade(target, exc)
             return None
-    _local.entry = (target, conn)
-    return conn
+        _entry = (target, conn)
+        return conn
+
+
+def _close_entry(conn: sqlite3.Connection) -> None:
+    try:
+        # TRUNCATE, not the implicit passive checkpoint on close: it is the one
+        # that shrinks the write-ahead log back to nothing, so the next open
+        # has no log to rebuild an index over.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
 
 
 def execute(sql: str, params: Sequence[Any] = ()) -> Optional[int]:
     """One write, committed. Returns the new rowid, or None when the store is
     unusable — a lost row must never surface as an exception in the request
     path (see the module docstring)."""
-    conn = connect()
-    if conn is None:
-        return None
-    try:
-        with conn:
-            return conn.execute(sql, params).lastrowid
-    except (sqlite3.Error, OSError):
-        # One statement failing is not evidence the store is unusable — a lost
-        # row is dropped quietly, exactly like an unwritable activity line.
-        # Only open/migrate failures degrade the database.
-        return None
+    with _use_lock:
+        conn = connect()
+        if conn is None:
+            return None
+        try:
+            with conn:
+                return conn.execute(sql, params).lastrowid
+        except (sqlite3.Error, OSError):
+            # One statement failing is not evidence the store is unusable — a
+            # lost row is dropped quietly, exactly like an unwritable activity
+            # line. Only open/migrate failures degrade the database.
+            return None
 
 
 def query(sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-    conn = connect()
-    if conn is None:
-        return []
-    try:
-        return list(conn.execute(sql, params))
-    except (sqlite3.Error, OSError):
-        return []
+    with _use_lock:
+        conn = connect()
+        if conn is None:
+            return []
+        try:
+            return list(conn.execute(sql, params))
+        except (sqlite3.Error, OSError):
+            return []
 
 
 def close_this_thread() -> None:
-    """Drops this thread's handle. Tests call it when they move `APP_DIR`;
-    the daemon never needs it."""
-    entry = getattr(_local, "entry", None)
-    if entry is not None:
-        try:
-            entry[1].close()
-        except sqlite3.Error:
-            pass
-        _local.entry = None
+    """Closes the process's connection. Tests call it when they move
+    `APP_DIR`; the daemon never needs it.
+
+    Named for the per-thread handles this module used to keep — kept as the
+    name every caller already uses, and still exactly "drop the handle".
+    """
+    global _entry
+    with _open_lock:
+        if _entry is not None:
+            _close_entry(_entry[1])
+            _entry = None
     _clear_degraded()
 
 

@@ -1,4 +1,5 @@
 import os
+import types
 import pytest
 
 import claude_unlimited.cli as cli
@@ -86,6 +87,16 @@ def code_env(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.updater, "ensure_cli_aliases", lambda *a, **kw: None)
     execs = []
     monkeypatch.setattr(cli.os, "execvp", lambda file, args: execs.append((file, args)))
+
+    def _run_tool(argv, **kw):
+        # Windows has no execvp: code() falls back to _run_tool as a child
+        # process (see cli.py's `if os.name == "nt"` branch). Stubbing only
+        # execvp above leaves that branch making a real subprocess launch of
+        # a fake path on Windows.
+        execs.append((cli._resolve_launcher(argv[0]), argv))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli, "_run_tool", _run_tool)
     monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
     monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
     return execs

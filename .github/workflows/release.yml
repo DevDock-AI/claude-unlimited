@@ -1,7 +1,7 @@
 name: Release
 
 # Tag-driven. Pushing a v* tag runs the suite, and only if it passes does a
-# GitHub Release get created — the updater resolves that release's tag to a
+# draft GitHub Release get created (published by scripts/publish_release.sh) — the updater resolves that release's tag to a
 # commit SHA and refuses to install anything whose contents disagree, so a
 # release must never be published from code that was not tested.
 on:
@@ -79,11 +79,18 @@ jobs:
             echo '```'
           } > release-notes.md
 
-      - name: Publish the release
+      # A DRAFT, not a published release. Releases in this repository are
+      # immutable once published: nothing can be attached afterwards. The
+      # macOS HUD is built on the maintainer's Mac (its shaders are not in this
+      # repository), so it is attached to the draft and the draft published by
+      # scripts/publish_release.sh. The updater only ever sees published
+      # releases, so nobody can update to one that is missing its HUD.
+      - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
+            --draft \
             --title "$GITHUB_REF_NAME" \
             --notes-file release-notes.md \
             --verify-tag

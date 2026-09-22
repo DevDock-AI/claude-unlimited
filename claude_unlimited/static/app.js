@@ -160,6 +160,17 @@ function applyTranslations() {
   document.querySelectorAll('[data-i18n-title]').forEach((el) => {
     el.title = t(el.dataset.i18nTitle);
   });
+  document.querySelectorAll('[data-i18n-tooltip]').forEach((el) => {
+    el.dataset.tooltip = t(el.dataset.i18nTooltip);
+  });
+  // For controls whose only name IS the accessible name — a date field with
+  // no visible label, say. Re-applied on a language change like every other
+  // string, which an aria-label written once into the HTML would not be.
+  document.querySelectorAll('[data-i18n-aria-label]').forEach((el) => {
+    el.setAttribute('aria-label', t(el.dataset.i18nAriaLabel));
+  });
+  // Built in JS from a placeholder string, so data-i18n can't retranslate it.
+  renderParityBanner();
 }
 
 async function loadLocales() {
@@ -381,8 +392,17 @@ function _tooltipTarget(e) {
 }
 function _positionTooltip(target) {
   const rect = target.getBoundingClientRect();
-  _tooltipEl.style.left = `${rect.left + rect.width / 2}px`;
-  _tooltipEl.style.top = `${rect.top}px`;
+  const tip = _tooltipEl.getBoundingClientRect();
+  const margin = 8;
+  // Centred over the target, but never past either side of the viewport: the
+  // rail's buttons sit at the very left edge.
+  const half = tip.width / 2;
+  const x = Math.min(Math.max(rect.left + rect.width / 2, margin + half), window.innerWidth - margin - half);
+  _tooltipEl.style.left = `${x}px`;
+  // Above by default (the CSS transform lifts it); below when there is no room.
+  const below = rect.top - tip.height - 7 < margin;
+  _tooltipEl.style.transform = below ? 'translate(-50%, 7px)' : '';
+  _tooltipEl.style.top = `${below ? rect.bottom : rect.top}px`;
 }
 function wireDataTooltips() {
   _tooltipEl = document.createElement('div');
@@ -427,6 +447,206 @@ function wireCursorGlow() {
 
 // ---- toasts ----
 
+// ---- keyboard operability (UI-01) ----------------------------------------
+//
+// This dashboard is built almost entirely from clickable <div>s. They are
+// mouse-only by construction: no role, no tabindex, and Enter/Space do
+// nothing. Rewriting ~50 elements and their CSS would be a large diff with a
+// real chance of visual regression, so instead every interactive control is
+// given its semantics at runtime, in one place.
+//
+// It has to be an observer rather than a one-time pass: profile cards, table
+// rows and the notification list are re-rendered from JS (some every second),
+// so any attribute set once at load is gone on the next paint.
+const INTERACTIVE_SELECTOR = [
+  '.rail-item', '.btn', '.seg-btn', '.toggle', '.mini-chart-opt', '.mini-metric-opt',
+  '.copy-btn', '.kebab-btn', '.set-nav-item', '.toast-close',
+].join(',');
+
+// A toggle is a switch, not a button: a screen reader has to be able to say
+// whether it is on, which role="button" cannot express.
+const SWITCH_SELECTOR = '.toggle';
+
+function applyA11ySemantics(root) {
+  const scope = root && root.nodeType === 1 ? root : document;
+  const nodes = [];
+  if (scope.matches && scope.matches(INTERACTIVE_SELECTOR)) nodes.push(scope);
+  if (scope.querySelectorAll) nodes.push(...scope.querySelectorAll(INTERACTIVE_SELECTOR));
+  for (const el of nodes) {
+    const isSwitch = el.matches(SWITCH_SELECTOR);
+    if (isSwitch) {
+      // `.off` is how this codebase stores a toggle's state, so it is also
+      // the source of truth for aria-checked.
+      el.setAttribute('aria-checked', el.classList.contains('off') ? 'false' : 'true');
+    }
+    // A real <button> already has all of this; adding role/tabindex to one is
+    // noise at best and wrong at worst.
+    if (el.tagName === 'BUTTON') continue;
+    if (!el.hasAttribute('role')) el.setAttribute('role', isSwitch ? 'switch' : 'button');
+    if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '0');
+  }
+}
+
+// ---- accessible names for inputs (UI-03) ---------------------------------
+//
+// There is not a single <label> in this dashboard: every field is a
+// `.field-group` holding a `.field-label` div next to its input, which looks
+// right and says nothing to a screen reader. Rather than restructure the
+// markup, point each input at the label text that is already there.
+const LABELLABLE_SELECTOR = 'input:not([type=hidden]), select, textarea';
+
+function applyInputLabels(root) {
+  const scope = root && root.nodeType === 1 ? root : document;
+  const nodes = [];
+  if (scope.matches && scope.matches(LABELLABLE_SELECTOR)) nodes.push(scope);
+  if (scope.querySelectorAll) nodes.push(...scope.querySelectorAll(LABELLABLE_SELECTOR));
+  for (const el of nodes) {
+    // Anything that already has a name — a real <label>, an aria-label, or a
+    // previous pass — is left alone.
+    if (el.hasAttribute('aria-label') || el.hasAttribute('aria-labelledby')) continue;
+    if (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`)) continue;
+
+    const label = el.closest('.field-group, .field-row, .input-row')?.querySelector('.field-label, .field-title');
+    if (label) {
+      if (!label.id) label.id = `lbl-${Math.random().toString(36).slice(2, 9)}`;
+      el.setAttribute('aria-labelledby', label.id);
+      continue;
+    }
+    // No visible label anywhere: fall back to the placeholder or title, which
+    // at least names the field. A field with neither stays unnamed rather
+    // than getting an invented one.
+    const fallback = el.getAttribute('placeholder') || el.getAttribute('title');
+    if (fallback) el.setAttribute('aria-label', fallback);
+  }
+}
+
+// One delegated handler for the whole page: Enter and Space activate whatever
+// interactive control has focus, the way a real button would. Space is
+// preventDefault-ed because its default action is to scroll.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+  const el = e.target instanceof Element ? e.target.closest(INTERACTIVE_SELECTOR) : null;
+  if (!el || el.tagName === 'BUTTON') return;   // native buttons already do this
+  if (el.getAttribute('aria-disabled') === 'true') return;
+  e.preventDefault();
+  el.click();
+});
+
+// Re-apply to anything JS renders, and keep aria-checked in step with the
+// `.off` class that the toggles actually use.
+function startA11yObserver() {
+  applyA11ySemantics(document);
+  applyInputLabels(document);
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      if (record.type === 'attributes') {
+        applyA11ySemantics(record.target);
+        continue;
+      }
+      for (const node of record.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        applyA11ySemantics(node);
+        applyInputLabels(node);
+      }
+    }
+  });
+  observer.observe(document.body, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['class'],
+  });
+}
+
+// ---- dialog semantics and focus (UI-02) ----------------------------------
+//
+// Same approach as the interactive-control helper: the modals are plain divs
+// whose open state is a `.open` class on the scrim, so one observer can give
+// all of them dialog semantics and focus behaviour without touching the six
+// open/close functions individually.
+let _modalOpeners = new WeakMap();
+
+function labelModal(modal) {
+  if (modal.hasAttribute('role')) return;
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-modal', 'true');
+  // The dialog needs a name. Every modal here leads with a .modal-title, so
+  // point at it rather than duplicating the string into an aria-label that
+  // would then have to be translated separately.
+  const title = modal.querySelector('.modal-title');
+  if (title) {
+    if (!title.id) title.id = `modal-title-${Math.random().toString(36).slice(2, 9)}`;
+    modal.setAttribute('aria-labelledby', title.id);
+  }
+  // So focus can land on the dialog itself when there is nothing better.
+  if (!modal.hasAttribute('tabindex')) modal.setAttribute('tabindex', '-1');
+}
+
+function focusIntoModal(modal) {
+  // The observer fires the instant `.open` is added — before the browser has
+  // laid the now-visible dialog out, so every field still reports zero client
+  // rects and the "is it on screen" test says no. Wait for layout, or focus
+  // always falls back to the container.
+  requestAnimationFrame(() => requestAnimationFrame(() => focusIntoModalNow(modal)));
+}
+
+function focusIntoModalNow(modal) {
+  // A text field is the useful place to land in a form dialog. Anything else
+  // (a confirm dialog, say) gets the dialog container — deliberately NOT its
+  // first button, because on a destructive confirm that would put Enter one
+  // keystroke away from the thing the dialog exists to slow down.
+  // `input[type="text"]` is NOT enough: an <input> with no type attribute is a
+  // text field, and most of the fields in these dialogs are written that way.
+  // Select by exclusion instead, so a checkbox or a file picker is never the
+  // landing spot.
+  const fields = modal.querySelectorAll(
+    'textarea:not([disabled]), input:not([disabled]):not([type=checkbox]):not([type=radio])'
+    + ':not([type=file]):not([type=hidden]):not([type=button]):not([type=submit])');
+  // offsetParent is null for descendants of a position:fixed element, which
+  // every one of these modals is — it reported the visible name field as
+  // hidden. getClientRects() is the check that actually answers "is this on
+  // screen".
+  const field = [...fields].find((el) => el.getClientRects().length > 0);
+  const target = field || modal;
+  try { target.focus({ preventScroll: true }); } catch (e) { /* not focusable yet */ }
+}
+
+function startModalA11yObserver() {
+  const wire = (scrim) => {
+    const modal = scrim.querySelector('.modal');
+    if (modal) labelModal(modal);
+  };
+  document.querySelectorAll('.modal-scrim').forEach(wire);
+
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      const scrim = record.target;
+      if (!(scrim instanceof Element) || !scrim.classList.contains('modal-scrim')) continue;
+      const modal = scrim.querySelector('.modal');
+      if (!modal) continue;
+      const isOpen = scrim.classList.contains('open');
+      const wasOpen = scrim.dataset.a11yOpen === '1';
+      if (isOpen === wasOpen) continue;
+      scrim.dataset.a11yOpen = isOpen ? '1' : '0';
+      if (isOpen) {
+        labelModal(modal);
+        // Remember who opened it so focus can go back there on close — losing
+        // focus to <body> is what makes a keyboard user restart from the top
+        // of the page every time they dismiss a dialog.
+        _modalOpeners.set(scrim, document.activeElement);
+        focusIntoModal(modal);
+      } else {
+        const opener = _modalOpeners.get(scrim);
+        _modalOpeners.delete(scrim);
+        if (opener && document.contains(opener)) {
+          try { opener.focus({ preventScroll: true }); } catch (e) { /* gone */ }
+        }
+      }
+    }
+  });
+  document.querySelectorAll('.modal-scrim').forEach((scrim) => {
+    scrim.dataset.a11yOpen = scrim.classList.contains('open') ? '1' : '0';
+    observer.observe(scrim, { attributes: true, attributeFilter: ['class'] });
+  });
+}
+
 const TOAST_ICONS = {
   info: { icon: '<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/>', color: 'var(--accent)', bg: 'var(--accent-soft)' },
   success: { icon: '<path d="M20 6 9 17l-5-5"/>', color: 'var(--good)', bg: 'var(--good-soft)' },
@@ -434,10 +654,20 @@ const TOAST_ICONS = {
   error: { icon: '<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/>', color: 'var(--bad)', bg: 'var(--bad-soft)' },
 };
 
+// At most this many toasts on screen at once. Without a cap a burst (every
+// profile failing a probe, say) stacks off the top of the window and buries
+// the newest message, which is the one that matters.
+const MAX_TOASTS = 4;
+
 function showToast(type, title, sub, { duration } = { duration: 5000 }) {
   const container = document.getElementById('toastContainer');
   if (!container) return;
   const spec = TOAST_ICONS[type] || TOAST_ICONS.info;
+  // An error interrupts; everything else waits its turn. A single container
+  // cannot be both, so the politeness is set per message, before the node is
+  // appended — changing it afterwards does not re-announce.
+  container.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
+
   const el = document.createElement('div');
   el.className = 'toast';
   el.innerHTML = `
@@ -448,14 +678,30 @@ function showToast(type, title, sub, { duration } = { duration: 5000 }) {
       <div class="toast-title">${esc(title)}</div>
       ${sub ? `<div class="toast-sub">${esc(sub)}</div>` : ''}
     </div>
+    <button type="button" class="toast-close" aria-label="${esc(t('toast.dismiss'))}">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
   `;
+
+  let timer = null;
   const dismiss = () => {
+    if (timer) clearTimeout(timer);
     el.classList.add('leaving');
     setTimeout(() => el.remove(), 240);
   };
+  const startTimer = () => { timer = setTimeout(dismiss, duration); };
+  // Reading a toast should not race its own expiry — hovering or focusing it
+  // holds it open, and moving away starts the clock again.
+  el.addEventListener('mouseenter', () => { if (timer) clearTimeout(timer); });
+  el.addEventListener('mouseleave', startTimer);
+  el.addEventListener('focusin', () => { if (timer) clearTimeout(timer); });
+  el.addEventListener('focusout', startTimer);
   el.addEventListener('click', dismiss);
+
   container.appendChild(el);
-  setTimeout(dismiss, duration);
+  // Oldest first: the newest message is the one the user is waiting for.
+  while (container.children.length > MAX_TOASTS) container.firstElementChild.remove();
+  startTimer();
 }
 
 // ---- connection-lost banner ----
@@ -548,11 +794,371 @@ async function reloadWhenRestarted() {
 function refreshCurrentView() {
   const activeItem = document.querySelector('.rail-item.active');
   const view = activeItem ? activeItem.dataset.view : 'overview';
+  window.scrollTo(0, 0);   // a new view starts at its top, not where the last one was
   if (view === 'overview') { loadStatus().then(() => loadProfiles()); loadProjectUsage(); loadUsageSummary(); loadActivityPreview(); }
   if (view === 'profiles') loadProfilesTable();
   if (view === 'activity') loadActivity();
   if (view === 'settings') loadSettings();
 }
+
+// ---- statistics ----
+
+let _statsRange = '1m';
+
+// One colour per series, taken from the theme tokens rather than invented:
+// codex teal for the Codex lineup, accent cyan for Claude, warn/bad for the
+// tiers worth noticing. Identity never comes from colour alone — every row
+// carries its own label.
+const STATS_SERIES = ['var(--codex)', 'var(--accent)', 'var(--warn)', 'var(--bad)', 'var(--good)', 'var(--chip-off)'];
+
+function statsMoney(n) {
+  if (n === null || n === undefined) return '—';
+  return n < 1 && n > 0 ? `$${n.toFixed(3)}` : `$${n.toFixed(2)}`;
+}
+
+function renderStatsRank(rows, { valueOf, metaOf }) {
+  if (!rows || !rows.length) return `<div class="stats-empty">${esc(t('stats.no_data'))}</div>`;
+  const max = Math.max(...rows.map((r) => r.cost_usd || 0), 0.0001);
+  return `<div class="stats-rank">${rows.map((r, i) => {
+    const label = r.other ? t('stats.other') : (r.label || r.key || t('stats.unattributed'));
+    return `<div class="stats-r">
+      <div class="top"><b>${esc(label)}</b><span>${esc(valueOf(r))}</span></div>
+      <div class="track"><i style="width:${Math.max((r.cost_usd || 0) / max * 100, 1.5)}%;background:${STATS_SERIES[Math.min(i, STATS_SERIES.length - 1)]}"></i></div>
+      ${metaOf ? `<div class="top" style="margin:5px 0 0"><span>${esc(metaOf(r))}</span></div>` : ''}
+    </div>`;
+  }).join('')}</div>`;
+}
+
+// One colour per provider kind, from the theme tokens — the same mapping the
+// dock uses, so a Codex line is teal in both places.
+const STATS_KIND_COLOR = { codex: 'var(--codex)', oauth: 'var(--accent)', api: 'var(--text-dim)', other: 'var(--warn)' };
+
+// The chart is drawn by a small vendored chart library (served from /vendor). Hand-rolled
+// SVG got us a shape but no cursor, no hit-testing and no per-point readout;
+// The library gives all three and stays ~50KB.
+let _statsPlot = null;
+let _statsPlotTeardown = null;
+
+/// ECO savings. Bytes are ground truth; tokens are calibrated per request and
+/// cost is an estimate OF that estimate, so both are marked approximate.
+/// Calls per day as a weekday x week grid. Five levels, quantised against the
+/// busiest day so the scale always uses its full range.
+function renderActivityHeatmap(days) {
+  if (!days || !days.length) return '';
+  const max = Math.max(...days.map((d) => d.requests || 0), 0);
+  if (!max) return '';
+
+  // Pad to a whole first week so every column is a real Mon-Sun.
+  const first = new Date(days[0].date + 'T00:00:00');
+  const lead = (first.getDay() + 6) % 7;            // Monday-first
+  const cells = Array(lead).fill(null).concat(days);
+
+  const weeks = Math.ceil(cells.length / 7);
+  const rows = [];
+  for (let dow = 0; dow < 7; dow++) {
+    const label = dow % 2 === 0
+      ? new Date(2024, 0, 1 + dow).toLocaleDateString(undefined, { weekday: 'short' })
+      : '';
+    let row = `<div class="heat-lab">${esc(label)}</div>`;
+    for (let w = 0; w < weeks; w++) {
+      const cell = cells[w * 7 + dow];
+      if (cell === undefined || cell === null) { row += '<i class="l0"></i>'; continue; }
+      const n = cell.requests || 0;
+      const level = n === 0 ? 0 : Math.min(4, Math.ceil((n / max) * 4));
+      const when = new Date(cell.date + 'T00:00:00')
+        .toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+      row += `<i class="l${level}" data-tooltip="${esc(when)} · ${n}"></i>`;
+    }
+    rows.push(row);
+  }
+  return `<div class="panel" style="margin-top:10px">
+    <div class="panel-title">${esc(t('stats.activity.title'))}<em>${esc(t('stats.activity.sub'))}</em></div>
+    <div class="heat-cal" style="grid-template-columns:28px repeat(${weeks}, minmax(6px, 18px))">${rows.join('')}</div>
+    <div class="heat-scale"><span>${esc(t('stats.activity.less'))}</span>
+      <i class="l0"></i><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i>
+      <span>${esc(t('stats.activity.more'))}</span></div>
+  </div>`;
+}
+
+function renderEcoPanel(eco) {
+  if (!eco) return '';
+  const title = esc(t('stats.eco.title'));
+  if (!eco.requests) {
+    // Distinguish "never ran" from "ran and found nothing" — they mean very
+    // different things to someone deciding whether to switch it on.
+    const off = !eco.modes || !Object.keys(eco.modes).length;
+    return `<div class="panel" style="margin-top:10px">
+      <div class="panel-title">${title}</div>
+      <div class="stats-empty">
+        <b>${esc(t(off ? 'stats.eco.never' : 'stats.eco.none'))}</b><br>
+        ${esc(t(off ? 'stats.eco.never_sub' : 'stats.eco.none_sub'))}
+      </div></div>`;
+  }
+  const cost = eco.cost_usd === null || eco.cost_usd === undefined
+    ? `<span class="stats-eco-note">${esc(t('stats.eco.unpriced'))}</span>`
+    : `<div class="stats-money">≈${esc(statsMoney(eco.cost_usd))}</div>`;
+  return `<div class="panel" style="margin-top:10px">
+    <div class="panel-title">${title}<em>${esc(t('stats.eco.approx'))}</em></div>
+    <div class="stats-eco">
+      <div>${cost}
+        <div class="stats-money-sub">≈${esc(formatTokenCount(eco.tokens || 0))} ${esc(t('stats.eco.tokens'))}</div>
+      </div>
+      <div class="stats-eco-side">
+        <div><b>${esc(formatBytes(eco.bytes || 0))}</b></div>
+        <div>${eco.requests} ${esc(t('stats.eco.requests'))}</div>
+        <div>${Object.keys(eco.modes || {}).map(esc).join(' · ')}</div>
+      </div>
+    </div></div>`;
+}
+
+/// Primitive speech: real output tokens per reply, by level, beside the replies
+/// written without it. Deliberately labelled rough — different requests.
+function renderSpeechPanel(speech) {
+  if (!speech) return '';
+  const title = esc(t('stats.speech.title'));
+  const levels = Object.entries(speech.levels || {});
+  if (!levels.length) {
+    return `<div class="panel" style="margin-top:10px">
+      <div class="panel-title">${title}</div>
+      <div class="stats-empty"><b>${esc(t('stats.speech.never'))}</b><br>${esc(t('stats.speech.never_sub'))}</div></div>`;
+  }
+  const row = (label, s) => `<div class="stats-speech-row"><span>${esc(label)}</span>
+      <span class="mono-num">${esc(formatTokenCount(s.avg_output_tokens))}</span>
+      <span class="stats-eco-note">${esc(t('stats.speech.replies').replace('{n}', String(s.requests)))}</span></div>`;
+  return `<div class="panel" style="margin-top:10px">
+    <div class="panel-title">${title}<em>${esc(t('stats.speech.sub'))}</em></div>
+    <div class="stats-speech">
+      ${levels.map(([level, s]) => row(t(`settings.speech.${level}`), s)).join('')}
+      ${row(t('stats.speech.without'), speech.without || { requests: 0, avg_output_tokens: 0 })}
+      <div class="stats-eco-note">${esc(t('stats.speech.rough'))}</div>
+    </div></div>`;
+}
+
+/// Bytes are exact, so show them as bytes — not rounded into a token guess.
+function formatBytes(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KB';
+  return n + ' B';
+}
+
+function statsAxisLabel(iso, granularity) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  if (granularity === 'hour') return `${String(d.getHours()).padStart(2, '0')}:00`;
+  if (granularity === 'month') return d.toLocaleDateString(undefined, { month: 'short' });
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+}
+
+function statsCssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
+}
+
+/// Resolves a series colour to a real value: the chart library paints to canvas, where a
+/// CSS var() string means nothing.
+/// "oauth" is our internal kind, not a product. Users see Claude / Codex / API.
+function kindLabel(kind) {
+  const names = { oauth: 'Claude', codex: 'Codex', api: 'API', other: 'Other' };
+  return names[kind] || (kind ? kind.charAt(0).toUpperCase() + kind.slice(1) : '');
+}
+
+function statsKindColor(kind) {
+  const map = { codex: '--codex', oauth: '--accent', api: '--text-dim' };
+  return statsCssVar(map[kind] || '--warn');
+}
+
+function statsDestroyPlot() {
+  if (_statsPlotTeardown) { _statsPlotTeardown(); _statsPlotTeardown = null; }
+  if (_statsPlot) { _statsPlot.destroy(); _statsPlot = null; }
+}
+
+/// Builds the chart into `host`. Called after the panel is in the DOM,
+/// because the chart library measures its container to size the canvas.
+function mountStatsChart(host, buckets, series, granularity) {
+  if (!host || !window.uPlot || !buckets || !buckets.length) return;
+
+  const labels = buckets.map((b) => statsAxisLabel(b.date || b.label, granularity));
+  const xs = buckets.map((_, i) => i);
+  const lines = (series && series.length)
+    ? series
+    : [{ kind: 'total', points: buckets.map((b) => b.cost_usd || 0) }];
+
+  const data = [xs, ...lines.map((s) => s.points.map((v) => v || 0))];
+  const tip = document.createElement('div');
+  tip.className = 'stats-tip';
+  host.appendChild(tip);
+
+  const opts = {
+    width: host.clientWidth || 600,
+    height: 180,
+    padding: [10, 6, 0, 6],
+    legend: { show: false },
+    cursor: { y: false, points: { size: 7 } },
+    scales: { x: { time: false } },
+    axes: [
+      { stroke: statsCssVar('--text-faint'), grid: { show: false }, ticks: { show: false },
+        values: (u, splits) => splits.map((i) => labels[i] || ''), size: 26,
+        space: 70, incrs: [1, 2, 3, 6, 12, 24, 48] },
+      { stroke: statsCssVar('--text-faint'),
+        grid: { stroke: statsCssVar('--border-soft'), width: 1 },
+        ticks: { show: false }, size: 46,
+        values: (u, splits) => splits.map((v) => statsMoney(v)) },
+    ],
+    series: [
+      {},
+      ...lines.map((s) => ({
+        label: s.kind,
+        stroke: statsKindColor(s.kind),
+        width: 2,
+        // A soft fill under the first series only — stacking fills would
+        // misread as cumulative totals.
+        fill: lines.length === 1 ? statsCssVar('--accent-soft') : undefined,
+        points: { show: false },
+      })),
+    ],
+    hooks: {
+      setCursor: [(u) => {
+        const i = u.cursor.idx;
+        if (i === null || i === undefined) { tip.classList.remove('on'); return; }
+        const rows = lines.map((s, n) => {
+          const v = u.data[n + 1][i];
+          return `<div class="row"><i style="background:${statsKindColor(s.kind)}"></i>${esc(kindLabel(s.kind))} <b>${esc(statsMoney(v || 0))}</b></div>`;
+        }).join('');
+        const total = lines.reduce((sum, _, n) => sum + (u.data[n + 1][i] || 0), 0);
+        tip.innerHTML = `<div><b>${esc(labels[i] || '')}</b></div>${rows}` +
+          (lines.length > 1 ? `<div class="row" style="opacity:.75">total <b>${esc(statsMoney(total))}</b></div>` : '');
+        const yTop = u.valToPos(u.data[1][i] || 0, 'y');
+        tip.style.left = `${u.valToPos(i, 'x')}px`;
+        // A null point yields NaN, which parks the tooltip in the corner.
+        tip.style.top = `${Number.isFinite(yTop) ? yTop : 0}px`;
+        tip.classList.add('on');
+      }],
+    },
+  };
+
+  _statsPlot = new uPlot(opts, data, host);
+
+  // The library's own legend is off (it renders a table); this is the dashboard's.
+  const legend = document.createElement('div');
+  legend.className = 'stats-legend';
+  legend.innerHTML = lines.map((s) =>
+    `<b><i style="background:${statsKindColor(s.kind)}"></i>${esc(kindLabel(s.kind))}</b>`).join('');
+  host.appendChild(legend);
+
+  // The library leaves cursor.idx at the last point when the pointer exits, so the
+  // readout would stay pinned on screen forever without this.
+  const onLeave = () => tip.classList.remove('on');
+  _statsPlot.over.addEventListener('mouseleave', onLeave);
+
+  // Follow the panel's width; the library sizes its canvas in pixels.
+  const onResize = () => _statsPlot && _statsPlot.setSize({ width: host.clientWidth || 600, height: 180 });
+  window.addEventListener('resize', onResize);
+  _statsPlotTeardown = () => {
+    window.removeEventListener('resize', onResize);
+    if (_statsPlot) _statsPlot.over.removeEventListener('mouseleave', onLeave);
+  };
+}
+
+let _statsFingerprint = null;
+let _statsLastPoll = 0;
+const STATS_POLL_MS = 10000;
+// The overview's usage card, for the same reason (see pollLiveUpdate).
+let _summaryLastPoll = 0;
+const SUMMARY_POLL_MS = 5000;
+
+async function loadStats() {
+  const el = document.getElementById('statsBody');
+  if (!el) return;
+  let data;
+  try {
+    data = await api(`/api/usage/stats?range=${encodeURIComponent(_statsRange)}`);
+  } catch (e) {
+    return;
+  }
+  // pollLiveUpdate calls this every second. Rebuilding the chart that often
+  // destroys the canvas under the pointer — the cursor freezes and the
+  // readout sticks. Only re-render when the payload actually changed.
+  const fingerprint = JSON.stringify([
+    _statsRange, data.totals, (data.buckets || []).map((b) => [b.date || b.label, b.cost_usd]),
+    (data.series || []).map((s) => [s.kind, s.points]),
+  ]);
+  if (fingerprint === _statsFingerprint && _statsPlot) return;
+  _statsFingerprint = fingerprint;
+  statsDestroyPlot();
+
+  const tt = data.totals || {};
+  const cacheHit = tt.cache_hit_percent === null || tt.cache_hit_percent === undefined
+    ? '—' : `${tt.cache_hit_percent}%`;
+  const peak = Math.max(...(data.buckets || []).map((b) => b.cost_usd || 0), 0);
+  const began = data.history_begins ? new Date(data.history_begins).toLocaleDateString() : null;
+
+  setLiveHtml(el, `
+    <div class="stats-hero">
+      <div class="panel">
+        <div class="panel-title">${esc(t('stats.total'))}</div>
+        <div class="stats-money">${esc(statsMoney(tt.cost_usd))}</div>
+        <div class="stats-money-sub">${esc(formatTokenCount(tt.tokens || 0))} ${esc(t('stats.tokens_word'))} · ${tt.requests || 0} ${esc(t('stats.requests_word'))}</div>
+        <div class="stats-kvs">
+          <div class="stats-kv"><span>${esc(t('stats.tokens_in'))}</span><b>${esc(formatTokenCount(tt.tokens_in || 0))}</b></div>
+          <div class="stats-kv"><span>${esc(t('stats.tokens_out'))}</span><b>${esc(formatTokenCount(tt.tokens_out || 0))}</b></div>
+          <div class="stats-kv"><span>${esc(t('stats.cache_read'))}</span><b>${esc(formatTokenCount(tt.cache_read || 0))}</b></div>
+          <div class="stats-kv"><span>${esc(t('stats.cache_hit'))}</span><b>${esc(cacheHit)}</b></div>
+          ${tt.uncosted_events ? `<div class="stats-kv"><span>${esc(t('stats.unpriced'))}</span><b>${tt.uncosted_events}</b></div>` : ''}
+        </div>
+        <div class="stats-note">${esc(t('stats.list_rates'))}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">${esc(t('stats.daily_cost'))}<em>${peak ? esc(t('stats.peak')) + " " + esc(statsMoney(peak)) : ""}</em></div>
+        <div class="stats-line" id="statsChart"></div>
+      </div>
+    </div>
+
+    <div class="stats-cols" style="margin-top:10px">
+      <div class="panel">
+        <div class="panel-title">${esc(t('stats.by_model'))}</div>
+        ${renderStatsRank(data.by_model, { valueOf: (r) => `${statsMoney(r.cost_usd)} · ${r.share}%`,
+                                           metaOf: (r) => `${formatTokenCount(r.tokens)} · ${r.requests}` })}
+      </div>
+      <div class="panel">
+        <div class="panel-title">${esc(t('stats.by_project'))}</div>
+        ${renderStatsRank(data.by_project, { valueOf: (r) => `${statsMoney(r.cost_usd)} · ${r.share}%`,
+                                             metaOf: (r) => `${r.requests} ${t('stats.requests_word')}` })}
+      </div>
+      <div class="panel">
+        <div class="panel-title">${esc(t('stats.by_account'))}</div>
+        ${renderStatsRank(data.by_profile, { valueOf: (r) => `${statsMoney(r.cost_usd)} · ${r.share}%`,
+                                             metaOf: (r) => r.kind || '' })}
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:10px">
+      <div class="panel-title">${esc(t('stats.asked_for'))}</div>
+      ${renderStatsRank(data.by_requested_model, { valueOf: (r) => `${statsMoney(r.cost_usd)} · ${r.requests}` })}
+    </div>
+
+    <div class="stats-cols stats-trio">
+      ${renderActivityHeatmap(data.days)}
+      ${renderEcoPanel(data.eco)}
+      ${renderSpeechPanel(data.speech)}
+    </div>
+
+    ${began ? `<div class="stats-empty" style="padding:14px 0 0">${esc(t('stats.history_begins'))} ${esc(began)}</div>` : ''}
+  `);
+
+  // After setLiveHtml: the library measures its container, so the host has to
+  // be in the DOM and laid out before the chart is built.
+  mountStatsChart(document.getElementById('statsChart'), data.buckets, data.series, data.granularity);
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('#statsRangeRow .seg-btn');
+  if (!btn) return;
+  _statsRange = btn.dataset.range;
+  _statsFingerprint = null;
+  _statsLastPoll = 0;
+  document.querySelectorAll('#statsRangeRow .seg-btn').forEach((b) => b.classList.toggle('on', b === btn));
+  loadStats();
+});
 
 // ---- status / stat strip ----
 
@@ -666,6 +1272,17 @@ const SUBAGENT_TAG_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentC
 function subagentTag(p) {
   if (!p.forced_for_subagents) return '';
   return `<span class="subagent-tag" title="${esc(t('profiles.forced_subagents_tag_title'))}">${SUBAGENT_TAG_ICON}<span>${esc(t('profiles.forced_subagents_tag'))}</span></span>`;
+}
+// The "Leaves on Fable limit" marker: this Profile's own switch is on, so a
+// session on it moves elsewhere the moment its Fable week is spent. Same
+// shape as the subagent tag, for the same reason — a routing rule that could
+// move a session must never be invisible. The pool-wide override is not
+// reflected here: it is a Settings toggle, and this tag shows the Profile's
+// own configuration.
+const FABLE_TAG_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+function fableLeaveTag(p) {
+  if (!p.leave_on_fable_limit || p.kind === 'api') return '';
+  return `<span class="subagent-tag" title="${esc(t('profiles.leave_fable_tag_title'))}">${FABLE_TAG_ICON}<span>${esc(t('profiles.leave_fable_tag'))}</span></span>`;
 }
 
 // How many Claude Code agents (main agents and subagents) are pinned to this
@@ -817,6 +1434,56 @@ function renderUsageBar(label, pct, has, threshold, color) {
     </div>`;
 }
 
+// Per-model weekly windows ("Fable weekly"), from the background usage reads —
+// the same numbers Claude Code's /usage prints. Information only: rotation
+// does not switch accounts on them yet, which the detail modal says.
+function modelUsageBars(p) {
+  return (p.model_usage || []).map((w) =>
+    renderUsageBar(t('profile.model_window').replace('{model}', w.name), w.percent, true, null,
+      weeklyBarColor(p.status_word, w.percent))).join('');
+}
+
+// Shown only while requests are actually being charged to prepaid credits
+// (see router.spending_on_credits): the plan window is spent and the user
+// has allowed the account to keep going on money. Never silent — this is the
+// one state in the pool that costs per request.
+function creditsPill(p) {
+  if (!p.spending_on_credits) return '';
+  const label = t('profile.on_credits');
+  const balance = typeof p.credits_balance === 'number'
+    ? ` · ${formatCredits(p.credits_balance)}` : '';
+  return `<span class="credits-pill" title="${esc(t('profile.on_credits_note'))}">${esc(label)}${esc(balance)}</span>`;
+}
+
+// The detail modal shows the balance whether or not it is being spent: the
+// question "why is this account idle when I paid for credits?" is the one
+// issue #6 opened with, and it is unanswerable from a pill that only appears
+// once spending has already started.
+function creditsDetailLine(p) {
+  if (p.credits_has === null || p.credits_has === undefined) return '';
+  const amount = typeof p.credits_balance === 'number' ? formatCredits(p.credits_balance) : null;
+  let text;
+  if (!p.credits_has) text = t('profile.credits_none');
+  else if (p.spending_on_credits) text = t('profile.credits_spending').replace('{balance}', amount || '—');
+  else if (amount) text = t('profile.credits_available').replace('{balance}', amount);
+  else text = t('profile.credits_available_unknown');
+  return `<div class="field-sub">${esc(text)}</div>`;
+}
+
+// A credit balance is a currency figure from the provider, not our own
+// costing — two decimals, no rounding into "$13".
+function formatCredits(balance) {
+  return `$${balance.toFixed(2)}`;
+}
+
+// The table row has no spare bar column, so the same numbers ride as chips
+// under the account name.
+function modelUsageChips(p) {
+  const chips = (p.model_usage || []).map((w) =>
+    `<span class="model-usage-chip" title="${esc(t('profile.model_window_note'))}" style="color:${weeklyBarColor(p.status_word, w.percent)}">${esc(t('profile.model_window').replace('{model}', w.name))} ${w.percent}%</span>`).join('');
+  return chips ? `<div class="model-usage-line">${chips}</div>` : '';
+}
+
 // API-kind Profile analogue of renderUsageBar — an absolute token count
 // against a token_threshold budget instead of a percentage against a
 // switch_threshold. The budget IS the full width of the bar (no separate
@@ -904,7 +1571,7 @@ function renderProfileCard(p) {
       </div>`;
   // codex uses switch_threshold like oauth (its backend returns
   // percentage-based quota headers); only api kind gets the token budget.
-  const usageBlock = p.kind !== 'api' ? `${bar5h}${bar7d}` : `
+  const usageBlock = p.kind !== 'api' ? `${bar5h}${bar7d}${modelUsageBars(p)}` : `
     ${tokensRow}
     <div class="bar-group">
       <div class="bar-label-row"><span>${esc(t('profile.cost_estimated'))}</span><span class="mono-num">${p.cost_usd_total !== null ? '$' + p.cost_usd_total.toFixed(2) : '—'}</span></div>
@@ -921,8 +1588,9 @@ function renderProfileCard(p) {
       <div class="p-top">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
-        ${planBadge(p)}${subagentTag(p)}${liveAgentsPill(p)}
+        ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}
         ${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}
+        ${creditsPill(p)}
         ${kindLabel ? `<span class="p-kind">${kindLabel}</span>` : ''}
         <span class="p-priority" title="${esc(t('profiles.priority_tooltip'))}">
           <svg class="p-priority-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 20V14M12 20V8M18 20V4"/></svg>
@@ -974,6 +1642,7 @@ async function loadProfiles() {
   try {
     const { profiles } = await api('/api/profiles');
     _lastProfiles = profiles;
+    refreshCodexCreditsVisibility();
     renderStatStrip(profiles);
     if (!profiles.length) {
       setLiveHtml(el, `<div class="empty">${esc(t('empty.no_profiles_hint'))}</div>`);
@@ -1060,8 +1729,8 @@ function renderProfileTableRow(p) {
       <div class="row-name-cell">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
-          <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}</div>
-          <div class="p-kind">${kindLabel}</div>
+          <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}</div>
+          <div class="p-kind">${kindLabel}</div>${modelUsageChips(p)}
         </div>
       </div>
       ${usageCells}
@@ -1501,13 +2170,20 @@ function openProfileDetailModal(profileId) {
     document.getElementById('pd_bars').innerHTML =
       barGroup(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, true) +
       (has7d ? barGroup(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, false) : '') +
-      `<div class="field-sub">${resetIn ? `${t('profile.resets_in')} ${resetIn}` : t('profiles.no_reset_data')}</div>`;
+      modelUsageBars(p) +
+      `<div class="field-sub">${resetIn ? `${t('profile.resets_in')} ${resetIn}` : t('profiles.no_reset_data')}</div>` +
+      ((p.model_usage || []).length ? `<div class="field-sub">${esc(t('profile.model_window_note'))}</div>` : '') +
+      creditsDetailLine(p);
     document.getElementById('pd_threshold_val').textContent = String(p.switch_threshold);
   }
 
   document.getElementById('pd_priority_val').textContent = String(p.priority);
   document.getElementById('pd_automatic_toggle').classList.toggle('off', !p.automatic);
   setForcedSubagentsToggle('pd', !!p.forced_for_subagents);
+  // An API key never reports a Fable limit, so the switch is meaningless
+  // there and hidden; the value still round-trips untouched.
+  document.getElementById('pd_leave_fable_row').style.display = isApi ? 'none' : '';
+  document.getElementById('pd_leave_fable_toggle').classList.toggle('off', !p.leave_on_fable_limit);
   document.getElementById('pd_automatic_sub').textContent = p.automatic ? t('profiles.automatic_on_sub') : t('profiles.automatic_off_sub');
   _pdSelectedTagColor = p.tag_color || null;
   renderDetailTagRow();
@@ -1537,6 +2213,7 @@ async function saveProfileDetail() {
     priority: Number(document.getElementById('pd_priority_val').textContent),
     automatic: !document.getElementById('pd_automatic_toggle').classList.contains('off'),
     forced_for_subagents: !document.getElementById('pd_forced_subagents_toggle').classList.contains('off'),
+    leave_on_fable_limit: !document.getElementById('pd_leave_fable_toggle').classList.contains('off'),
     tag_color: _pdSelectedTagColor,
   };
   if (isApi) {
@@ -2305,7 +2982,7 @@ async function runUpdateInstall() {
       _updateModalPhase('result', {
         title: t('modal.update.installed'), sub: t('modal.update.installed_sub'),
       });
-      showToast('ok', t('toast.update_installed'), t('toast.update_installed_sub'));
+      showToast('success', t('toast.update_installed'), t('toast.update_installed_sub'));
       // The daemon restarts itself now, so the page waits for the new one to
       // answer before reloading — asking too early either fails or reports the
       // version that is on its way out.
@@ -2360,19 +3037,57 @@ function wireUpdateButtons() {
   document.getElementById('updateModalInstallBtn').addEventListener('click', runUpdateInstall);
 }
 
+// UI-04: the settings page cannot show HTML defaults as if they were the
+// daemon's. On a failed read it says so and disables the controls, so nothing
+// can be toggled from a state nobody verified.
+function setSettingsLoadFailed(error) {
+  const banner = document.getElementById('settingsLoadError');
+  const body = document.getElementById('view-settings');
+  if (banner) {
+    banner.style.display = error ? '' : 'none';
+    const detail = banner.querySelector('.settings-error-detail');
+    if (detail) detail.textContent = error ? (error.message || String(error)) : '';
+  }
+  if (body) body.classList.toggle('settings-unreadable', Boolean(error));
+}
+
 async function loadSettings() {
   try {
-    const { settings } = await api('/api/settings');
+    const payload = await api('/api/settings');
+    const settings = payload.settings;
     document.getElementById('updateModeSelect').dataset.value = settings.update_mode;
     document.getElementById('updateModeSelect')._cuOptions = UPDATE_MODE_OPTIONS();
     document.getElementById('updateModeSelect')._cuRenderValue();
     setToggleState(document.getElementById('notifMasterToggle'), settings.notifications_enabled);
     setToggleState(document.getElementById('distributeDefaultToggle'), settings.distribute_sessions_default);
     setToggleState(document.getElementById('usageFreshToggle'), settings.keep_usage_fresh);
+    setToggleState(document.getElementById('codexSpendCreditsToggle'), settings.codex_spend_credits);
+    setToggleState(document.getElementById('returnPreferredToggle'), settings.return_to_preferred);
+    setToggleState(document.getElementById('fableLimitAllToggle'), settings.fable_limit_all_profiles);
+    refreshCodexCreditsVisibility();
     renderNotifList(settings);
+    const context1m = settings.context_1m || 'auto';
+    document.querySelectorAll('#context1mRow .seg-btn').forEach((b) => {
+      b.classList.toggle('on', b.dataset.context1m === context1m);
+    });
+    renderContext1mVerdict(payload.context_1m_preview);
+    const ecoTier = settings.eco_tier || 'off';
+    document.querySelectorAll('#ecoTierRow .seg-btn').forEach((b) => {
+      b.classList.toggle('on', b.dataset.eco === ecoTier);
+    });
+    const speechLevel = settings.speech_level || 'off';
+    document.querySelectorAll('#speechLevelRow .seg-btn').forEach((b) => {
+      b.classList.toggle('on', b.dataset.speech === speechLevel);
+    });
     refreshUpdateState();
+    setSettingsLoadFailed(null);
   } catch (e) {
-    // leave defaults if this fails
+    // NOT "leave the defaults" (UI-04). Every control on this page is written
+    // into the HTML with a default already selected, so swallowing a failed
+    // read leaves the page confidently displaying settings that were never
+    // read from the daemon — and the first click then PATCHes a value the user
+    // never chose. Say the read failed, and offer to try again.
+    setSettingsLoadFailed(e);
   }
   await loadDaemonServiceStatus();
   await loadProcessStats();
@@ -2433,25 +3148,130 @@ function renderNotifList(settings) {
     toggle.addEventListener('click', async () => {
       const field = toggle.dataset.field;
       const next = toggle.classList.contains('off');
-      await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ [field]: next }) });
+      try {
+        await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ [field]: next }) });
+      } catch (err) {
+        // Leave the row exactly as it was and say so, rather than throwing
+        // into nothing and letting the click look like it did something.
+        showToast('error', t('toast.settings_save_failed'), err.message);
+        return;
+      }
       _lastSettings[field] = next;
       toggle.classList.toggle('off', !next);
     });
   });
 }
 
+// One save path for every plain settings toggle (UI-07).
+//
+// These used to `await` the PATCH bare: a rejected save produced an unhandled
+// promise rejection and NO sign at all that the setting had not been stored —
+// the user saw the knob not move and had nothing to tell them why. The flip is
+// applied only after the server confirms, so there is never a moment where the
+// UI claims a setting the daemon does not have.
+async function patchSettingToggle(el, field, next) {
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ [field]: next }) });
+    setToggleState(el, next);
+    return true;
+  } catch (err) {
+    showToast('error', t('toast.settings_save_failed'), err.message);
+    return false;
+  }
+}
+
 async function toggleNotificationsMaster() {
   const el = document.getElementById('notifMasterToggle');
-  const next = el.classList.contains('off');
-  await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ notifications_enabled: next }) });
-  setToggleState(el, next);
+  await patchSettingToggle(el, 'notifications_enabled', el.classList.contains('off'));
+}
+
+// Only an account that can report a credit balance has anything to spend, so
+// a pool with no ChatGPT account never sees this setting.
+//
+// Called from BOTH the settings load and the profiles load, because neither
+// can assume the other ran first: opening /settings directly renders the page
+// before any profile has been fetched, and the section stayed hidden on an
+// account pool that has a Codex profile.
+async function refreshCodexCreditsVisibility() {
+  const section = document.getElementById('codexCreditsSection');
+  if (!section) return;
+  let profiles = _lastProfiles;
+  if (!profiles.length) {
+    // The Settings view does not load profiles, so opening /settings directly
+    // (or reloading on it) leaves this empty — ask for them rather than
+    // hiding a setting the user does have accounts for.
+    try {
+      profiles = (await api('/api/profiles')).profiles || [];
+    } catch (e) {
+      return;   // leave it as it is; the next poll or view change retries
+    }
+  }
+  section.style.display = profiles.some((p) => p.kind === 'codex') ? '' : 'none';
+}
+
+// What a session launched right now would actually get, and why. The decision
+// is made inside `cu code` in another process; the daemon runs the same pure
+// function over the same pool so this can be answered without launching.
+function renderContext1mVerdict(preview) {
+  const el = document.getElementById('context1mVerdict');
+  if (!el) return;
+  if (!preview) { el.style.display = 'none'; return; }
+  const key = `settings.context1m.verdict.${preview.reason}`;
+  const text = t(key);
+  el.style.display = '';
+  el.classList.toggle('is-on', preview.enabled === true);
+  el.classList.toggle('is-off', preview.enabled === false);
+  // An unrecognised reason must not render a raw i18n key at the user.
+  const lines = [text === key ? t('settings.context1m.verdict.unknown') : text];
+  // The capacity guard's numbers, one line per ChatGPT/Codex account in the
+  // route: the window it is held to, and whether that window is a known
+  // figure or an assumption for a GPT id the built-in table has not met.
+  const guardProfiles = (preview.guard && Array.isArray(preview.guard.profiles)) ? preview.guard.profiles : [];
+  guardProfiles.forEach((g) => {
+    const models = (g.models || []).join('/');
+    const budgetK = Math.floor((g.budget || 0) / 1000);
+    lines.push(t('settings.context1m.guard_line')
+      .replace('{name}', g.name || g.id || '')
+      .replace('{budget}', String(budgetK))
+      .replace('{models}', models));
+    if (g.assumed) {
+      lines.push(t('settings.context1m.guard_assumed')
+        .replace('{name}', g.name || g.id || '')
+        .replace('{models}', models));
+    }
+  });
+  // Morph in place: textContent per line, never innerHTML, and only the
+  // lines that changed are re-created.
+  el.replaceChildren(...lines.map((line) => {
+    const div = document.createElement('div');
+    div.textContent = line;
+    return div;
+  }));
+}
+
+async function toggleFableLimitAll() {
+  const el = document.getElementById('fableLimitAllToggle');
+  await patchSettingToggle(el, 'fable_limit_all_profiles', el.classList.contains('off'));
+}
+
+async function toggleReturnPreferred() {
+  const el = document.getElementById('returnPreferredToggle');
+  await patchSettingToggle(el, 'return_to_preferred', el.classList.contains('off'));
+}
+
+async function toggleCodexSpendCredits() {
+  const el = document.getElementById('codexSpendCreditsToggle');
+  const saved = await patchSettingToggle(el, 'codex_spend_credits', el.classList.contains('off'));
+  // The daemon re-derives each Codex account's state from this on its next
+  // sync; refresh so the card stops (or starts) saying "on credits" right
+  // away instead of at the next poll tick. Only on a save that landed — a
+  // refresh after a failed PATCH just re-renders the unchanged state.
+  if (saved) loadProfiles();
 }
 
 async function toggleUsageFresh() {
   const el = document.getElementById('usageFreshToggle');
-  const next = el.classList.contains('off');
-  await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ keep_usage_fresh: next }) });
-  setToggleState(el, next);
+  await patchSettingToggle(el, 'keep_usage_fresh', el.classList.contains('off'));
 }
 
 async function toggleDistributeDefault() {
@@ -2704,6 +3524,9 @@ function selectType(type) {
   // the Profiles table chip. codex uses switch_threshold like oauth.
   document.getElementById('f_threshold_wrap').style.display = type === 'api' ? 'none' : '';
   document.getElementById('f_token_threshold_wrap').style.display = type === 'api' ? '' : 'none';
+  // An API key reports no Fable limit, so "leave when it is spent" has
+  // nothing to act on there.
+  document.getElementById('f_leave_fable_wrap').style.display = type === 'api' ? 'none' : '';
   document.getElementById('saveBtn').style.display = (type === 'import' || type === 'oauth' || codexChatgpt) ? 'none' : '';
 }
 
@@ -2774,6 +3597,7 @@ function openModal() {
   renderAddProfileTagRow();
   document.getElementById('f_automatic_toggle').classList.remove('off');
   setForcedSubagentsToggle('f', false);
+  document.getElementById('f_leave_fable_toggle').classList.add('off');
   document.getElementById('advancedBody').classList.add('open');
   document.getElementById('advancedToggle').classList.add('open');
   document.getElementById('importStatus').style.display = 'none';
@@ -2800,6 +3624,7 @@ async function submitProfile() {
     priority: Number(document.getElementById('f_priority_val').textContent),
     automatic: !document.getElementById('f_automatic_toggle').classList.contains('off'),
     forced_for_subagents: !document.getElementById('f_forced_subagents_toggle').classList.contains('off'),
+    leave_on_fable_limit: !document.getElementById('f_leave_fable_toggle').classList.contains('off'),
   };
   if (_selectedTagColor) payload.tag_color = _selectedTagColor;
   if (kind === 'api') {
@@ -3044,6 +3869,7 @@ let _currentView = 'overview';
 const VIEW_ROUTES = {
   overview: '/',
   profiles: '/profiles',
+  stats: '/stats',
   activity: '/activity',
   settings: '/settings',
   help: '/help',
@@ -3057,6 +3883,36 @@ const ROUTE_VIEWS = Object.fromEntries(
 const _viewState = {};
 function registerViewState(view, { toQuery, fromQuery }) {
   _viewState[view] = { toQuery, fromQuery };
+}
+
+// ---- settings sub-navigation ----
+// Settings grew past the point where one long scroll is findable, so the
+// sections are grouped and only one group is on screen at a time. The group
+// lives in the URL (?s=daemon) so a link to "the Daemon settings" reopens
+// there instead of at the top.
+const SETTINGS_GROUPS = ['general', 'routing', 'daemon', 'data', 'eco', 'danger'];
+let _settingsGroup = 'general';
+
+function setSettingsGroup(group, { sync = true } = {}) {
+  if (!SETTINGS_GROUPS.includes(group)) group = 'general';
+  _settingsGroup = group;
+  document.querySelectorAll('[data-sgroup-nav]').forEach((el) => {
+    el.classList.toggle('active', el.dataset.sgroupNav === group);
+  });
+  // Hidden via a class, never inline display: a section the app hides on its
+  // own (Models parity with no codex profile) sets style.display itself, and
+  // writing display here would fight it and reveal a section that shouldn't be.
+  document.querySelectorAll('[data-sgroup]').forEach((el) => {
+    el.classList.toggle('sgroup-off', el.dataset.sgroup !== group);
+  });
+  if (sync) syncUrl();
+}
+
+function initSettingsNav() {
+  document.querySelectorAll('[data-sgroup-nav]').forEach((el) => {
+    el.addEventListener('click', () => setSettingsGroup(el.dataset.sgroupNav));
+  });
+  setSettingsGroup(_settingsGroup, { sync: false });
 }
 
 function viewFromLocation() {
@@ -3091,6 +3947,11 @@ function syncUrl({ replace = true } = {}) {
   }
 }
 
+registerViewState('settings', {
+  toQuery: () => ({ s: _settingsGroup === 'general' ? '' : _settingsGroup }),
+  fromQuery: (q) => setSettingsGroup(q.s || 'general', { sync: false }),
+});
+
 function switchView(view, { history = 'push' } = {}) {
   closeKebabMenu();
   closeAllSelectPops();
@@ -3102,8 +3963,9 @@ function switchView(view, { history = 'push' } = {}) {
 
   if (view === 'overview') { loadStatus().then(() => loadProfiles()); loadProjectUsage(); loadUsageSummary(); loadActivityPreview(); }
   if (view === 'profiles') loadProfilesTable();
+  if (view === 'stats') loadStats();
   if (view === 'activity') { renderActivityFilters(); loadActivity(); }
-  if (view === 'settings') { loadSettings(); loadModelParity(); }
+  if (view === 'settings') { setSettingsGroup(_settingsGroup, { sync: false }); loadSettings(); loadModelParity(); }
 
   // 'none' is for restoring from the URL on load or on popstate — writing
   // history there would either duplicate the entry or fight the Back button.
@@ -3133,9 +3995,28 @@ async function pollLiveUpdate() {
     // indefinitely, since nothing else refreshes it.
     await loadStatus();
     if (_currentView === 'overview') {
-      await Promise.all([loadProfiles(), loadProjectUsage(), loadUsageSummary(), loadActivityPreview()]);
+      // The usage card charts a week (or more) and is aggregated from every
+      // event in that period. Which account is serving right now has to be a
+      // second old; a bar chart over seven days does not, and refreshing it
+      // every tick was the most expensive thing the Dashboard did.
+      const summaryDue = !_summaryLastPoll || Date.now() - _summaryLastPoll >= SUMMARY_POLL_MS;
+      if (summaryDue) _summaryLastPoll = Date.now();
+      await Promise.all([
+        loadProfiles(),
+        loadProjectUsage(),
+        summaryDue ? loadUsageSummary() : Promise.resolve(),
+        loadActivityPreview(),
+      ]);
     } else if (_currentView === 'profiles') {
       await loadProfilesTable();
+    } else if (_currentView === 'stats') {
+      // Statistics aggregates the whole usage table, and that table grows
+      // forever. It is a reporting view, not a live one — polling it every
+      // second buys nothing and gets steadily more expensive.
+      if (!_statsLastPoll || Date.now() - _statsLastPoll >= STATS_POLL_MS) {
+        _statsLastPoll = Date.now();
+        await loadStats();
+      }
     } else if (_currentView === 'activity') {
       await loadActivity();
     } else if (_currentView === 'settings') {
@@ -3179,10 +4060,94 @@ setupUpdateModeSelect();
 document.getElementById('resetBtn').addEventListener('click', resetAllProfiles);
 document.getElementById('paritySaveBtn').addEventListener('click', saveModelParity);
 document.getElementById('parityResetBtn').addEventListener('click', resetModelParity);
+// ---- HUD (Heads-Up Display) ----
+// The button only appears where it can actually work: macOS, bundle present.
+async function initWidgetButton() {
+  const btn = document.getElementById('railWidgetBtn');
+  if (!btn) return;
+  try {
+    const state = await api('/api/widget');
+    btn.style.display = (state.supported && state.installed) ? '' : 'none';
+  } catch (e) {
+    btn.style.display = 'none';
+  }
+}
+
+async function reopenWidget() {
+  try {
+    await api('/api/widget/launch', { method: 'POST' });
+    showToast('success', t('widget.ok'), t('widget.ok_sub'));
+  } catch (e) {
+    const key = e.code === 'not_installed' ? 'widget.missing'
+              : e.code === 'unsupported' ? 'widget.unsupported' : null;
+    showToast('error', key ? t(key) : e.message, key === 'widget.missing' ? t('widget.missing_sub') : '');
+  }
+}
+
 document.getElementById('parityAddBtn').addEventListener('click', onAddParityRow);
+document.getElementById('railWidgetBtn').addEventListener('click', reopenWidget);
+document.getElementById('parityAddMissingBtn').addEventListener('click', onAddMissingParityRows);
+// ECO tier: a spending/behaviour decision, so it saves immediately and shows
+// the failure rather than leaving the UI flipped on a PATCH that did not land.
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('#ecoTierRow .seg-btn');
+  if (!btn) return;
+  const previous = document.querySelector('#ecoTierRow .seg-btn.on');
+  if (btn === previous) return;
+  document.querySelectorAll('#ecoTierRow .seg-btn').forEach((b) => b.classList.toggle('on', b === btn));
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ eco_tier: btn.dataset.eco }) });
+    showToast('success', t('settings.eco.title'), btn.textContent.trim());
+  } catch (err) {
+    if (previous) document.querySelectorAll('#ecoTierRow .seg-btn').forEach((b) => b.classList.toggle('on', b === previous));
+    showToast('error', t('toast.settings_failed') || 'Could not save', err.message);
+  }
+});
+// 1M context window: same save-or-revert pattern as the ECO tier. It changes
+// how much a session can hold before compacting, so a PATCH that did not land
+// must not leave the UI claiming otherwise.
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('#context1mRow .seg-btn');
+  if (!btn) return;
+  const previous = document.querySelector('#context1mRow .seg-btn.on');
+  if (btn === previous) return;
+  document.querySelectorAll('#context1mRow .seg-btn').forEach((b) => b.classList.toggle('on', b === btn));
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ context_1m: btn.dataset.context1m }) });
+    showToast('success', t('settings.context1m.title'), btn.textContent.trim());
+    // The "Right now" sentence is the daemon's decision for the NEW mode;
+    // without this it keeps describing the mode just replaced.
+    try {
+      const fresh = await api('/api/settings');
+      renderContext1mVerdict(fresh.context_1m_preview);
+    } catch (_) { /* the mode saved; a stale sentence is fixed by the next load */ }
+  } catch (err) {
+    if (previous) document.querySelectorAll('#context1mRow .seg-btn').forEach((b) => b.classList.toggle('on', b === previous));
+    showToast('error', t('toast.settings_failed') || 'Could not save', err.message);
+  }
+});
+// Primitive speech level: same save-or-revert pattern as the ECO tier.
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('#speechLevelRow .seg-btn');
+  if (!btn) return;
+  const previous = document.querySelector('#speechLevelRow .seg-btn.on');
+  if (btn === previous) return;
+  document.querySelectorAll('#speechLevelRow .seg-btn').forEach((b) => b.classList.toggle('on', b === btn));
+  try {
+    await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ speech_level: btn.dataset.speech }) });
+    showToast('success', t('settings.speech.title'), btn.textContent.trim());
+  } catch (err) {
+    if (previous) document.querySelectorAll('#speechLevelRow .seg-btn').forEach((b) => b.classList.toggle('on', b === previous));
+    showToast('error', t('toast.settings_failed') || 'Could not save', err.message);
+  }
+});
 document.getElementById('notifMasterToggle').addEventListener('click', toggleNotificationsMaster);
 document.getElementById('distributeDefaultToggle').addEventListener('click', toggleDistributeDefault);
 document.getElementById('usageFreshToggle').addEventListener('click', toggleUsageFresh);
+document.getElementById('settingsRetryBtn').addEventListener('click', () => loadSettings());
+document.getElementById('returnPreferredToggle').addEventListener('click', toggleReturnPreferred);
+document.getElementById('fableLimitAllToggle').addEventListener('click', toggleFableLimitAll);
+document.getElementById('codexSpendCreditsToggle').addEventListener('click', toggleCodexSpendCredits);
 document.getElementById('autostartToggle').addEventListener('click', toggleAutostart);
 document.getElementById('regenTokenBtn').addEventListener('click', regeneratePlaceholderToken);
 document.getElementById('killProcessBtn').addEventListener('click', killProcess);
@@ -3281,6 +4246,13 @@ function setForcedSubagentsToggle(prefix, on) {
     setForcedSubagentsToggle(prefix, toggle.classList.contains('off'));
   });
 });
+// "Leave this profile when its Fable limit is spent" — a plain on/off, no
+// warning block: it only ever moves a session, never pins one.
+['f', 'pd'].forEach((prefix) => {
+  const toggle = document.getElementById(`${prefix}_leave_fable_toggle`);
+  if (!toggle) return;
+  toggle.addEventListener('click', () => toggle.classList.toggle('off'));
+});
 document.querySelectorAll('[data-pd-step]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const field = btn.dataset.pdStep;
@@ -3367,7 +4339,12 @@ function _codexModelOptionsFor(current) {
   return opts;
 }
 function _codexEffortOptions() {
-  return _reasoningEfforts.map((e) => ({ value: e, label: e }));
+  return _reasoningEfforts.map((e) => ({ value: e, label: codexEffortLabel(e) }));
+}
+
+/// "none" is the one level whose name does not explain itself.
+function codexEffortLabel(effort) {
+  return effort === 'none' ? t('settings.parity.effort_none') : effort;
 }
 function _claudeEffortOptions() {
   return [{ value: '', label: t('modal.add_profile.automatic_option') },
@@ -3424,6 +4401,37 @@ function onDeleteParityRow(i) {
 // server's duplicate-base check).
 function _baseId(id) { return (id || '').replace(/-(\d{8}|\d{4}-\d{2}-\d{2})$/, ''); }
 
+// Claude models the catalogue knows that the saved list doesn't offer. Model
+// ids are never written here — they come from /api/codex/model-map, which is
+// why this file can survive a lineup change.
+let _parityUnmapped = [];
+
+function renderParityBanner() {
+  const banner = document.getElementById('parityNewBanner');
+  const sub = document.getElementById('parityNewBannerSub');
+  if (!banner || !sub) return;
+  const n = _parityUnmapped.length;
+  banner.style.display = n ? '' : 'none';
+  if (!n) return;
+  const names = _parityUnmapped.map((m) => m.claude_label || m.claude_model).join(', ');
+  sub.textContent = t(n === 1 ? 'settings.parity.new_sub_one' : 'settings.parity.new_sub_many')
+    .replace('{n}', String(n)).replace('{names}', names);
+}
+
+function onAddMissingParityRows() {
+  // Stages the rows with the target each would get and leaves them unsaved:
+  // adding a model is a spending decision, so the user still presses Save.
+  const used = new Set(_parityRows.map((r) => _baseId(r.claude_model)));
+  for (const m of _parityUnmapped) {
+    if (used.has(_baseId(m.claude_model))) continue;
+    _parityRows.push({ claude_model: m.claude_model, model: m.would_map_to,
+                       effort: m.would_use_effort, claude_effort: null });
+  }
+  _parityUnmapped = [];
+  renderParityBanner();
+  renderParityRows();
+}
+
 function onAddParityRow() {
   const used = new Set(_parityRows.map((r) => _baseId(r.claude_model)));
   let seed = (_parityMeta.defaults || []).find((d) => !used.has(_baseId(d.claude_model)));
@@ -3459,9 +4467,11 @@ async function loadModelParity() {
     claude_model: r.claude_model, model: r.openai_model,
     effort: r.reasoning_effort, claude_effort: r.claude_effort || null,
   }));
+  _parityUnmapped = data.unmapped || [];
   refreshCodexSelectOptions();
   section.style.display = '';
   renderParityRows();
+  renderParityBanner();
 }
 
 async function saveModelParity() {
@@ -3501,7 +4511,7 @@ const CODEX_MODEL_OPTIONS = () => [
 // the backend's own mapping, like any other automatic default.
 const CODEX_REASONING_OPTIONS = () => [
   { value: '', label: t('modal.add_profile.automatic_option') },
-  ..._reasoningEfforts.map((e) => ({ value: e, label: e })),
+  ..._reasoningEfforts.map((e) => ({ value: e, label: codexEffortLabel(e) })),
 ];
 setupSelectInput(document.getElementById('f_codex_model'), CODEX_MODEL_OPTIONS(), () => updateCodexModelHelp('f'));
 setupSelectInput(document.getElementById('f_codex_reasoning'), CODEX_REASONING_OPTIONS(), () => {});
@@ -3624,6 +4634,8 @@ wireProfilesViewToggle();
 wireUpdateButtons();
 wireCursorGlow();
 wireDataTooltips();
+initSettingsNav();
+initWidgetButton();
 loadLocales().then(() => {
   loadStatus().then(() => loadProfiles());
   loadProjectUsage();
@@ -3648,6 +4660,10 @@ loadLocales().then(() => {
   // at, since they just caused it.
   loadActivityPreview();
 });
+// Not inside the locales .then: keyboard operability must not wait on a
+// network read, and it sets no user-visible text.
+startA11yObserver();
+startModalA11yObserver();
 checkConnection();
 // Self-scheduling rather than a fixed interval: the cadence changes to a
 // fast retry while the daemon is down so recovery is near-instant.

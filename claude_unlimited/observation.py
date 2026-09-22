@@ -17,6 +17,20 @@ from typing import Optional
 
 
 @dataclass(frozen=True)
+class ModelWindow:
+    """One model's own weekly allowance on an account, e.g. Fable at 26%.
+
+    Only the provider's usage ENDPOINT reports these (no response header is
+    model-scoped), so they arrive from usage_probe, never from real traffic.
+    Observed and displayed; routing reads them only through
+    ProfileRuntime.blocked_models."""
+    name: str                          # the provider's display name, e.g. "Fable"
+    percent: float                     # 0-100
+    resets_at: Optional[datetime]
+    active: bool = False               # provider's "this limit is binding" hint; never routed on
+
+
+@dataclass(frozen=True)
 class UsageSnapshot:
     percent: float
     resets_at: Optional[datetime]
@@ -30,6 +44,10 @@ class UsageSnapshot:
     # 5h/7d.
     window_label: Optional[str] = None
     window_label_7d: Optional[str] = None
+    # Per-model windows. None = this source cannot see them (every real
+    # response), so whatever is already known is KEPT; a tuple, even empty,
+    # comes from a usage read and replaces it.
+    model_windows: Optional[tuple["ModelWindow", ...]] = None
 
 
 @dataclass(frozen=True)

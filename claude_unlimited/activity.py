@@ -8,15 +8,13 @@ Personal Max"), never raw request/response content.
 
 from __future__ import annotations
 
-import json
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from . import db
-from .config import APP_DIR, ensure_app_dir
+from .config import APP_DIR
 
 # Kept for db.import_legacy_logs(), the only thing that still reads this file.
 ACTIVITY_FILE = APP_DIR / "activity.jsonl"

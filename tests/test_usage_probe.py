@@ -306,3 +306,147 @@ def test_a_tick_sends_nothing_when_the_setting_is_off_or_for_api_key_profiles(da
     daemon._run_usage_probe_tick()
     assert calls == ["sk-ant-12345678"]             # the oauth one only; never the API-key Profile
     assert profile_repo.list_profiles()[1].id == oauth.id
+
+
+# ---------------------------------------------------------------------------
+# Codex per-model availability.
+#
+# OpenAI and Anthropic report different things and the bucket shape has to
+# reflect that: Anthropic gives a percentage per model, OpenAI gives only a
+# boolean. A Codex bucket is therefore binary — 0 available, 100 not — which
+# still answers the routing question ("is this model blocked on this
+# account"); the percentage is only how an Anthropic bucket answers it.
+# ---------------------------------------------------------------------------
+
+def test_codex_model_usage_becomes_binary_buckets():
+    from claude_unlimited.usage_probe import codex_model_windows
+
+    windows = codex_model_windows({"model_usage": {
+        "gpt-6-astra": {"available": False, "available_at": 1790000000,
+                        "credits_would_enable": True},
+        "gpt-5.6-sol": {"available": True, "available_at": None},
+    }})
+    by_name = {w.name: w for w in windows}
+    assert by_name["gpt-6-astra"].percent == 100.0
+    assert by_name["gpt-6-astra"].resets_at is not None
+    # The provider naming a model unavailable IS the binding limit here.
+    assert by_name["gpt-6-astra"].active is True
+    assert by_name["gpt-5.6-sol"].percent == 0.0
+    assert by_name["gpt-5.6-sol"].resets_at is None
+    assert by_name["gpt-5.6-sol"].active is False
+
+
+def test_codex_model_usage_tolerates_the_shapes_the_endpoint_really_returns():
+    from claude_unlimited.usage_probe import codex_model_windows
+
+    # Verified live on a Plus account: an unconstrained model reports
+    # available_at null. Nothing here may raise.
+    assert codex_model_windows({}) == ()
+    assert codex_model_windows({"model_usage": None}) == ()
+    assert codex_model_windows({"model_usage": {}}) == ()
+    assert codex_model_windows(None) == ()
+    # Unknown availability is NOT the same as unavailable — skip it rather
+    # than invent a block that would idle a working account.
+    assert codex_model_windows({"model_usage": {"m": {"available": "yes"}}}) == ()
+    assert codex_model_windows({"model_usage": {"m": {}}}) == ()
+    assert codex_model_windows({"model_usage": {"": {"available": False}}}) == ()
+
+
+def test_codex_available_at_accepts_epoch_or_iso():
+    from claude_unlimited.usage_probe import codex_model_windows
+
+    epoch = codex_model_windows({"model_usage": {
+        "m": {"available": False, "available_at": 1790000000}}})[0]
+    iso = codex_model_windows({"model_usage": {
+        "m": {"available": False, "available_at": "2026-09-21T14:13:20Z"}}})[0]
+    assert epoch.resets_at == iso.resets_at
+    # A naive timestamp must not come back tz-unaware: gateway._blocked_models_for
+    # and router.fable_spent compare it against an aware `now`, which would raise.
+    naive = codex_model_windows({"model_usage": {
+        "m": {"available": False, "available_at": "2026-09-21T14:13:20"}}})[0]
+    assert naive.resets_at.tzinfo is not None
+    junk = codex_model_windows({"model_usage": {
+        "m": {"available": False, "available_at": "whenever"}}})[0]
+    assert junk.resets_at is None
+
+
+def test_a_codex_probe_carries_the_model_windows(monkeypatch):
+    """The parser existing is not the point — fetch_codex_usage has to attach
+    it, the way fetch_anthropic_usage does. That wiring is what was missing."""
+    from claude_unlimited import usage_probe
+
+    body = {"rate_limit": {"primary_window": {"used_percent": 10.0,
+                                               "limit_window_seconds": 18000}},
+            "model_usage": {"gpt-6-astra": {"available": False, "available_at": None}}}
+    monkeypatch.setattr(usage_probe, "_get", lambda url, headers: (200, None, body))
+
+    class Cred:
+        access_token = "tok"
+        account_id = "acct"
+
+    result = usage_probe.fetch_codex_usage(Cred())
+    assert result.status == 200
+    assert result.model_windows and result.model_windows[0].name == "gpt-6-astra"
+    assert result.model_windows[0].percent == 100.0
+
+
+# ---------------------------------------------------------------------------
+# The daemon side of the rejection-triggered re-read.
+#
+# A requested Profile is presented to the scheduler as "never observed", which
+# skips ONLY the interval gate. The provider pause and the per-Profile backoff
+# must still apply — the read is meant to happen sooner, not to bypass the
+# protections that stop us hammering a provider that is already pushing back.
+# ---------------------------------------------------------------------------
+
+def test_a_requested_profile_skips_the_interval_but_not_the_backoff(tmp_path):
+    from claude_unlimited import usage_probe
+
+    clock = {"now": 10_000.0}
+    sched = usage_probe.Scheduler(clock=lambda: clock["now"],
+                                  state_file=tmp_path / "probe.json")
+    sched.note_activity()
+
+    just_read = clock["now"] - 5.0          # far inside the 5-10 min interval
+    normal = usage_probe.Candidate("p1", usage_probe.PROVIDER_ANTHROPIC, just_read)
+    # What _usage_probe_candidates() builds for a Profile that asked for a
+    # re-read: the same candidate with observed_at=None.
+    forced = usage_probe.Candidate("p1", usage_probe.PROVIDER_ANTHROPIC, None)
+
+    assert sched.due([normal]) == []        # interval gate holds it back
+    assert sched.due([forced]) == ["p1"]    # the request gets through
+
+    # ...but a Profile inside its own backoff stays held back even when asked
+    # for, which is the protection that must not be bypassed.
+    sched.record("p1", usage_probe.PROVIDER_ANTHROPIC,
+                 usage_probe.ProbeResult(status=429, retry_after=3600))
+    assert sched.due([forced]) == []
+
+
+def test_a_requested_profile_still_respects_the_provider_pause(tmp_path):
+    from claude_unlimited import usage_probe
+
+    clock = {"now": 20_000.0}
+    sched = usage_probe.Scheduler(clock=lambda: clock["now"],
+                                  state_file=tmp_path / "probe.json")
+    sched.note_activity()
+    forced = usage_probe.Candidate("p2", usage_probe.PROVIDER_ANTHROPIC, None)
+    assert sched.due([forced]) == ["p2"]
+
+    # A 429 pauses the whole provider; an out-of-band request must not poke it.
+    sched.record("p2", usage_probe.PROVIDER_ANTHROPIC,
+                 usage_probe.ProbeResult(status=429, retry_after=1800))
+    assert sched.due([forced]) == []
+
+
+def test_an_idle_pool_reads_nothing_even_when_asked(tmp_path):
+    """No new polling (invariant 2): the re-read rides the existing tick, and
+    that tick does not run while nobody is working."""
+    from claude_unlimited import usage_probe
+
+    clock = {"now": 30_000.0}
+    sched = usage_probe.Scheduler(clock=lambda: clock["now"],
+                                  state_file=tmp_path / "probe.json")
+    # note_activity() never called -> never active.
+    forced = usage_probe.Candidate("p3", usage_probe.PROVIDER_ANTHROPIC, None)
+    assert sched.due([forced]) == []

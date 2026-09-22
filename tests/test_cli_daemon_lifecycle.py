@@ -1,4 +1,5 @@
 import errno
+import types
 
 import os
 import pytest
@@ -6,6 +7,27 @@ import pytest
 import claude_unlimited.cli as cli
 import claude_unlimited.daemon_installer as daemon_installer
 from claude_unlimited import __version__
+
+
+def _stub_launch(monkeypatch, sink=None):
+    """Stubs both ways `code()` launches `claude`: POSIX `os.execvp` (never
+    returns on success) and the Windows child-process fallback, `_run_tool`
+    (see cli.py's `if os.name == "nt"` branch in `code()`). Only one of the
+    two ever actually runs for a given OS, but stubbing just `execvp` leaves
+    Windows falling through to a real subprocess launch of a fake path.
+    `sink`, if given, records each call as (binary, argv) like the old
+    execvp-only stubs did."""
+    def execvp(cmd, args):
+        if sink is not None:
+            sink.append((cmd, args))
+
+    def run_tool(argv, **kw):
+        if sink is not None:
+            sink.append((cli._resolve_launcher(argv[0]), argv))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.os, "execvp", execvp)
+    monkeypatch.setattr(cli, "_run_tool", run_tool)
 
 
 def _serving(monkeypatch, *versions):
@@ -78,7 +100,7 @@ def test_code_when_daemon_already_running_execs_claude_directly(monkeypatch):
     spawn_calls = []
     monkeypatch.setattr(cli, "_spawn_background_daemon", lambda port: spawn_calls.append(port))
     exec_calls = []
-    monkeypatch.setattr(cli.os, "execvp", lambda cmd, args: exec_calls.append((cmd, args)))
+    _stub_launch(monkeypatch, exec_calls)
 
     assert cli.main(["code", "--model", "opus"]) == 0
 
@@ -106,7 +128,7 @@ def test_code_starts_daemon_when_not_running(monkeypatch):
     monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port: "tok-456")
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     exec_calls = []
-    monkeypatch.setattr(cli.os, "execvp", lambda cmd, args: exec_calls.append((cmd, args)))
+    _stub_launch(monkeypatch, exec_calls)
 
     assert cli.main(["code"]) == 0
 
@@ -114,6 +136,33 @@ def test_code_starts_daemon_when_not_running(monkeypatch):
     (binary, argv), = exec_calls
     assert os.path.basename(binary) == "claude"
     assert argv[0] == "claude"
+
+
+def test_background_daemon_spawn_is_unbuffered_on_windows(monkeypatch, tmp_path):
+    """Confirmed on real Windows hardware: stdout/stderr redirected to a file
+    (as this spawn does) makes CPython fully block-buffer them. The daemon's
+    startup banner and everything after it sat unflushed in
+    daemon.out.log/.err.log indefinitely even though the daemon was up and
+    serving requests. -u forces unbuffered I/O; only needed on Windows,
+    where PYTHONUNBUFFERED isn't already set the way launchd/systemd units
+    set it for the service-managed daemon."""
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            captured["argv"] = argv
+            captured["kw"] = kw
+
+    monkeypatch.setattr(cli.subprocess, "Popen", FakePopen)
+
+    cli._spawn_background_daemon(4317)
+
+    argv = captured["argv"]
+    if os.name == "nt":
+        assert argv[0] == cli.sys.executable and argv[1] == "-u"
+    else:
+        assert "-u" not in argv
 
 
 def test_code_gives_up_if_daemon_never_comes_up(monkeypatch, capsys):
@@ -130,7 +179,7 @@ def test_code_custom_port_is_forwarded_everywhere(monkeypatch):
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
     monkeypatch.setattr(cli, "_probe_health", lambda host, port, timeout=1.0: port == 5000)
     monkeypatch.setattr(cli, "_fetch_placeholder_token", lambda host, port: "tok")
-    monkeypatch.setattr(cli.os, "execvp", lambda cmd, args: None)
+    _stub_launch(monkeypatch)
 
     assert cli.main(["code", "--port", "5000"]) == 0
     assert cli.os.environ["ANTHROPIC_BASE_URL"] == f"http://{cli.LOOPBACK_HOST}:5000"
@@ -318,9 +367,15 @@ def test_purge_warns_when_something_still_holds_the_port(monkeypatch, tmp_path, 
     (tmp_path / ".claude-unlimited").mkdir()
     monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setattr(cli, "_probe_health", lambda *a, **k: True)   # never stops
+    # Without these two, "still holds the port" fell through to a REAL lsof on
+    # 4317 and SIGTERMed the developer's running daemon on every suite run.
+    monkeypatch.setattr(cli, "_pids_listening_on", lambda port: [])
+    killed = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append(pid))
 
     cli._stop_running_daemon(4317)
     assert "still serving" in capsys.readouterr().out
+    assert killed == []
 
 
 def test_purge_deregisters_the_service_before_removing_files(monkeypatch, tmp_path):
@@ -350,7 +405,11 @@ def test_purge_never_removes_the_users_own_claude_login(monkeypatch, tmp_path):
     from claude_unlimited import cli
     from claude_unlimited.anthropic_oauth import MACOS_KEYCHAIN_SERVICE
 
+    from claude_unlimited import anthropic_oauth
     monkeypatch.setattr(cli.sys, "platform", "darwin")
+    # The removal decides by platform.system(), not sys.platform — without
+    # this the test only passes on a Mac, and fails on Linux CI.
+    monkeypatch.setattr(anthropic_oauth.platform, "system", lambda: "Darwin")
     deleted = []
 
     class _R:

@@ -16,7 +16,7 @@ from typing import Optional
 
 from . import activity, connectors, oauth_credential, secret_store
 from . import config as config_module
-from .config import CONFIG_LOCK, Pool, Profile, load_pool, save_pool
+from .config import CONFIG_LOCK, Profile, load_pool, save_pool
 
 # Derived from connectors.py, so a kind's name is registered in exactly one
 # place. Both stay flat tuples shared across kinds; the per-kind auth_mode
@@ -119,7 +119,7 @@ def _validate_field_types(**changes) -> None:
     _num("token_threshold", kind=int, minimum=0, allow_none=True)
     _num("monthly_budget_cap", kind=(int, float), minimum=0, allow_none=True)
 
-    for key in ("enabled", "automatic", "forced_for_subagents"):
+    for key in ("enabled", "automatic", "forced_for_subagents", "leave_on_fable_limit"):
         if key in changes and not isinstance(changes[key], bool):
             raise ValidationError(f"{key} must be true or false.")
 
@@ -232,6 +232,7 @@ def create_profile(
     codex_model: Optional[str] = None,
     codex_reasoning_effort: Optional[str] = None,
     forced_for_subagents: bool = False,
+    leave_on_fable_limit: bool = False,
     credential_already_encoded: bool = False,
 ) -> Profile:
     _validate(name, kind, base_url, auth_mode, tag_color)
@@ -244,7 +245,7 @@ def create_profile(
         default_model=default_model, tag_color=tag_color, plan=plan,
         codex_model=codex_model, codex_reasoning_effort=codex_reasoning_effort,
         claude_config_dir=claude_config_dir, codex_home=codex_home,
-        forced_for_subagents=forced_for_subagents,
+        forced_for_subagents=forced_for_subagents, leave_on_fable_limit=leave_on_fable_limit,
     )
     if priority is not None:
         _validate_field_types(priority=priority)
@@ -284,6 +285,7 @@ def create_profile(
         codex_model=codex_model,
         codex_reasoning_effort=codex_reasoning_effort,
         forced_for_subagents=forced_for_subagents,
+        leave_on_fable_limit=leave_on_fable_limit,
     )
 
     if credential_already_encoded:
@@ -407,7 +409,7 @@ def update_profile(profile_id: str, **changes) -> Profile:
         "name", "priority", "switch_threshold", "enabled", "automatic",
         "default_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
         "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
-        "forced_for_subagents",
+        "forced_for_subagents", "leave_on_fable_limit",
     }
     unknown = set(changes) - allowed
     if unknown:

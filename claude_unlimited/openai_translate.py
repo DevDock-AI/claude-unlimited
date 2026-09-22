@@ -10,24 +10,33 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Callable
 
 from .openai_models import OpenAIModelTarget
 
 
 # ---- Anthropic request -> OpenAI Responses API request ----
 
-def anthropic_request_to_openai(body: dict, target: OpenAIModelTarget) -> dict:
+def anthropic_request_to_openai(body: dict, target: OpenAIModelTarget, *,
+                                reasoning_lookup: Optional[Callable[[list[str]], list[dict]]] = None,
+                                prompt_cache_key: Optional[str] = None) -> dict:
     """Translates one already-JSON-decoded Anthropic /v1/messages request
     body into an OpenAI Responses API request body.
 
     Every Claude Code request carries the full conversation, since the
     Anthropic API requires history to be re-sent each turn. It is translated
     faithfully into OpenAI's `input` item list, never summarized or
-    truncated."""
+    truncated.
+
+    `reasoning_lookup(anchors)` returns the encrypted reasoning items that
+    preceded an earlier assistant message (codex_state); they are replayed
+    right before that message's items, the order the Codex CLI sends them in.
+    `prompt_cache_key` is the conversation's stable cache key."""
     instructions = _extract_system_text(body.get("system"))
     input_items: list[dict] = []
     for message in body.get("messages", []):
+        if reasoning_lookup is not None and isinstance(message, dict) and message.get("role") == "assistant":
+            input_items.extend(reasoning_lookup(assistant_anchors(message)))
         input_items.extend(_message_to_input_items(message))
 
     openai_body: dict = {
@@ -38,13 +47,52 @@ def anthropic_request_to_openai(body: dict, target: OpenAIModelTarget) -> dict:
         "tool_choice": _map_tool_choice(body.get("tool_choice")),
         "parallel_tool_calls": True,
         "reasoning": {"effort": target.reasoning_effort},
+        # With store:false the backend keeps nothing between requests; this
+        # returns each turn's reasoning encrypted, so it can be replayed.
+        "include": ["reasoning.encrypted_content"],
     }
+    if prompt_cache_key:
+        openai_body["prompt_cache_key"] = prompt_cache_key
     if instructions:
         openai_body["instructions"] = instructions
     tools = _map_tools(body.get("tools"))
     if tools:
         openai_body["tools"] = tools
     return openai_body
+
+
+def assistant_anchors(message: dict) -> list[str]:
+    """How an assistant message is recognised when Claude Code sends it back:
+    by its tool call ids (unique, and ours — the translator emits OpenAI's
+    call_id as the tool_use id), else by its exact text."""
+    from .codex_state import anchor_for_call, anchor_for_text
+    content = message.get("content")
+    if isinstance(content, str):
+        return [anchor_for_text(content)] if content else []
+    if not isinstance(content, list):
+        return []
+    anchors = [anchor_for_call(b["id"]) for b in content
+               if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")]
+    text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    if text:
+        anchors.append(anchor_for_text(text))
+    return anchors
+
+
+def user_turn_index(body: dict) -> int:
+    """How many messages the user has typed so far — a new one starts a new
+    Codex turn. Tool results sent back do not."""
+    count = 0
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            count += 1
+        elif isinstance(content, list) and not any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            count += 1
+    return count
 
 
 def _extract_system_text(system) -> str:
@@ -258,6 +306,9 @@ class TranslatedUsage:
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
+    # Reasoning is part of output_tokens; carried separately because it is
+    # what drives Codex quota (ADR 0007).
+    reasoning_tokens: int = 0
 
 
 @dataclass
@@ -281,6 +332,18 @@ class ResponseTranslator:
     _stop_reason: str = "end_turn"
     usage: TranslatedUsage = field(default_factory=TranslatedUsage)
     _saw_any_output: bool = False
+    # A message item has been opened upstream but has produced no text yet, so
+    # no Anthropic block has been started for it. See _start_block.
+    _pending_text_block: bool = False
+    # What this response produced that a later request must be able to match:
+    # the reasoning items to replay, and the anchors they belong to.
+    reasoning_items: list = field(default_factory=list)
+    call_ids: list = field(default_factory=list)
+    text: str = ""
+
+    def anchors(self) -> list[str]:
+        from .codex_state import anchor_for_call, anchor_for_text
+        return [anchor_for_call(c) for c in self.call_ids] + ([anchor_for_text(self.text)] if self.text else [])
 
     def feed(self, event: dict) -> Iterator[bytes]:
         event_type = event.get("type", "")
@@ -293,6 +356,12 @@ class ResponseTranslator:
         elif event_type == "response.function_call_arguments.delta":
             yield from self._tool_input_delta(event)
         elif event_type == "response.output_item.done":
+            item = event.get("item") or {}
+            if item.get("type") == "reasoning" and item.get("encrypted_content"):
+                # Kept exactly as returned (id, summary, encrypted_content),
+                # the shape the Codex CLI replays.
+                self.reasoning_items.append({k: item[k] for k in ("type", "id", "summary", "encrypted_content")
+                                             if k in item})
             yield from self._end_block(event)
         elif event_type == "response.completed":
             yield from self._finish(event, stop_reason=None)
@@ -305,6 +374,24 @@ class ResponseTranslator:
 
     def _sse(self, event_name: str, data: dict) -> bytes:
         return f"event: {event_name}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
+    def abort(self, message: str) -> Iterator[bytes]:
+        """End a stream that broke after it started, as an error the client
+        can see.
+
+        The alternative is what used to happen: the connection to the provider
+        fails mid-response (a stalled read, a reset), the generator raises, and
+        the client is left holding a stream whose `message_stop` never
+        arrives — a subagent that sits on "Waiting for task" forever. An
+        `error` event is a terminal event in Anthropic's SSE protocol, so the
+        turn fails in seconds instead of hanging.
+        """
+        if self._current_block_open:
+            yield self._sse("content_block_stop",
+                            {"type": "content_block_stop", "index": self._current_block_index})
+            self._current_block_open = False
+        yield self._sse("error", {"type": "error",
+                                  "error": {"type": "api_error", "message": message}})
 
     def _start_message(self, event: dict) -> Iterator[bytes]:
         if self._started:
@@ -325,13 +412,16 @@ class ResponseTranslator:
         item = event.get("item", {})
         item_type = item.get("type")
         if item_type == "message":
+            # Opened only once text actually arrives (see _text_delta). A
+            # message item that produces none — the model went straight to a
+            # tool call, or the turn ended early — would otherwise become an
+            # empty text block, which Claude Code keeps in its history and
+            # sends back on the NEXT request: Anthropic rejects that with
+            # "400 messages: text content blocks must be non-empty", so a
+            # single empty block from here breaks the conversation on a
+            # different account entirely.
             self._current_block_type = "text"
-            self._current_block_index += 1
-            self._current_block_open = True
-            yield self._sse("content_block_start", {
-                "type": "content_block_start", "index": self._current_block_index,
-                "content_block": {"type": "text", "text": ""},
-            })
+            self._pending_text_block = True
         elif item_type == "function_call":
             self._current_block_type = "tool_use"
             self._current_block_index += 1
@@ -345,6 +435,7 @@ class ResponseTranslator:
                 item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex}"
             )
             self._pending_tool_name = item.get("name", "")
+            self.call_ids.append(self._pending_tool_call_id)
             yield self._sse("content_block_start", {
                 "type": "content_block_start", "index": self._current_block_index,
                 "content_block": {"type": "tool_use", "id": self._pending_tool_call_id,
@@ -355,9 +446,20 @@ class ResponseTranslator:
 
     def _text_delta(self, event: dict) -> Iterator[bytes]:
         delta = event.get("delta", "")
-        if not delta or self._current_block_index < 0:
+        if not delta:
+            return
+        if self._pending_text_block:
+            self._pending_text_block = False
+            self._current_block_index += 1
+            self._current_block_open = True
+            yield self._sse("content_block_start", {
+                "type": "content_block_start", "index": self._current_block_index,
+                "content_block": {"type": "text", "text": ""},
+            })
+        if self._current_block_index < 0:
             return
         self._saw_any_output = True
+        self.text += delta
         yield self._sse("content_block_delta", {
             "type": "content_block_delta", "index": self._current_block_index,
             "delta": {"type": "text_delta", "text": delta},
@@ -375,6 +477,9 @@ class ResponseTranslator:
         })
 
     def _end_block(self, event: dict) -> Iterator[bytes]:
+        # A message item that never produced text: nothing was started, so
+        # nothing is stopped, and no empty block reaches the client.
+        self._pending_text_block = False
         if not self._current_block_open:
             return
         item = event.get("item", {})
@@ -393,17 +498,34 @@ class ResponseTranslator:
             self._current_block_open = False
         response = event.get("response", {})
         usage = response.get("usage") or {}
+        # The Responses API nests the cache and reasoning counts:
+        # usage.input_tokens_details.cached_tokens and
+        # usage.output_tokens_details.reasoning_tokens. Reading a flat
+        # `cached_input_tokens` (which does not exist) recorded every Codex
+        # request as fully uncached. And OpenAI's input_tokens INCLUDES the
+        # cached part while Anthropic's excludes it, so it is split here —
+        # the total Claude Code adds up for its context stays the same.
+        in_details = usage.get("input_tokens_details") or {}
+        out_details = usage.get("output_tokens_details") or {}
+        total_input = int(usage.get("input_tokens", 0) or 0)
+        cached = min(int(in_details.get("cached_tokens", 0) or 0), total_input)
         self.usage = TranslatedUsage(
-            input_tokens=usage.get("input_tokens", 0) or 0,
-            output_tokens=usage.get("output_tokens", 0) or 0,
-            cache_read_input_tokens=usage.get("cached_input_tokens", 0) or 0,
-            cache_creation_input_tokens=usage.get("cache_write_input_tokens", 0) or 0,
+            input_tokens=total_input - cached,
+            output_tokens=int(usage.get("output_tokens", 0) or 0),
+            cache_read_input_tokens=cached,
+            cache_creation_input_tokens=0,
+            reasoning_tokens=int(out_details.get("reasoning_tokens", 0) or 0),
         )
         final_stop_reason = stop_reason or self._stop_reason or ("end_turn" if self._saw_any_output else "end_turn")
         yield self._sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": final_stop_reason, "stop_sequence": None},
-            "usage": {"input_tokens": self.usage.input_tokens, "output_tokens": self.usage.output_tokens},
+            "usage": {"input_tokens": self.usage.input_tokens, "output_tokens": self.usage.output_tokens,
+                      "cache_read_input_tokens": self.usage.cache_read_input_tokens,
+                      "cache_creation_input_tokens": self.usage.cache_creation_input_tokens,
+                      # Not an Anthropic field; Claude Code ignores it, and the
+                      # gateway's usage capture records it.
+                      "reasoning_tokens": self.usage.reasoning_tokens},
         })
         yield self._sse("message_stop", {"type": "message_stop"})
 
@@ -429,6 +551,8 @@ def assemble_message_from_sse(chunks: Iterator[bytes]) -> dict:
     }
     blocks: dict[int, dict] = {}
     partial_json: dict[int, list[str]] = {}
+    started = False
+    failure: Optional[dict] = None
 
     for raw in chunks:
         for line in raw.decode("utf-8", "replace").splitlines():
@@ -439,10 +563,19 @@ def assemble_message_from_sse(chunks: Iterator[bytes]) -> dict:
             except json.JSONDecodeError:
                 continue
             kind = event.get("type")
-            if kind == "message_start":
-                started = event.get("message") or {}
-                message["id"] = started.get("id", message["id"])
-                message["model"] = started.get("model", "")
+            if kind == "error":
+                # A stream that failed after it began. Kept, not ignored:
+                # ignoring it returned a 200 with empty content, which the
+                # client reports as "the model produced an empty response" —
+                # a lie about what happened, and one that hid every upstream
+                # failure behind it (Claude Code's own auto-compaction was
+                # failing this way).
+                failure = event.get("error") or {"type": "api_error", "message": "upstream stream failed"}
+            elif kind == "message_start":
+                started = True
+                opened = event.get("message") or {}
+                message["id"] = opened.get("id", message["id"])
+                message["model"] = opened.get("model", "")
             elif kind == "content_block_start":
                 index = event.get("index", 0)
                 block = dict(event.get("content_block") or {})
@@ -461,8 +594,20 @@ def assemble_message_from_sse(chunks: Iterator[bytes]) -> dict:
                 message["stop_reason"] = (event.get("delta") or {}).get("stop_reason", message["stop_reason"])
                 message["usage"].update(event.get("usage") or {})
 
+    if failure is not None or not started:
+        # Anthropic's error body shape, so the caller can send it as the error
+        # it is rather than as a successful answer with nothing in it.
+        return {"type": "error",
+                "error": failure or {"type": "api_error",
+                                     "message": "upstream returned no response"}}
+
     for index in sorted(blocks):
         block = blocks[index]
+        # Belt and braces with the streaming side: an empty text block is what
+        # Anthropic rejects on the next request ("text content blocks must be
+        # non-empty"), so it must not survive into a message either.
+        if block.get("type") == "text" and not block.get("text"):
+            continue
         if block.get("type") == "tool_use":
             raw_input = "".join(partial_json.get(index, []))
             try:

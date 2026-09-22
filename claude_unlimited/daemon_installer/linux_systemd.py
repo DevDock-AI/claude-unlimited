@@ -85,6 +85,9 @@ def _unit_contents(port: int) -> str:
         "StartLimitIntervalSec=0\n"
         "\n"
         "[Service]\n"
+        # Without this, stdout is block-buffered and the journal lags a whole
+        # run — the log is only useful if it is written as it happens.
+        "Environment=PYTHONUNBUFFERED=1\n"
         f"ExecStart={exec_start}\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"

@@ -17,6 +17,7 @@ assume two exist.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -174,3 +175,37 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
         )
 
     return Unknown(status_code=status_code)
+
+
+@dataclass(frozen=True)
+class Credits:
+    """The prepaid-credit balance a codex backend reports alongside its plan
+    windows (issue #6). Deliberately NOT part of the Observation union:
+    credits say nothing about whether the plan window is spent, they arrive on
+    200 and 429 alike, and folding them into classify() would mean adding the
+    same field to two unrelated members of that union. Callers read them with
+    parse_credits() and record them separately."""
+
+    has_credits: bool
+    balance: Optional[float]  # None = the header was absent or unparseable
+
+
+def parse_credits(headers: dict[str, str]) -> Optional[Credits]:
+    """Credits from an already-lowercased, ALLOWED_HEADERS-filtered header
+    map, or None when this response said nothing about them.
+
+    None and Credits(has_credits=False) are different answers: None means
+    "unknown, keep whatever we knew", False means "the backend just told us
+    there are none". Only a response that carries at least one of the two
+    headers produces a Credits."""
+    raw_has = headers.get("x-codex-credits-has-credits")
+    raw_balance = headers.get("x-codex-credits-balance")
+    if raw_has is None and raw_balance is None:
+        return None
+    balance = _parse_float(raw_balance)
+    if raw_has is None:
+        # Only a balance came back: a positive one is itself the answer.
+        has = bool(balance and balance > 0)
+    else:
+        has = raw_has.strip().lower() in ("1", "true", "yes")
+    return Credits(has_credits=has, balance=balance)

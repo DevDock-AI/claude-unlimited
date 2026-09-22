@@ -225,3 +225,42 @@ def test_usage_summary_1y_is_month_granularity_not_365_day_bars(running_server):
     status, body = _request(f"{running_server}/api/usage/summary?range=1y")
     assert body["granularity"] == "month"
     assert len(body["daily_totals"]) == 12
+
+
+def test_usage_stats_endpoint_returns_every_breakdown(running_server):
+    """One endpoint applies one period filter uniformly, so the Stats view can
+    never show a total that disagrees with its own breakdowns."""
+    import claude_unlimited.db as db
+    p = profile_repo.create_profile(name="Codex", kind="codex", credential="sk-codex-12345678")
+    for model, requested, cost in [("gpt-5.6-sol", "claude-sonnet-5", 1.5),
+                                   ("gpt-6-astra", "claude-fable-5-1", 2.0),
+                                   ("gpt-5.6-sol", "claude-sonnet-5", 0.5)]:
+        db.execute(
+            """INSERT INTO usage_event (ts, profile_id, project_id, model, input_tokens, output_tokens,
+                                        cache_creation_input_tokens, cache_read_input_tokens, cost_usd, requested_model)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (datetime.now(timezone.utc).isoformat(), p.id, "-Users-a-app", model, 100, 20, 5, 300, cost, requested))
+
+    status, body = _request(f"{running_server}/api/usage/stats?range=1m")
+
+    assert status == 200
+    assert body["totals"]["requests"] == 3
+    assert body["totals"]["cost_usd"] == 4.0
+    assert body["totals"]["cache_hit_percent"] is not None
+    # sol is two rows totalling $2.00 and astra one row of $2.00; the tiebreak
+    # is tokens, which sol wins with twice the volume.
+    assert [r["key"] for r in body["by_model"]] == ["gpt-5.6-sol", "gpt-6-astra"]
+    assert body["by_model"][0]["requests"] == 2 and body["by_model"][0]["cost_usd"] == 2.0
+    assert sum(r["share"] for r in body["by_model"]) == 100.0
+    assert body["by_profile"][0]["label"] == "Codex" and body["by_profile"][0]["kind"] == "codex"
+    assert {r["key"] for r in body["by_requested_model"]} == {"claude-fable-5-1", "claude-sonnet-5"}
+    assert body["history_begins"] is not None
+    # A project is named, never shown as Claude Code's raw folder id — that is
+    # a full local path on a screen people share.
+    assert body["by_project"][0]["key"] == "-Users-a-app"
+    assert body["by_project"][0]["label"] == "Users-a-app"   # no such folder here: best effort, no leading "-"
+
+
+def test_usage_stats_rejects_a_bogus_range_instead_of_500ing(running_server):
+    status, body = _request(f"{running_server}/api/usage/stats?range=all-of-time")
+    assert status == 200 and body["range"] == "1m"

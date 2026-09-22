@@ -18,6 +18,7 @@ def _ok(stdout="", returncode=0):
 @pytest.fixture(autouse=True)
 def isolated_pid_file(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "PID_FILE", tmp_path / "daemon.pid")
+    monkeypatch.setattr(backend, "LOG_DIR", tmp_path / "logs")
     return tmp_path
 
 
@@ -46,7 +47,18 @@ def test_install_creates_task_and_starts_it():
     create_call = calls[0]
     assert create_call[:3] == ("schtasks", "/create", "/tn")
     assert backend.TASK_NAME in create_call
-    assert any("claude_unlimited start --port 4317" in a for a in create_call)
+    # /tr points at a generated wrapper script rather than embedding the
+    # command line directly: schtasks' /tr has no redirection syntax of its
+    # own, Task Scheduler hands the process no std handles otherwise (see
+    # install()'s comment), and a wrapper file sidesteps nesting quotes
+    # inside schtasks' own parsing of /tr.
+    tr_value = create_call[create_call.index("/tr") + 1]
+    wrapper = backend.Path(tr_value.strip('"'))
+    assert wrapper.name == "daemon_launcher.cmd"
+    content = wrapper.read_text(encoding="ascii")
+    assert "claude_unlimited start --port 4317" in content
+    assert " -u " in content  # unbuffered — see the buffering half of the same bug
+    assert ">>" in content and "daemon.out.log" in content and "daemon.err.log" in content
     mock_restart.assert_called_once()
 
 

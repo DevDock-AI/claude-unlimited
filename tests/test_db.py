@@ -68,7 +68,7 @@ def test_wal_is_enabled(env):
     assert db.connect().execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
 
 
-def test_each_thread_gets_a_working_connection(env):
+def test_every_thread_can_write(env):
     errors = []
 
     def writer(n):
@@ -77,14 +77,42 @@ def test_each_thread_gets_a_working_connection(env):
                        (f"t{n}", "config", f"from thread {n}"))
         except Exception as exc:  # noqa: BLE001 - the point of the test
             errors.append(exc)
-        finally:
-            db.close_this_thread()
 
     threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert errors == []
     assert len(db.query("SELECT * FROM activity_event")) == 4
+
+
+def test_threads_share_one_connection_and_leave_no_handle_behind(env):
+    """The daemon serves a thread per HTTP connection. A handle per thread
+    meant a handle per Dashboard poll, none of them ever closed: each one held
+    a WAL read mark, the log could not be checkpointed past them, and opening
+    the next handle over that log took seconds. One shared connection is what
+    makes that impossible."""
+    handles = []
+
+    def worker():
+        handles.append(db.connect())
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+
+    assert len(set(id(h) for h in handles)) == 1
+    assert handles[0] is db.connect()
+
+
+def test_closing_truncates_the_write_ahead_log(env):
+    for n in range(50):
+        db.execute("INSERT INTO activity_event (ts, category, text) VALUES (?, ?, ?)",
+                   (f"t{n}", "config", "x" * 500))
+    wal = db.path().with_name(db.path().name + "-wal")
+    db.close_this_thread()
+    # Gone, or truncated to nothing: either way the next open has no log to
+    # rebuild an index over.
+    assert not wal.exists() or wal.stat().st_size == 0
 
 
 def test_an_unusable_database_degrades_instead_of_raising(env):

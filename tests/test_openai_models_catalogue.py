@@ -10,6 +10,7 @@ import datetime
 
 import claude_unlimited.model_catalogue as mc
 from claude_unlimited.openai_models import (
+    unmapped_claude_models,
     _DEFAULT_TARGET,
     _LEGACY_SELECTABLE,
     _MODEL_LADDER,
@@ -65,8 +66,12 @@ def test_effective_map_keeps_every_curated_decision_verbatim():
 
 
 def test_a_new_top_claude_model_gets_the_top_openai_tier():
+    # "Top tier" means the strongest CURATED target, not the most expensive
+    # model in existence: nothing maps to the flagship by default, so a brand
+    # new top Claude model must not invent that spending level either.
     emap = effective_model_map(make_catalogue())
-    assert emap["claude-zenith-6"] == OpenAIModelTarget("gpt-6-astra", "high")
+    assert emap["claude-zenith-6"] == OpenAIModelTarget("gpt-5.6-sol", "medium")
+    assert "gpt-6-astra" not in {t.model for t in emap.values()}
 
 
 def test_a_new_mid_tier_model_takes_its_conservative_neighbours_tier():
@@ -120,7 +125,7 @@ def test_advertised_models_are_exactly_the_saved_rows():
     assert ids == ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
     assert "claude-zenith-6" not in ids and "claude-nova-4" not in ids
     labels = dict(ads)
-    assert labels["claude-fable-5"] == "Claude Fable 5 | GPT-6 Astra · high"
+    assert labels["claude-fable-5"] == "Claude Fable 5 | GPT-5.6 Sol · medium"
 
 
 def test_advertised_models_reflect_a_saved_list_with_claude_effort():
@@ -151,7 +156,8 @@ def test_automatic_mapping_rows_come_from_the_saved_list():
 
 def test_map_model_resolves_catalogue_only_models():
     cat = make_catalogue()
-    assert map_model("claude-zenith-6", catalogue=cat) == OpenAIModelTarget("gpt-6-astra", "high")
+    # Inherits the TOP CURATED tier, which is Fable's — no longer the flagship.
+    assert map_model("claude-zenith-6", catalogue=cat) == OpenAIModelTarget("gpt-5.6-sol", "medium")
     # A dated spelling of a catalogue row lands on the same row.
     assert map_model("claude-nova-4-20260901", catalogue=cat) == OpenAIModelTarget("gpt-5.6-terra", "medium")
 
@@ -301,3 +307,72 @@ def test_default_rows_pick_the_newest_version_of_each_family_not_the_priciest():
     heads = {r["claude_model"] for r in default_parity_rows(cat)}
     assert "claude-sonnet-5" in heads       # newest wins
     assert "claude-sonnet-4-6" not in heads  # not the prilier older one
+
+
+def test_unmapped_reports_a_family_with_no_saved_row():
+    cat = make_catalogue()
+    # Defaults cover fable/opus/sonnet/haiku, so only the families the
+    # catalogue added are outstanding.
+    ids = [r["claude_model"] for r in unmapped_claude_models(catalogue=cat)]
+    assert ids == ["claude-zenith-6", "claude-nova-4"]
+    zenith = unmapped_claude_models(catalogue=cat)[0]
+    assert zenith["would_map_to"] == "gpt-5.6-sol"
+    assert zenith["would_use_effort"] == "medium"
+    assert zenith["claude_label"]
+
+
+def test_unmapped_ignores_models_older_than_the_saved_decision():
+    # The real catalogue keeps every point release forever. Against a saved
+    # opus-5 / sonnet-5, the 4.x releases are NOT news — reporting them made
+    # the live banner list 10 models, 9 of them stale.
+    cat = make_catalogue(extra={
+        "claude-opus-4-8": entry("anthropic", 2.4e-05),
+        "claude-opus-4-5": entry("anthropic", 2.2e-05),
+        "claude-sonnet-4-6": entry("anthropic", 9e-06),
+    })
+    ids = [r["claude_model"] for r in unmapped_claude_models(catalogue=cat)]
+    assert "claude-opus-4-8" not in ids
+    assert "claude-opus-4-5" not in ids
+    assert "claude-sonnet-4-6" not in ids
+
+
+def test_unmapped_reports_a_model_newer_than_its_saved_row():
+    # The case the banner exists for: the family is already mapped, and
+    # something newer than that decision shipped. It needs an EXPLICIT saved
+    # list — with no saved list the defaults track the catalogue's newest
+    # member per family, so by construction nothing is ever outstanding.
+    cat = make_catalogue(extra={"claude-sonnet-6": entry("anthropic", 1.4e-05)})
+    saved = [{"claude_model": "claude-sonnet-5", "model": "gpt-5.6-terra",
+              "effort": "medium", "claude_effort": None}]
+    ids = [r["claude_model"] for r in unmapped_claude_models(saved, catalogue=cat)]
+    assert "claude-sonnet-6" in ids
+    assert "claude-sonnet-5" not in ids
+
+
+def test_unmapped_reports_only_the_newest_member_of_an_unknown_family():
+    cat = make_catalogue(extra={
+        "claude-mythos-5-1": entry("anthropic", 6e-05),
+        "claude-mythos-5": entry("anthropic", 5.5e-05),
+    })
+    ids = [r["claude_model"] for r in unmapped_claude_models(catalogue=cat)]
+    assert "claude-mythos-5-1" in ids
+    assert "claude-mythos-5" not in ids   # one decision to make, not a back catalogue
+
+
+def test_unmapped_never_reports_an_unversioned_preview():
+    cat = make_catalogue(extra={"claude-mythos-preview": entry("anthropic", 6e-05)})
+    ids = [r["claude_model"] for r in unmapped_claude_models(catalogue=cat)]
+    assert "claude-mythos-preview" not in ids
+
+
+def test_unmapped_counts_a_dated_spelling_as_covered():
+    cat = make_catalogue()
+    saved = [{"claude_model": "claude-zenith-6-20260901", "model": "gpt-5.6-sol",
+              "effort": "medium", "claude_effort": None}]
+    assert "claude-zenith-6" not in [r["claude_model"] for r in unmapped_claude_models(saved, catalogue=cat)]
+
+
+def test_unmapped_is_empty_without_a_catalogue():
+    # No catalogue means no way to know a model exists — never raise the
+    # banner on a guess.
+    assert unmapped_claude_models() == []

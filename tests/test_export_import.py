@@ -264,3 +264,20 @@ def test_importing_a_second_forced_profile_keeps_the_holder_already_routing(env)
     ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True, import_settings=False)
     assert {p.name: p.forced_for_subagents for p in profile_repo.list_profiles()} == {"Current": True, "Old": False}
 
+
+
+def test_leave_on_fable_limit_survives_an_export_import_round_trip(env):
+    profile_repo.create_profile(name="Leaver", kind="oauth", credential="sk-ant-12345678",
+                                account_uuid="acct-1", leave_on_fable_limit=True)
+    profile_repo.create_profile(name="Stayer", kind="oauth", credential="sk-ant-87654321",
+                                account_uuid="acct-2")
+    bundle = _round_trip_bundle()
+    profile_repo.reset_all_profiles()
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True, import_settings=False)
+    assert {p.name: p.leave_on_fable_limit for p in profile_repo.list_profiles()} == {"Leaver": True, "Stayer": False}
+
+    # "Use imported version" applies the field to an existing profile too.
+    profile_repo.update_profile(profile_repo.list_profiles()[0].id, leave_on_fable_limit=False)
+    ei.apply_import(ei.import_bundle(bundle, passphrase="hunter22"), import_profiles=True,
+                    import_settings=False, conflict_strategy="use_imported")
+    assert {p.name: p.leave_on_fable_limit for p in profile_repo.list_profiles()} == {"Leaver": True, "Stayer": False}

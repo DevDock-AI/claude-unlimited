@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from claude_unlimited import openai_translate
 from claude_unlimited.openai_models import OpenAIModelTarget
 from claude_unlimited.openai_translate import ResponseTranslator, anthropic_request_to_openai
 
@@ -225,8 +226,11 @@ def test_text_only_turn_translates_to_a_full_anthropic_sse_sequence():
         {"type": "response.output_text.delta", "delta": "Hel"},
         {"type": "response.output_text.delta", "delta": "lo"},
         {"type": "response.output_item.done", "item": {"type": "message"}},
+        # The real Responses API shape: cache and reasoning counts are nested,
+        # and input_tokens INCLUDES the cached part.
         {"type": "response.completed", "response": {"usage": {
-            "input_tokens": 10, "output_tokens": 2, "cached_input_tokens": 3, "cache_write_input_tokens": 0}}},
+            "input_tokens": 10, "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens": 2, "output_tokens_details": {"reasoning_tokens": 1}}}},
     ]
     out = b""
     for event in events:
@@ -240,9 +244,31 @@ def test_text_only_turn_translates_to_a_full_anthropic_sse_sequence():
     assert "event: content_block_stop" in text
     assert '"stop_reason": "end_turn"' in text
     assert "event: message_stop" in text
-    assert translator.usage.input_tokens == 10
+    # Anthropic's input_tokens excludes cache reads, so the 10 splits 7 + 3;
+    # the total Claude Code adds up for its context is unchanged.
+    assert translator.usage.input_tokens == 7
     assert translator.usage.output_tokens == 2
     assert translator.usage.cache_read_input_tokens == 3
+    assert translator.usage.reasoning_tokens == 1
+    assert '"cache_read_input_tokens": 3' in text and '"reasoning_tokens": 1' in text
+
+
+def test_the_flat_cached_field_that_does_not_exist_is_not_read():
+    # The bug: a flat `cached_input_tokens` was read, so every Codex request
+    # was recorded as fully uncached — which made "is caching working?"
+    # unanswerable from our own data.
+    translator = ResponseTranslator()
+    list(translator.feed({"type": "response.completed", "response": {"usage": {
+        "input_tokens": 50_000, "cached_input_tokens": 49_000, "output_tokens": 10}}}))
+    assert translator.usage.cache_read_input_tokens == 0
+    assert translator.usage.input_tokens == 50_000
+
+
+def test_cached_tokens_never_exceed_the_input_total():
+    translator = ResponseTranslator()
+    list(translator.feed({"type": "response.completed", "response": {"usage": {
+        "input_tokens": 5, "input_tokens_details": {"cached_tokens": 9}, "output_tokens": 1}}}))
+    assert (translator.usage.input_tokens, translator.usage.cache_read_input_tokens) == (0, 5)
 
 
 def test_tool_call_turn_sets_tool_use_stop_reason():
@@ -302,3 +328,99 @@ def test_message_start_only_fires_once():
     second = b"".join(translator.feed({"type": "response.created", "response": {}}))
     assert b"message_start" in first
     assert second == b""
+
+
+# ---- a failed stream must not read as a successful empty answer ------------
+
+def _sse(events):
+    return [f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode("utf-8") for e in events]
+
+
+def test_a_stream_that_errors_assembles_into_an_error_body():
+    """The non-streaming path used to ignore `error` events and return a 200
+    with no content, which the client reports as "produced an empty
+    response" — hiding every upstream failure behind a wrong explanation."""
+    chunks = _sse([
+        {"type": "message_start", "message": {"id": "msg_1", "model": "gpt-test"}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "half"}},
+        {"type": "error", "error": {"type": "api_error", "message": "upstream stream failed: timeout"}},
+    ])
+    body = openai_translate.assemble_message_from_sse(iter(chunks))
+    assert body["type"] == "error"
+    assert "timeout" in body["error"]["message"]
+
+
+def test_a_stream_that_never_started_assembles_into_an_error_body():
+    body = openai_translate.assemble_message_from_sse(iter([]))
+    assert body["type"] == "error" and "no response" in body["error"]["message"]
+
+
+def test_a_normal_stream_still_assembles_into_a_message():
+    chunks = _sse([
+        {"type": "message_start", "message": {"id": "msg_1", "model": "gpt-test"}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}},
+        {"type": "message_stop"},
+    ])
+    body = openai_translate.assemble_message_from_sse(iter(chunks))
+    assert body["type"] == "message" and body["content"][0]["text"] == "hello"
+
+
+def _translate(events):
+    t = ResponseTranslator()
+    out = b""
+    for e in events:
+        out += b"".join(t.feed(e))
+    return out.decode("utf-8")
+
+
+def test_a_message_item_with_no_text_produces_no_empty_block():
+    """Anthropic rejects an empty text block on the NEXT request ("400
+    messages: text content blocks must be non-empty"), and Claude Code keeps
+    whatever we send in its history — so one empty block here breaks the
+    conversation later, usually on a different account."""
+    out = _translate([
+        {"type": "response.created", "response": {"id": "r1", "model": "gpt-test"}},
+        {"type": "response.output_item.added", "item": {"type": "message"}},
+        {"type": "response.output_item.done", "item": {"type": "message"}},
+        {"type": "response.output_item.added",
+         "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}},
+        {"type": "response.function_call_arguments.delta", "delta": '{"path":"a"}'},
+        {"type": "response.output_item.done", "item": {"type": "function_call"}},
+        {"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}},
+    ])
+    assert '"type": "text"' not in out
+    assert '"type": "tool_use"' in out
+    # The one block that IS emitted must still be index 0: a skipped index
+    # leaves a gap the client has to reconcile.
+    assert '"index": 0' in out and '"index": 1' not in out
+
+
+def test_a_message_item_with_text_still_produces_one_text_block():
+    out = _translate([
+        {"type": "response.created", "response": {"id": "r1", "model": "gpt-test"}},
+        {"type": "response.output_item.added", "item": {"type": "message"}},
+        {"type": "response.output_text.delta", "delta": "hello"},
+        {"type": "response.output_item.done", "item": {"type": "message"}},
+        {"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}},
+    ])
+    assert out.count('"type": "content_block_start"') == 1
+    assert '"text": "hello"' in out
+
+
+def test_an_assembled_message_never_carries_an_empty_text_block():
+    chunks = _sse([
+        {"type": "message_start", "message": {"id": "msg_1", "model": "gpt-test"}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1,
+         "content_block": {"type": "tool_use", "id": "call_1", "name": "Read", "input": {}}},
+        {"type": "content_block_delta", "index": 1,
+         "delta": {"type": "input_json_delta", "partial_json": '{"path":"a"}'}},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}},
+    ])
+    body = openai_translate.assemble_message_from_sse(iter(chunks))
+    assert [b["type"] for b in body["content"]] == ["tool_use"]

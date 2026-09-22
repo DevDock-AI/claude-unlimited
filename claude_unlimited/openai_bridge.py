@@ -18,13 +18,16 @@ import json
 import os
 import platform
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Iterator, Optional
 from urllib.parse import urlsplit
 
-from . import openai_credential, openai_login
+from . import codex_state, openai_credential, openai_login
+from . import openai_translate
+from .openai_translate import user_turn_index
 from .config import Profile
 from .openai_models import fallback_models, map_model
 from . import wire_formats
@@ -38,7 +41,14 @@ API_KEY_BACKEND_URL = "https://api.openai.com/v1/responses"
 CODEX_CLI_VERSION = "0.149.0"
 ORIGINATOR = "codex_cli_rs"
 
-DEFAULT_TIMEOUT_SECONDS = 120
+# Socket timeout, which here is an IDLE timeout: it bounds the wait for the
+# next chunk, not the length of the response. 120s was too tight for a
+# reasoning model — a hard task can think for minutes before emitting its
+# first event, and the read would time out mid-turn. The failure is no longer
+# silent either (the stream ends in an `error` event, see _translated_chunks),
+# so the cost of waiting longer is only that a truly dead connection takes
+# this long to be called dead.
+DEFAULT_TIMEOUT_SECONDS = 300
 CHUNK_READ_SIZE = 8192
 
 
@@ -98,6 +108,10 @@ def _codex_user_agent() -> str:
 _REFRESH_CHECK_COOLDOWN_SECONDS = 60.0
 _RATE_LIMIT_BACKOFF_SECONDS = 900.0
 _refresh_not_before: dict[str, float] = {}
+# Guards the check-and-set on _refresh_not_before, and records which Profiles
+# are mid-refresh. See refresh_now() for why both are needed.
+_refresh_lock = threading.Lock()
+_refresh_in_progress: set = set()
 
 _INSTALLATION_ID_CACHE: Optional[str] = None
 
@@ -155,6 +169,18 @@ def _looks_like_model_rejection(status: int, body_text: str) -> bool:
     return bool(_MODEL_REJECTION_PATTERN.search(body_text))
 
 
+# "the input is bigger than this model will take", in the several wordings the
+# providers use for it.
+_CONTEXT_OVERFLOW_PATTERN = re.compile(
+    r"context[_ ]length|context window|maximum context|too many tokens|"
+    r"prompt is too long|input is too long|reduce the length|exceeds? the (?:model|maximum)",
+    re.IGNORECASE)
+
+
+def _looks_like_context_overflow(body_text: str) -> bool:
+    return bool(_CONTEXT_OVERFLOW_PATTERN.search(body_text))
+
+
 def forget_model_substitutions() -> None:
     """Drops everything learned about rejected models.
 
@@ -183,9 +209,17 @@ def _remember_substitution(rejected: str, accepted: str) -> None:
         _MODEL_SUBSTITUTIONS[rejected] = accepted
 
 
-def _build_headers(cred: openai_credential.StoredOpenAICredential, *, is_subscription: bool) -> dict[str, str]:
-    session_id = _uuid7()
-    thread_id = _uuid7()
+def _build_headers(cred: openai_credential.StoredOpenAICredential, *, is_subscription: bool,
+                   ids: Optional["codex_state.ConversationIds"] = None,
+                   turn_state: Optional[str] = None) -> dict[str, str]:
+    """Codex CLI request headers. `ids` is the conversation's stable identity
+    (codex_state): ChatGPT derives cache affinity from `session-id`, so a
+    per-request random one — what this used to send for every request —
+    gave the backend no way to keep a conversation next to its cached prefix.
+    Without ids (not identifiable Claude Code traffic) each request still
+    gets fresh ones."""
+    session_id = ids.session_id if ids else _uuid7()
+    thread_id = ids.thread_id if ids else _uuid7()
     headers = {
         "Authorization": f"Bearer {cred.access_token}",
         "Content-Type": "application/json",
@@ -194,11 +228,28 @@ def _build_headers(cred: openai_credential.StoredOpenAICredential, *, is_subscri
         "User-Agent": _codex_user_agent(),
         "session-id": session_id,
         "thread-id": thread_id,
-        "x-client-request-id": thread_id,
+        "x-client-request-id": _uuid7(),
     }
+    if ids and ids.is_subagent:
+        # What the Codex CLI sends for a spawned agent.
+        headers["x-openai-subagent"] = "collab_spawn"
+        if ids.parent_thread_id:
+            headers["x-codex-parent-thread-id"] = ids.parent_thread_id
+    if turn_state:
+        headers["x-codex-turn-state"] = turn_state
     if is_subscription and cred.account_id:
         headers["ChatGPT-Account-ID"] = cred.account_id
     return headers
+
+
+@dataclass(frozen=True)
+class ConversationContext:
+    """Which Claude Code conversation a request belongs to (gateway supplies
+    it from project_attribution). None fields mean "not identifiable"."""
+    claude_session_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    # Only for a nested subagent (Claude Code omits it for a direct one).
+    parent_agent_id: Optional[str] = None
 
 
 def _refresh_if_needed(profile: Profile, cred: openai_credential.StoredOpenAICredential) -> openai_credential.StoredOpenAICredential:
@@ -242,10 +293,25 @@ def refresh_now(profile_id: str,
     refresh genuinely failed; the caller keeps using whatever it had.
     """
     now = time.monotonic()
-    not_before = _refresh_not_before.get(profile_id)
-    if not_before is not None and now < not_before:
-        return None  # still inside the backoff window from a recent failed attempt
-    _refresh_not_before[profile_id] = now + _REFRESH_CHECK_COOLDOWN_SECONDS
+    # Claim the slot atomically, exactly as gateway._try_refresh does on the
+    # Anthropic side and for the same reason: OpenAI ROTATES the refresh token
+    # on use (see `refreshed.refresh_token or cred.refresh_token` below), so
+    # two threads refreshing this Profile at once send the SAME single-use
+    # token. One consumes it; the other replays a token that no longer exists,
+    # which earns a 429 and can invalidate the grant outright — an account
+    # that was refreshing fine suddenly needing a manual re-auth.
+    #
+    # Reading not_before, deciding, and then writing it is a check-then-act
+    # that both threads can pass. The daemon serves requests on threads, so
+    # two concurrent turns on one Codex account reach here together.
+    with _refresh_lock:
+        if profile_id in _refresh_in_progress:
+            return None   # another thread is already refreshing this one
+        not_before = _refresh_not_before.get(profile_id)
+        if not_before is not None and now < not_before:
+            return None  # still inside the backoff window from a recent failed attempt
+        _refresh_not_before[profile_id] = now + _REFRESH_CHECK_COOLDOWN_SECONDS
+        _refresh_in_progress.add(profile_id)
 
     try:
         refreshed = openai_login.refresh_access_token(cred.refresh_token)
@@ -255,6 +321,12 @@ def refresh_now(profile_id: str,
             # than the normal cooldown.
             _refresh_not_before[profile_id] = now + _RATE_LIMIT_BACKOFF_SECONDS
         return None
+    finally:
+        # Must run on EVERY exit, including the success path below and any
+        # unexpected exception — a slot left claimed would block this
+        # Profile's refreshes for the life of the process.
+        with _refresh_lock:
+            _refresh_in_progress.discard(profile_id)
     new_cred = openai_credential.StoredOpenAICredential(
         access_token=refreshed.access_token,
         refresh_token=refreshed.refresh_token or cred.refresh_token,
@@ -274,7 +346,9 @@ def refresh_now(profile_id: str,
 
 
 def run(profile: Profile, stored_credential: str, body: bytes,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS, parity: Optional[dict] = None) -> OpenAIBridgeResult:
+        timeout: float = DEFAULT_TIMEOUT_SECONDS, parity: Optional[dict] = None,
+        context: Optional[ConversationContext] = None,
+        replay_reasoning: bool = True) -> OpenAIBridgeResult:
     """Runs one Claude Code request through a codex-kind Profile: decode the
     credential, maybe refresh it, translate the Anthropic request body, make
     the HTTPS call, and return a lazily-translated body_chunks generator of
@@ -330,12 +404,41 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         # substituting a Codex model for a rejected one would be nonsense.
         candidates += [m for m in fallback_models(first_choice) if m not in candidates]
 
+    # Only agent turns (requests offering tools) belong to the conversation.
+    # Claude Code's side calls — the auto-mode safety classifier, titles —
+    # carry the same session id but a different prompt, and must not take the
+    # conversation's sticky turn token or cache key.
+    is_agent_turn = bool(anthropic_body.get("tools"))
+    ids = (codex_state.conversation_ids(context.claude_session_id, context.agent_id,
+                                        context.parent_agent_id)
+           if context and is_agent_turn else None)
+    if ids is None:
+        # No conversation to key on (a script calling the proxy directly, or a
+        # Claude Code side call). Requests sharing a big system prompt are the
+        # same cached prefix upstream, so key on the prompt itself rather than
+        # sending a fresh random session-id — which is what left 400k+ tokens
+        # uncached on a fan-out of small, same-system requests.
+        ids = codex_state.identity_from_prompt(
+            target.model, openai_translate._extract_system_text(anthropic_body.get("system")))
+    turn = user_turn_index(anthropic_body)
+    turn_token = (codex_state.turn_state(context.claude_session_id, context.agent_id, turn)
+                  if ids and context else None)
+
     resp = None
     conn = None
-    for model in candidates:
+    served_model = None
+    attempts = [(m, replay_reasoning) for m in candidates]
+    index = 0
+    while index < len(attempts):
+        model, replay_reasoning = attempts[index]
+        index += 1
         attempt_target = replace(target, model=model)
-        payload = json.dumps(fmt.to_provider(anthropic_body, attempt_target)).encode("utf-8")
-        headers = _build_headers(cred, is_subscription=is_subscription)
+        lookup = ((lambda anchors, m=model: codex_state.reasoning_for(profile.id, m, anchors))
+                  if replay_reasoning else None)
+        payload = json.dumps(fmt.to_provider(
+            anthropic_body, attempt_target, reasoning_lookup=lookup,
+            prompt_cache_key=ids.prompt_cache_key if ids else None)).encode("utf-8")
+        headers = _build_headers(cred, is_subscription=is_subscription, ids=ids, turn_state=turn_token)
         headers["Content-Length"] = str(len(payload))
 
         try:
@@ -347,6 +450,7 @@ def run(profile: Profile, stored_credential: str, body: bytes,
 
         if resp.status < 400:
             _remember_substitution(target.model, model)
+            served_model = model
             break
 
         # An error response is never SSE, so read it whole (error bodies are
@@ -356,10 +460,22 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         response_headers = dict(resp.getheaders())
         status = resp.status
         conn.close()
+        text = raw.decode("utf-8", errors="replace")
 
-        if model is not candidates[-1] and _looks_like_model_rejection(
-            status, raw.decode("utf-8", errors="replace")
-        ):
+        # Replayed reasoning the backend will not accept (expired, or from a
+        # rotated key) must never cost the request: retry once without it.
+        #
+        # A context-length refusal counts. Replaying reasoning ADDS input
+        # Claude Code did not send and cannot see, so its own context budget
+        # cannot account for it — and it is the one part of the request we are
+        # free to drop, because it is an optimization, not the conversation.
+        if (replay_reasoning and status == 400
+                and ("encrypted" in text.lower() or "reasoning" in text.lower()
+                     or _looks_like_context_overflow(text))):
+            attempts.insert(index, (model, False))
+            continue
+
+        if model != candidates[-1] and _looks_like_model_rejection(status, text):
             continue
 
         def _error_chunks(raw: bytes = raw) -> Iterator[bytes]:
@@ -370,6 +486,10 @@ def run(profile: Profile, stored_credential: str, body: bytes,
 
     assert resp is not None and conn is not None  # candidates is never empty
     response_headers = dict(resp.getheaders())
+    if ids and context:
+        lowered = {k.lower(): v for k, v in response_headers.items()}
+        codex_state.remember_turn_state(context.claude_session_id, context.agent_id, turn,
+                                        lowered.get("x-codex-turn-state", ""))
 
     def _translated_chunks() -> Iterator[bytes]:
         translator = fmt.response_stream()
@@ -395,10 +515,22 @@ def run(profile: Profile, stored_credential: str, body: bytes,
                         break
                 else:
                     buffer += chunk
+                # The SSE spec allows CRLF, and a proxy may rewrite line
+                # endings even when the origin does not use them. "\r\n\r\n"
+                # contains no "\n\n", so without this the frame boundary is
+                # never found and the entire stream sits in the buffer and is
+                # silently dropped. Safe on the payload: a raw CR cannot appear
+                # inside a JSON string, only as the escape \r.
+                if b"\r\n" in buffer:
+                    buffer = buffer.replace(b"\r\n", b"\n")
                 while b"\n\n" in buffer:
                     frame, _, buffer = buffer.partition(b"\n\n")
                     event = _parse_sse_frame(frame)
-                    if event is not None:
+                    # Nothing may follow the provider's terminal event: the
+                    # translator has already emitted message_stop, so a later
+                    # frame would append content AFTER the end of the message
+                    # and the client cannot read that.
+                    if event is not None and not terminal_event_seen:
                         if event.get("type") in {
                             "response.completed",
                             "response.failed",
@@ -408,10 +540,29 @@ def run(profile: Profile, stored_credential: str, body: bytes,
                         yield from translator.feed(event)
                 if incomplete is not None:
                     if terminal_event_seen:
+                        # Not silent: this is us deciding a protocol-level
+                        # anomaly was benign, and if the provider's behaviour
+                        # changes the daemon log is the only place that would
+                        # show it. Not an Activity entry — the turn SUCCEEDED,
+                        # and the only category that fits there is "error".
+                        print("[codex] accepted a truncated chunked close: the terminal "
+                              f"event arrived first ({len(incomplete.partial)} trailing bytes)",
+                              file=sys.stderr, flush=True)
                         break
                     raise incomplete
+        except Exception as exc:  # noqa: BLE001 - see abort() on why this cannot propagate
+            # The status line and headers left long ago, so there is no way to
+            # turn this into an HTTP error: the only thing the client can still
+            # be told is an SSE `error` event. Without one it waits for a
+            # `message_stop` that will never come.
+            yield from translator.abort(f"upstream stream failed: {type(exc).__name__}: {exc}"[:500])
         finally:
             conn.close()
+            # Only a finished response is replayed from: a partial turn's
+            # reasoning would precede output Claude Code never kept.
+            if terminal_event_seen and served_model and getattr(translator, "reasoning_items", None):
+                codex_state.remember_reasoning(profile.id, served_model, translator.anchors(),
+                                               translator.reasoning_items)
 
     return OpenAIBridgeResult(status=200, headers=response_headers, body_chunks=_translated_chunks())
 
@@ -430,6 +581,12 @@ def _parse_sse_frame(frame: bytes) -> Optional[dict]:
     if not data_line:
         return None
     try:
-        return json.loads(data_line)
+        parsed = json.loads(data_line)
     except json.JSONDecodeError:
         return None
+    # `data: "hi"`, `data: [1,2]` and `data: null` are all valid JSON and none
+    # of them is an event. Returning them would hand a str/list/None to
+    # `event.get("type")`, an AttributeError that the caller's broad handler
+    # turns into an aborted stream — a junk frame must be skipped, exactly
+    # like malformed JSON already is.
+    return parsed if isinstance(parsed, dict) else None

@@ -74,6 +74,8 @@ class ExportedProfile:
     # "Every subagent goes here". Defaulted so bundles written before the
     # field existed still import.
     forced_for_subagents: bool = False
+    # "Leave when Fable is spent". Same reason for the default.
+    leave_on_fable_limit: bool = False
 
 
 def build_export_bundle(
@@ -104,6 +106,7 @@ def build_export_bundle(
                 tag_color=p.tag_color, account_uuid=p.account_uuid, credential=cred,
                 plan=p.plan, codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
                 forced_for_subagents=p.forced_for_subagents,
+                leave_on_fable_limit=p.leave_on_fable_limit,
             )))
         payload["profiles"] = exported
 
@@ -218,6 +221,7 @@ def apply_import(
                         tag_color=item.get("tag_color"), plan=item.get("plan"),
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                         forced_for_subagents=bool(item.get("forced_for_subagents", False)),
+                        leave_on_fable_limit=item.get("leave_on_fable_limit") is True,
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
                     result["profiles_updated"] += 1
@@ -235,6 +239,7 @@ def apply_import(
                     account_uuid=item.get("account_uuid"), plan=item.get("plan"),
                     codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                     forced_for_subagents=bool(item.get("forced_for_subagents", False)),
+                    leave_on_fable_limit=item.get("leave_on_fable_limit") is True,
                 )
                 secret_store.set_token(new_profile.id, item["credential"])
                 pool.profiles.append(new_profile)

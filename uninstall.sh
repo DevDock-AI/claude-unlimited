@@ -34,9 +34,20 @@ case "$(uname -s)" in
       launchctl bootout "gui/$(id -u)/com.claude-unlimited.daemon" 2>/dev/null || true
       rm -f "$PLIST"
     fi
+    # The HUD is a separate app with its own login item. Left behind, it keeps
+    # starting on every login and polling a daemon that is no longer there.
+    HUD_PLIST="$HOME/Library/LaunchAgents/ai.devdock.claude-unlimited.hud.plist"
+    if [ -f "$HUD_PLIST" ]; then
+      launchctl bootout "gui/$(id -u)/ai.devdock.claude-unlimited.hud" 2>/dev/null || true
+      rm -f "$HUD_PLIST"
+    fi
+    pkill -f "HUD - Heads-Up Display.app/Contents/MacOS/" 2>/dev/null || true
+    rm -rf "$HOME/Applications/HUD - Heads-Up Display.app" "$HOME/Applications/CapacityWidget.app"
     ;;
 esac
 
-rm -f "$HOME/.local/bin/claude-unlimited"
+# Both command names ship — removing only `claude-unlimited` left `cu` behind
+# as a dangling symlink.
+rm -f "$HOME/.local/bin/claude-unlimited" "$HOME/.local/bin/cu"
 rm -rf "$HOME/.local/share/claude-unlimited" "$HOME/.claude-unlimited"
 echo "Removed. ~/.claude was left untouched."

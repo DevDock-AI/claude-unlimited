@@ -25,6 +25,7 @@ from pathlib import Path
 
 TASK_NAME = "ClaudeUnlimitedDaemon"
 PID_FILE = Path.home() / ".claude-unlimited" / "daemon.pid"
+LOG_DIR = Path.home() / ".claude-unlimited" / "logs"
 
 
 class DaemonInstallerError(RuntimeError):
@@ -55,9 +56,29 @@ def install(port: int) -> None:
     pythonw = Path(python).with_name("pythonw.exe")
     launcher = str(pythonw) if pythonw.exists() else python
 
+    # schtasks' /tr has no output-redirection syntax of its own, and Task
+    # Scheduler gives the launched process no std handles at all when /tr
+    # names the interpreter directly — confirmed on real hardware:
+    # daemon.out.log/.err.log stayed empty forever under a service-managed
+    # daemon, even while it was up and serving requests. A wrapper script
+    # also sidesteps nesting our own quotes inside schtasks' /tr parsing.
+    # -u is the other half of the same fix (see cli.py's
+    # _spawn_background_daemon): once something *is* capturing stdout to a
+    # file, CPython block-buffers it and the banner still never shows up.
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    out_log = LOG_DIR / "daemon.out.log"
+    err_log = LOG_DIR / "daemon.err.log"
+    wrapper = LOG_DIR.parent / "daemon_launcher.cmd"
+    wrapper.write_text(
+        "@echo off\r\n"
+        f'"{launcher}" -u -m claude_unlimited start --port {port} '
+        f'>> "{out_log}" 2>> "{err_log}"\r\n',
+        encoding="ascii",
+    )
+
     result = _run(
         "schtasks", "/create", "/tn", TASK_NAME,
-        "/tr", f'"{launcher}" -m claude_unlimited start --port {port}',
+        "/tr", f'"{wrapper}"',
         "/sc", "onlogon", "/rl", "limited", "/f",
     )
     if result.returncode != 0:

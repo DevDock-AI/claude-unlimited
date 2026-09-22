@@ -27,19 +27,24 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 
-from . import activity, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_tracking
+from . import activity, eco, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
-from .observation import AuthInvalid, ProviderUnavailable, QuotaExhausted, Unknown, UsageSnapshot, classify
+from .observation import AuthInvalid, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
 from .proxy import build_upstream_request, filter_response_headers, request_model, rewrite_model
 from .router import (
     PoolSnapshot,
     ProfileRuntime,
     ProfileState,
+    RequestFit,
     RoutingDecision,
     choose,
     choose_for_new_branch,
+    fable_spent,
+    fits,
+    must_leave,
     observe,
+    record_credits,
     recover_expired_cooldowns,
 )
 from .upstream import UpstreamResponse
@@ -130,9 +135,12 @@ def _restorable_usage_fields(persisted: Optional[dict], now: datetime) -> dict:
         if not isinstance(iso, str):
             return None
         try:
-            return datetime.fromisoformat(iso)
+            parsed = datetime.fromisoformat(iso)
         except ValueError:
             return None
+        # A naive timestamp compared with the aware `now` raises TypeError,
+        # and this runs at startup. Everything we write is UTC.
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
     fields: dict = {}
     resets_at = _parse(persisted.get("resets_at"))
@@ -143,8 +151,182 @@ def _restorable_usage_fields(persisted: Optional[dict], now: datetime) -> dict:
     if resets_at_7d is not None and resets_at_7d > now and isinstance(persisted.get("last_usage_percent_7d"), (int, float)):
         fields["last_usage_percent_7d"] = persisted["last_usage_percent_7d"]
         fields["resets_at_7d"] = resets_at_7d
+    # Per-model windows, same rule: one past its own reset is dropped.
+    windows = []
+    for row in persisted.get("model_usage") or ():
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) \
+                or isinstance(row.get("percent"), bool) or not isinstance(row.get("percent"), (int, float)):
+            continue
+        window_reset = _parse(row.get("resets_at"))
+        if window_reset is not None and window_reset <= now:
+            continue
+        windows.append(ModelWindow(name=row["name"], percent=float(row["percent"]),
+                                   resets_at=window_reset, active=row.get("active") is True))
+    if windows:
+        fields["model_usage"] = tuple(windows)
+    # Prepaid credits (issue #6). No expiry rule: unlike a usage window, a
+    # balance does not refill on a clock, so the last known figure stays the
+    # best answer until the backend reports a new one. Restoring it matters —
+    # without it a restart shows "credits: unknown" on an account the pool may
+    # be about to spend money from.
+    if isinstance(persisted.get("credits_has"), bool):
+        fields["credits_has"] = persisted["credits_has"]
+    balance = persisted.get("credits_balance")
+    if isinstance(balance, (int, float)) and not isinstance(balance, bool):
+        fields["credits_balance"] = float(balance)
     return fields
 
+
+
+def _replace_runtime(rt: ProfileRuntime, **changes) -> ProfileRuntime:
+    from dataclasses import replace
+    return replace(rt, **changes)
+
+
+def _eco_mode_of(stats) -> Optional[str]:
+    """Which tier produced a saving — a number without its tier cannot be
+    compared across a settings change."""
+    return getattr(stats, "tier", None)
+
+
+def _eco_compact(body: bytes, tier: str) -> tuple[bytes, "eco.CompactionStats"]:
+    """Compact tool output before the request leaves the daemon.
+
+    Fails open at every step (invariant 5): a body that will not parse, a
+    filter that raises, or a result that will not re-serialise all return the
+    ORIGINAL bytes. ECO must never be the reason a request fails.
+
+    Called once per handle(), not per rotation attempt: a failover re-sends
+    from the original body, and compacting an already-compacted body is how
+    markers stack up.
+    """
+    if tier == "off" or not body:
+        return body, eco.CompactionStats()
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return body, eco.CompactionStats()
+    try:
+        new_body, stats = eco.compact_request(parsed, tier)
+    except Exception:
+        return body, eco.CompactionStats()
+    if not stats.touched:
+        return body, stats
+    object.__setattr__(stats, "tier", tier)
+    try:
+        # Compact separators and real UTF-8: the defaults inflate non-ASCII to
+        # \uXXXX escapes and add a byte per key/element, which made the body
+        # grow for any conversation with diacritics or emoji.
+        encoded = json.dumps(new_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        return body, eco.CompactionStats()
+    if len(encoded) >= len(body):
+        # Invariant 3 at the WIRE level, not just per tool result: if the
+        # re-serialised body is not smaller, send the original and claim
+        # nothing. A reported saving must be a real one.
+        return body, eco.CompactionStats()
+    return encoded, stats
+
+
+def _speech_apply(body: bytes, stats: "eco.CompactionStats", level: str) -> tuple[bytes, "eco.CompactionStats"]:
+    """Primitive speech: add its instruction to an agent turn's system prompt.
+
+    Fails open exactly like ECO — a body that will not parse or re-serialise
+    goes out untouched. The level rides on the stats object, like ECO's tier,
+    so the usage row records which replies were written under it."""
+    if level == "off" or not body:
+        return body, stats
+    try:
+        parsed = json.loads(body)
+        new_body, added = speech.apply(parsed, level)
+        if not added:
+            return body, stats
+        encoded = json.dumps(new_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (ValueError, TypeError):
+        return body, stats
+    # CompactionStats() is a shared-looking default; never tag that instance.
+    if not stats.touched:
+        stats = eco.CompactionStats()
+    object.__setattr__(stats, "speech", level)
+    return encoded, stats
+
+
+def _drop_empty_text_blocks(body: bytes) -> bytes:
+    """Remove empty text blocks from a request before it is forwarded.
+
+    Anthropic rejects a request carrying one outright — `400 messages: text
+    content blocks must be non-empty` — and a client re-sends its whole
+    conversation every turn, so ONE empty block recorded in a session's
+    history breaks every later request in that session, on every account.
+    That is not a hypothetical: the Codex bridge used to emit one whenever a
+    reply went straight to a tool call, and the sessions it wrote could not be
+    continued afterwards even though nothing was wrong with the account.
+
+    Fixing the producer cannot repair a transcript already on disk, so the
+    request path drops them here. A message left with no content at all is
+    dropped with them — it can only have been an empty block on its own,
+    never a tool_use or tool_result, so nothing that must stay paired is
+    touched. Fails open like every other rewrite: a body that will not parse
+    goes out exactly as it came in.
+    """
+    if not body:
+        return body
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(parsed, dict):
+        return body
+
+    def keep(block) -> bool:
+        return not (isinstance(block, dict) and block.get("type") == "text"
+                    and not (block.get("text") or "").strip())
+
+    changed = False
+    messages = parsed.get("messages")
+    if isinstance(messages, list):
+        kept_messages = []
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                kept = [b for b in content if keep(b)]
+                if len(kept) != len(content):
+                    changed = True
+                    if not kept:
+                        continue  # the whole message was one empty block
+                    message = {**message, "content": kept}
+            kept_messages.append(message)
+        if changed:
+            parsed["messages"] = kept_messages
+
+    # The system prompt is rejected the same way, and is rebuilt every turn by
+    # ECO and primitive speech, so it can pick one up too.
+    system = parsed.get("system")
+    if isinstance(system, list):
+        kept_system = [b for b in system if keep(b)]
+        if len(kept_system) != len(system):
+            changed = True
+            parsed["system"] = kept_system
+
+    if not changed:
+        return body
+    try:
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (ValueError, TypeError):
+        return body
+
+
+def _codex_5h_percent(headers: dict) -> Optional[float]:
+    """The primary (5h) window percentage a Codex response reported."""
+    value = {k.lower(): v for k, v in (headers or {}).items()}.get("x-codex-primary-used-percent")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _speech_level_of(stats) -> Optional[str]:
+    return getattr(stats, "speech", None)
 
 
 def _parsed_request(body: bytes) -> Optional[dict]:
@@ -172,13 +354,18 @@ def _requested_model(parsed: Optional[dict]) -> Optional[str]:
 def _client_wants_streaming(parsed: Optional[dict]) -> bool:
     """Whether the inbound Anthropic request asked for an SSE response.
 
-    Anthropic's default is non-streaming, but every real Claude Code turn
-    sets stream:true explicitly; an unparsable or absent body is treated as
-    streaming so a malformed request can never silently buffer a whole
+    Follows the Anthropic API: streaming only when `stream` is true. A body
+    WITHOUT the field is a non-streaming call — that is how the Anthropic SDK
+    sends `messages.create()` when streaming is not requested, and it is
+    exactly how Claude Code's auto-mode safety classifier calls. Treating an
+    absent field as streaming sent that classifier an SSE body it could not
+    parse, and every Edit/Bash in auto mode on a Codex account failed with
+    "claude-sonnet-5 is temporarily unavailable". Only an unparsable body is
+    still treated as streaming, so a malformed request never buffers a whole
     response in memory."""
-    if not parsed or "stream" not in parsed:
+    if not parsed:
         return True
-    return bool(parsed.get("stream"))
+    return parsed.get("stream") is True
 
 
 def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
@@ -234,6 +421,182 @@ class BranchPin:
     parent_agent_id: Optional[str] = None
 
 
+def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime) -> frozenset:
+    """Which Claude models this codex Profile cannot serve right now.
+
+    OpenAI reports availability keyed by the GPT model id (`gpt-6-astra`),
+    while routing is asked about a CLAUDE id. Resolving one to the other needs
+    the parity list and the model catalogue — file I/O — so it happens here,
+    where both are already in hand, and router.py gets a plain set.
+
+    Only the models the pool actually advertises are resolved: the in-force
+    parity rows ARE the set Claude Code's picker offers for a codex-served
+    session, so they are the ids that can arrive. A model outside that set
+    falls through as unblocked, which is the safe direction — the provider's
+    own error is better than idling an account on a guess.
+
+    Returns an empty set for anything that is not a codex Profile, and for a
+    codex Profile whose backend reported nothing."""
+    if profile.kind != "codex" or not model_usage:
+        return frozenset()
+    unavailable = set()
+    for window in model_usage:
+        if window.percent < 100:
+            continue
+        # A bucket past its own available_at is stale, not blocking — the same
+        # rule fable_spent() applies to Anthropic's windows.
+        resets_at = getattr(window, "resets_at", None)
+        if resets_at is not None and now >= resets_at:
+            continue
+        unavailable.add(window.name.strip().lower())
+    if not unavailable:
+        return frozenset()
+
+    from .model_catalogue import base_id
+    from . import openai_models
+
+    blocked = set()
+    try:
+        rows = openai_models.normalize_parity(getattr(settings, "model_parity", None))
+    except Exception:
+        return frozenset()   # a broken parity list must not block every model
+    for row in rows:
+        claude_model = row.get("claude_model")
+        if not isinstance(claude_model, str) or not claude_model:
+            continue
+        try:
+            target = openai_models.map_model(
+                claude_model,
+                override_model=profile.codex_model,
+                override_reasoning_effort=profile.codex_reasoning_effort,
+                parity=rows)
+        except Exception:
+            continue
+        if target.model and target.model.strip().lower() in unavailable:
+            blocked.add(base_id(claude_model).lower())
+    return frozenset(blocked)
+
+
+@dataclass(frozen=True)
+class RequestGuard:
+    """The per-request capacity guard's verdict for ONE request (docs/adr
+    0009): the pure `fit` router.py filters on, plus what the gateway needs
+    to explain it — each codex Profile's resolved window for this request's
+    model. None (see _request_guard) means the body is under the byte floor
+    and nothing was sized."""
+    fit: RequestFit
+    windows: dict  # profile_id -> gpt_windows.WindowInfo, codex Profiles only
+
+
+def _request_guard(body: bytes, parsed: Optional[dict], pool: Pool) -> Optional[RequestGuard]:
+    """Which codex Profiles cannot hold this conversation.
+
+    Stage 1 is free: a body under gpt_windows.CERTAINLY_FITS_BYTES cannot
+    exceed any codex budget, so the common case parses nothing and returns
+    None — which is also the answer for a pool with no codex Profile, and
+    for anything that is not a /v1/messages turn (the caller's check).
+    Stage 2 reuses the shared parse when the caller already has one, and
+    parses otherwise; an unparsable body is sized from its bytes alone,
+    which only ever over-estimates and so only ever excludes codex.
+
+    Never raises, and never puts an oauth/api Profile in the set: Claude Code
+    sizes those windows itself. Any failure here degrades to "not sized" —
+    today's behaviour — rather than blocking Anthropic traffic."""
+    if len(body) < gpt_windows.CERTAINLY_FITS_BYTES:
+        return None
+    codex = [p for p in pool.profiles if p.kind == "codex" and p.enabled]
+    if not codex:
+        return None
+    try:
+        if parsed is None:
+            parsed = _parsed_request(body)
+        estimate = gpt_windows.estimate_input_tokens(body, parsed)
+        requested = _requested_model(parsed)
+        try:
+            rows = openai_models.normalize_parity(getattr(pool.settings, "model_parity", None))
+        except Exception:
+            rows = None
+        windows: dict = {}
+        over = set()
+        for profile in codex:
+            try:
+                target = openai_models.map_model(
+                    requested, override_model=profile.codex_model,
+                    override_reasoning_effort=profile.codex_reasoning_effort, parity=rows)
+                model = target.model
+            except Exception:
+                model = profile.codex_model  # unknown → assumed at the floor
+            info = gpt_windows.window_for(model, getattr(profile, "auth_mode", None),
+                                          getattr(profile, "base_url", None))
+            windows[profile.id] = info
+            if estimate > info.budget:
+                over.add(profile.id)
+        return RequestGuard(fit=RequestFit(estimated_tokens=estimate, over_capacity=frozenset(over)),
+                            windows=windows)
+    except Exception:
+        return None
+
+
+def _leave_on_fable_limit(p: Profile, settings) -> bool:
+    """The RESOLVED "leave when Fable is spent" switch for this Profile: its
+    own flag, or the pool-wide override that makes every Profile behave as if
+    its flag were on. Resolved here, once per sync, so router.py never has to
+    look at Settings. Harmless on an api Profile — it never reports a Fable
+    bucket, so fable_spent() is always False for it."""
+    return bool(getattr(p, "leave_on_fable_limit", False)
+                or getattr(settings, "fable_limit_all_profiles", False))
+
+
+def _may_spend_credits(p: Profile, settings) -> bool:
+    """Whether this Profile is allowed to keep serving on prepaid credits.
+    Codex-only: no other backend reports a credit balance, and mirroring the
+    setting onto an oauth or api Profile would let a future change read a
+    permission that can never legitimately apply to it."""
+    return bool(p.kind == "codex" and getattr(settings, "codex_spend_credits", False))
+
+
+MESSAGE_ALL_EXHAUSTED = "Claude Unlimited — all profiles are out of capacity."
+
+def _out_of_capacity(rt) -> bool:
+    """Whether this Profile has no capacity left, as opposed to being
+    unusable for some other reason.
+
+    EXHAUSTED and DRAINING say so outright. A COOLDOWN does not: it covers
+    both a provider rate-limit and a provider that could not be reached at
+    all, and "we could not connect" must never be reported to the user as
+    "you are out of quota". The account's own usage is what tells them apart —
+    a cooldown on an account sitting at its switch threshold is its quota
+    running out; a cooldown at 3% is the network.
+    """
+    if rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
+        return True
+    return (rt.state == ProfileState.COOLDOWN
+            and rt.last_usage_percent is not None
+            and rt.last_usage_percent >= rt.switch_threshold)
+
+
+def _capacity_exhaustion(snapshot, pool) -> tuple[bool, Optional[datetime]]:
+    """(every usable Profile is out of capacity, when the first one returns).
+
+    "Usable" means enabled: a Profile the user switched off is not part of the
+    pool's capacity, so a pool of one enabled account that hits its limit is
+    exhausted even with three disabled ones beside it.
+    """
+    enabled = {p.id for p in pool.profiles if p.enabled}
+    runtimes = [rt for rt in snapshot.profiles if rt.profile_id in enabled]
+    if not runtimes or not all(_out_of_capacity(rt) for rt in runtimes):
+        return False, None
+    deadlines = [d for rt in runtimes
+                 for d in (rt.resets_at, rt.cooldown_until) if d is not None]
+    return True, min(deadlines) if deadlines else None
+
+
+def _exhaustion_message(resets_at: Optional[datetime]) -> str:
+    if resets_at is None:
+        return MESSAGE_ALL_EXHAUSTED
+    return f"{MESSAGE_ALL_EXHAUSTED} The first one resets at {resets_at.astimezone():%H:%M}."
+
+
 @dataclass(frozen=True)
 class GatewayResult:
     status: int
@@ -241,6 +604,10 @@ class GatewayResult:
     body_chunks: Optional[Iterator[bytes]]
     profile_id: Optional[str]
     error: Optional[str] = None
+    # The sentence to show the user, when the gateway knows something more
+    # specific than the error code's stock wording (e.g. when capacity comes
+    # back). None means "use the stock message for `error`".
+    error_detail: Optional[str] = None
 
 
 class Gateway:
@@ -320,6 +687,11 @@ class Gateway:
         self._current_profile_id: Optional[str] = None
         self._transport = transport
         self._warned_approaching: set[str] = set()
+        # True once "everything is out of capacity" has been announced, so the
+        # next thousand rejected requests do not each write an Activity line
+        # and fire a notification. Cleared the moment any Profile can serve
+        # again (see _note_capacity_back).
+        self._exhaustion_announced = False
         # Profile ids with a request genuinely in flight right now — a
         # request is only ever added here once it's actually being served
         # (transport call started) and removed once that Profile's response
@@ -353,7 +725,39 @@ class Gateway:
         # now" 20+ minutes after its last request, long past the grace window).
         # in_flight_ids() ignores an entry older than _IN_FLIGHT_MAX_SECONDS so
         # such a slot self-heals; no legitimate single request runs that long.
+        # "Take over" — held until another Take Over or until the Profile
+        # stops being ELIGIBLE (see _manual_choice).
+        self._manual_profile_id: Optional[str] = None
+        # One credential-check worker at a time (see _schedule_credential_checks).
+        self._credential_check_running = False
         self._in_flight_since: dict[str, float] = {}
+        # Profiles whose spent Fable week has already been noted in Activity
+        # for a pin that is being honoured anyway (--profile, Take over,
+        # forced-in-subagents) or for a pool with nowhere else to go. A pinned
+        # session retries on every turn; one line per account per spent week
+        # is information, one per request is a flood. Cleared the moment the
+        # account is no longer spent, so the next week gets its own line.
+        self._fable_limit_noted: set = set()
+        # GPT ids the capacity guard has already said it is ASSUMING a window
+        # for (not in gpt_windows' table). One Activity line per id per
+        # daemon run; the preview shows the assumption for as long as it holds.
+        self._window_assumed_noted: set = set()
+        # When the guard last answered "prompt is too long" for a given
+        # session/pin key -> monotonic time. Claude Code compacts and retries
+        # on that answer, so one Activity line per key per interval is the
+        # information; one per request would be the flood the exhaustion
+        # announcement above already avoids.
+        self._capacity_noted_at: dict = {}
+        # Profiles that took a 429 their ACCOUNT-level windows cannot explain,
+        # so a per-model limit is the likely cause and the usage endpoint is
+        # worth re-reading now instead of at the next 5-10 minute tick.
+        # profile_id -> monotonic time the re-read was asked for; the entry
+        # stays after draining so the cap below can see it.
+        self._usage_recheck_requested: dict[str, float] = {}
+        self._usage_recheck_pending: set = set()
+        # Set when a re-read should not wait for the next probe tick; the
+        # daemon's probe loop waits on it instead of sleeping blind.
+        self.usage_recheck_wakeup = threading.Event()
         # Last time (monotonic) each Profile's in-flight request finished.
         # Without this, "Used now" is only ever true for the literal
         # duration of one request/response cycle — for a quick non-streaming
@@ -406,13 +810,13 @@ class Gateway:
         # read), so token_threshold is its analogue: a hard, absolute
         # lifetime-token-count cap instead of a percentage of a window
         # Anthropic reports. Only computed when at least one Profile
-        # actually uses it — usage_history.list_events() reads and parses
-        # the whole (bounded, but potentially sizeable) usage log, not
-        # worth paying on every single request for setups that never touch
-        # this feature.
+        # actually uses it, and as a SQL aggregate: this runs on every
+        # routing decision and on every Dashboard poll, and the version that
+        # built an object per stored event made both scale with the size of
+        # the user's whole history.
         tokens_by_profile = None
         if any(p.kind == "api" and p.token_threshold for p in pool.profiles):
-            tokens_by_profile = usage_history.usage_by_profile(usage_history.list_events())
+            tokens_by_profile = usage_history.totals_by_profile()
 
         def _over_token_budget(p: Profile) -> bool:
             if p.kind != "api" or not p.token_threshold or tokens_by_profile is None:
@@ -454,19 +858,18 @@ class Gateway:
                     automatic=p.automatic,
                     state=restored_state,
                     credential_seen=p.credential_updated_at,
+                    may_spend_credits=_may_spend_credits(p, pool.settings),
+                    blocked_models=_blocked_models_for(
+                        p, restored.get("model_usage", ()), pool.settings, now_utc),
+                    leave_on_fable_limit=_leave_on_fable_limit(p, pool.settings),
                     **restored,
                 )
                 state = restored_state
-                if state == ProfileState.ELIGIBLE:
-                    # Covers a Profile that's ELIGIBLE but already near its
-                    # real expiry the very first time this Gateway instance
-                    # ever sees it — e.g. right after a daemon restart, before
-                    # any request or a second sync tick would otherwise reach
-                    # the existing-Profile branch below. A brand new Profile
-                    # can never start AUTH_INVALID (it hasn't been observed
-                    # yet), so this only ever exercises the preventive
-                    # refresh-while-still-healthy path, never the recovery one.
-                    self._maybe_check_oauth_credential(p, self._runtime[p.id])
+                # A Profile this Gateway has just seen for the first time may
+                # already be near its real expiry (e.g. right after a restart).
+                # The check itself runs in _run_due_credential_checks, OUTSIDE
+                # this lock — see that method — so this tick only notes it.
+
             else:
                 rt = self._runtime[p.id]
                 new_state = rt.state
@@ -494,6 +897,7 @@ class Gateway:
                     # toggle or a full daemon restart, even though the real
                     # credential behind it is now valid.
                     new_state = ProfileState.ELIGIBLE
+                    self._queue_recovered_usage_read(p.id)
                 elif (rt.state == ProfileState.DRAINING and p.kind in ("oauth", "codex")
                         and rt.last_usage_percent is not None and rt.last_usage_percent < p.switch_threshold):
                     # Raising switch_threshold can put a DRAINING Profile
@@ -509,17 +913,27 @@ class Gateway:
                     # raising token_threshold above the current lifetime
                     # usage recovers it immediately.
                     new_state = ProfileState.ELIGIBLE
-                elif (self._maybe_check_oauth_credential(p, rt) == ProfileState.ELIGIBLE
-                        or self._maybe_check_codex_credential(p, rt) == ProfileState.ELIGIBLE):
-                    # An AUTH_INVALID Profile just self-recovered via its
-                    # refresh_token — see those methods' docstrings. Both
-                    # kinds that HAVE a refresh token are covered; checking
-                    # only one of them is what stranded codex accounts. For
-                    # every other state each call is either a no-op (wrong
-                    # kind, not due for a check yet) or a proactive refresh
-                    # with no state change (still ELIGIBLE, just less close
-                    # to actually expiring now).
+                # An AUTH_INVALID Profile that self-recovered via its
+                # refresh_token is already ELIGIBLE in self._runtime by now:
+                # _run_due_credential_checks applied it before this sync, so
+                # `rt.state` above carries it. That work used to happen right
+                # here, which meant a keychain fork and a token-refresh
+                # NETWORK CALL while this lock was held — every Dashboard and
+                # widget poll then queued behind it, for 20-45s on a loaded
+                # machine, and the widget fell back to its loading state.
+                may_spend_credits = _may_spend_credits(p, pool.settings)
+                if new_state in (ProfileState.DRAINING, ProfileState.EXHAUSTED) and may_spend_credits and rt.credits_has:
+                    # Turning "spend credits" on must take effect now, not at
+                    # the next request: an account parked as spent is exactly
+                    # the one the user just bought credits for.
                     new_state = ProfileState.ELIGIBLE
+                elif (new_state == ProfileState.ELIGIBLE and not may_spend_credits
+                        and p.kind == "codex" and rt.last_usage_percent is not None
+                        and rt.last_usage_percent >= p.switch_threshold):
+                    # And turning it back off must stop the spending now, for
+                    # the same reason — a Profile only ELIGIBLE because credits
+                    # were allowed has to go back to draining.
+                    new_state = ProfileState.DRAINING
                 if new_state not in (ProfileState.DISABLED, ProfileState.AUTH_INVALID) and _over_token_budget(p):
                     # No resets_at (there's no time window here) — stays
                     # EXHAUSTED, same as force_active()'s reasoning for
@@ -537,6 +951,7 @@ class Gateway:
                     resets_at=rt.resets_at,
                     last_usage_percent_7d=rt.last_usage_percent_7d, resets_at_7d=rt.resets_at_7d,
                     window_label=rt.window_label, window_label_7d=rt.window_label_7d,
+                    model_usage=rt.model_usage,   # rebuilt every poll tick; dropping it erased every read
                     credential_seen=p.credential_updated_at,
                     # Must be carried over: this reconstruction runs on every
                     # _sync_snapshot call (roughly every Dashboard poll tick, not
@@ -549,9 +964,33 @@ class Gateway:
                     # exists to catch, found here by inspection rather than by
                     # a second live incident.
                     consecutive_unretryable_failures=rt.consecutive_unretryable_failures,
+                    # Same rebuild trap as model_usage above: credits are
+                    # observed, not configured, so leaving them out would
+                    # blank the balance on the next Dashboard poll.
+                    credits_has=rt.credits_has, credits_balance=rt.credits_balance,
+                    may_spend_credits=may_spend_credits,
+                    # Recomputed rather than carried: it depends on the parity
+                    # list and on the clock (a bucket expires), both of which
+                    # can change between ticks. Leaving it out of THIS
+                    # constructor is the trap that has already dropped
+                    # model_usage and the credit balance.
+                    blocked_models=_blocked_models_for(
+                        p, rt.model_usage, pool.settings, datetime.now(timezone.utc)),
+                    # Configuration, re-read every tick like priority and
+                    # switch_threshold: flipping the Profile's switch or the
+                    # global override must apply to the next request. Same
+                    # rebuild trap as everything above.
+                    leave_on_fable_limit=_leave_on_fable_limit(p, pool.settings),
                 )
         if self._current_profile_id not in live_ids:
             self._current_profile_id = None
+        if self._fable_limit_noted:
+            # A spent-week note is forgotten the moment the account is no
+            # longer spent, so the NEXT spent week gets its own line — and a
+            # deleted Profile's note goes with it.
+            now_utc = datetime.now(timezone.utc)
+            self._fable_limit_noted = {pid for pid in self._fable_limit_noted
+                                       if pid in self._runtime and fable_spent(self._runtime[pid], now_utc)}
         # A pin naming a Profile that has been deleted (or turned off) is dead
         # weight that would otherwise be re-checked on every request until its
         # TTL; drop it here, where the persisted Pool is already in hand, so
@@ -599,15 +1038,37 @@ class Gateway:
         # megabytes), so it is only done when a per-branch mode can apply at
         # all. Checked against a fresh read outside the lock; a setting toggled
         # between here and the decision simply applies from the next request.
-        branch = (project_attribution.branch_key(headers, body)
-                  if self._branch_modes_apply(load_pool(), distribute, is_subagent) else None)
-        branch_moves: list[tuple[str, str]] = []
+        app_pinned = self._app_pinned(headers)
+        pool_now = load_pool()
+        branch_modes = app_pinned or self._branch_modes_apply(pool_now, distribute, is_subagent)
+        # ONE parse of the body per request, and only for branch
+        # identification: routing no longer looks at the requested model (a
+        # spent Fable week moves the whole session, whatever the model), so a
+        # pool with no per-branch mode parses nothing.
+        parsed_request = _parsed_request(body) if branch_modes else None
+        branch = project_attribution.branch_key(headers, body, parsed_request) if branch_modes else None
+        # The capacity guard (docs/adr/0009), once per request and only for a
+        # real turn: the same bytes go out on every rotation attempt, and the
+        # estimate is computed on the pre-ECO body, which is the larger one
+        # (conservative). Almost always None — see _request_guard.
+        is_turn = method == "POST" and path.rstrip("/").endswith("/v1/messages")
+        guard = _request_guard(body, parsed_request, pool_now) if is_turn else None
+        fit = guard.fit if guard is not None else None
+        if guard is not None:
+            self._note_assumed_windows(pool_now, guard)
+        branch_moves: list[tuple[str, str, str]] = []
         parent_agent_id = project_attribution.parent_agent_id_from_headers(headers)
         # Pins are only CREATED for real message traffic — token counting and
         # other ancillary calls never populate the prompt cache, so pinning on
         # them would just burn map slots. Lookups still apply to every path so
         # a branch's side calls ride its existing pin.
         may_create_pin = method == "POST" and path.rstrip("/").endswith("/v1/messages")
+
+        # ECO compacts the body ONCE for this request; every rotation attempt
+        # then sends the same compacted bytes. Default tier is "off", in which
+        # case this is a no-op returning the original object.
+        eco_body: Optional[bytes] = None
+        eco_stats = eco.CompactionStats()
 
         for _ in range(MAX_ROTATION_ATTEMPTS):
             with self._lock:
@@ -616,18 +1077,23 @@ class Gateway:
                 pre_recovery_states = {rt.profile_id: rt.state for rt in snapshot.profiles}
                 snapshot = recover_expired_cooldowns(snapshot, now)
                 self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
+                snapshot = self._maybe_return_to_preferred(pool, snapshot)
                 if forced_profile_id is not None:
                     # An explicit --profile pin outranks everything: it must
                     # never be silently substituted, not even by a branch pin.
-                    decision = self._forced_decision(pool, forced_profile_id)
+                    decision = self._forced_decision(pool, forced_profile_id, now, fit)
                 else:
                     decision = self._branch_decision(
                         pool, snapshot, now, branch, is_subagent, parent_agent_id,
-                        attempted, distribute, may_create_pin, moves=branch_moves)
+                        attempted, distribute, may_create_pin, moves=branch_moves,
+                        app_pinned=app_pinned, fit=fit)
             branch_routed = decision.reason in _BRANCH_ROUTED_REASONS
-            for from_id, to_id in branch_moves:
-                self._record_branch_move(pool, from_id, to_id)
+            for from_id, to_id, why in branch_moves:
+                self._record_branch_move(pool, from_id, to_id, why)
             branch_moves.clear()
+            if decision.reason == "fable_limit_no_alternative" and decision.profile_id is not None:
+                self._note_fable_limit_served_anyway(pool, decision.profile_id, now,
+                                                     "no other account can take the session — served anyway")
 
             for rt in snapshot.profiles:
                 if pre_recovery_states.get(rt.profile_id) in _QUOTA_RESET_SOURCE_STATES and rt.state == ProfileState.ELIGIBLE:
@@ -637,6 +1103,16 @@ class Gateway:
                     notifications.notify_if_enabled("quota_reset", "Claude Unlimited",
                                                       f"{name} is available again.", pool.settings)
 
+            if decision.reason == "no_profile_fits_request" and guard is not None:
+                # Capacity exists; no account that may take this request can
+                # HOLD it. Not a 503 (Claude Code would hold for ten minutes
+                # and retry the same body) but the one error it recovers
+                # from: an Anthropic-shaped prompt-too-long, on which it
+                # compacts and re-sends — to the same pinned account, or to
+                # whichever one the smaller conversation then fits.
+                return self._prompt_too_long_result(pool, snapshot, guard, headers, branch,
+                                                    forced_profile_id)
+
             if decision.profile_id is None or decision.profile_id in attempted:
                 if forced_profile_id is not None:
                     activity.record("error", "Pinned Profile unavailable — request rejected",
@@ -644,18 +1120,42 @@ class Gateway:
                                           f"client={_client_label(headers)}")
                     return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
                                           error=decision.reason)
-                if previous_profile_id is not None:
-                    activity.record("error", "No eligible Profile available — request rejected",
+                exhausted, resets_at = _capacity_exhaustion(snapshot, pool)
+                # Said ONCE per outage, not once per request: a client that
+                # retries in a loop used to write an Activity line and raise a
+                # notification every time, burying the one line that mattered.
+                if not self._exhaustion_announced:
+                    self._exhaustion_announced = True
+                    if exhausted:
+                        text = "All Profiles are out of capacity — requests rejected"
+                        note = _exhaustion_message(resets_at)
+                    else:
+                        text = "No eligible Profile available — requests rejected"
+                        note = "No eligible Profile is available — requests are being rejected."
+                    activity.record("error", text,
                                      meta=f"last active was {previous_profile_id}, "
                                           f"client={_client_label(headers)}")
-                    notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
-                                                      "No eligible Profile is available — a request was rejected.",
+                    notifications.notify_if_enabled("needs_attention", "Claude Unlimited", note,
                                                       pool.settings)
-                return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
-                                      error="no_eligible_profile")
+                error_headers = {}
+                if exhausted and resets_at is not None:
+                    # Seconds until the earliest window reopens, so a client
+                    # that honours Retry-After waits for real capacity instead
+                    # of hammering a daemon that has none.
+                    wait = int((resets_at - datetime.now(timezone.utc)).total_seconds())
+                    if wait > 0:
+                        error_headers["retry-after"] = str(wait)
+                return GatewayResult(status=503, headers=error_headers, body_chunks=None, profile_id=None,
+                                      error=("all_profiles_exhausted" if exhausted else "no_eligible_profile"),
+                                      error_detail=_exhaustion_message(resets_at) if exhausted else None)
 
             profile = pool.get(decision.profile_id)
             attempted.add(profile.id)
+            if self._exhaustion_announced:
+                # Capacity is back. Said once, and it re-arms the outage
+                # announcement for next time.
+                self._exhaustion_announced = False
+                activity.record("rotation", f"Capacity is back — {profile.name} is serving again")
 
             # GET /v1/models is what Claude Code builds its `/model` picker
             # from. A connector whose real backend isn't Anthropic-shaped
@@ -684,10 +1184,24 @@ class Gateway:
                     self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
                 continue
 
+            # Compact before the kind branch: oauth, api and codex all send the
+            # same tool output, so a setting that only reached two of the three
+            # would report savings that depend on which account happened to
+            # serve you.
+            if eco_body is None:
+                eco_body, eco_stats = _eco_compact(body, getattr(pool.settings, "eco_tier", "off"))
+                # Same place and same reason: every account kind gets it.
+                if path.rstrip("/").endswith("/v1/messages"):
+                    eco_body, eco_stats = _speech_apply(eco_body, eco_stats,
+                                                        getattr(pool.settings, "speech_level", "off"))
+                    # Last, so nothing above can reintroduce one.
+                    eco_body = _drop_empty_text_blocks(eco_body)
+
             if profile.kind == "codex":
-                result = self._handle_codex(profile, credential, method, path, headers, body, now,
+                result = self._handle_codex(profile, credential, method, path, headers, eco_body, now,
                                              forced_profile_id, previous_profile_id, pool,
-                                             branch_routed=branch_routed)
+                                             branch_routed=branch_routed, eco_stats=eco_stats,
+                                             reason=decision.reason)
                 if result is not None:
                     return result
                 continue  # this attempt failed in a rotate-away way — try the next eligible Profile
@@ -701,7 +1215,7 @@ class Gateway:
             # bodies are touched, inside build_upstream_request.
             claude_effort = openai_models.claude_effort_for(request_model(body), pool.settings.model_parity)
             try:
-                upstream_req = build_upstream_request(profile, credential, method, path, headers, body,
+                upstream_req = build_upstream_request(profile, credential, method, path, headers, eco_body,
                                                       claude_effort=claude_effort)
             except ValueError:
                 # A structurally invalid inbound request (e.g. over the body
@@ -785,6 +1299,7 @@ class Gateway:
             old_state = old_rt.state if old_rt is not None else None
             with self._lock:
                 self._observe(profile.id, observation, now)
+            self._maybe_request_usage_recheck(profile.id, observation)
             new_rt = self._runtime.get(profile.id)
             self._persist()
 
@@ -833,10 +1348,7 @@ class Gateway:
                     self._current_profile_id = profile.id
                 self._persist()
                 if previous_profile_id is not None and previous_profile_id != profile.id:
-                    prev_name = self._profile_name(pool, previous_profile_id)
-                    activity.record("rotation", f"Rotated {prev_name} → {profile.name}")
-                    notifications.notify_if_enabled("rotated", "Claude Unlimited",
-                                                      f"Rotated {prev_name} → {profile.name}.", pool.settings)
+                    self._announce_rotation(pool, previous_profile_id, profile, decision.reason)
                     # A real rotation switch clears the PREVIOUS Profile's
                     # "Used now" immediately rather than leaving it to
                     # linger for the rest of _USED_NOW_GRACE_SECONDS — the
@@ -862,7 +1374,9 @@ class Gateway:
             except Exception:
                 project_id = None  # best-effort attribution — must never affect a real request
 
-            body_chunks = self._wrap_with_usage_capture(resp.body_chunks, resp.headers, profile.id, project_id)
+            body_chunks = self._wrap_with_usage_capture(resp.body_chunks, resp.headers, profile.id, project_id,
+                                                         eco_stats=eco_stats,
+                                                         sent_bytes=len(eco_body or body))
             body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id)
             return GatewayResult(status=resp.status, headers=resp.headers, body_chunks=body_chunks,
                                   profile_id=profile.id)
@@ -1003,7 +1517,9 @@ class Gateway:
     def _handle_codex(self, profile: Profile, credential: str, method: str, path: str, headers: dict,
                        body: bytes, now: datetime, forced_profile_id: Optional[str],
                        previous_profile_id: Optional[str], pool: Pool,
-                       branch_routed: bool = False) -> Optional["GatewayResult"]:
+                       branch_routed: bool = False,
+                       eco_stats: Optional["eco.CompactionStats"] = None,
+                       reason: str = "") -> Optional["GatewayResult"]:
         """The codex-kind analogue of handle()'s main oauth/api body — kept
         as a separate method rather than inlined in the same branch,
         because openai_bridge.run() owns its own HTTP call and response
@@ -1027,8 +1543,14 @@ class Gateway:
             self._in_flight_since.setdefault(profile.id, time.monotonic())
 
         try:
+            branch = project_attribution.branch_key(headers, body)
             result = openai_bridge.run(profile, credential, body,
-                                        parity=pool.settings.model_parity)
+                                        parity=pool.settings.model_parity,
+                                        context=openai_bridge.ConversationContext(
+                                            claude_session_id=branch[0] if branch else None,
+                                            agent_id=(branch[1] if branch and branch[1] != project_attribution.MAIN_BRANCH
+                                                      else None),
+                                            parent_agent_id=project_attribution.parent_agent_id_from_headers(headers)))
         except openai_bridge.OpenAIBridgeError as exc:
             with self._lock:  # same atomicity reasoning as the Anthropic path
                 self._mark_profile_idle(profile.id)
@@ -1049,13 +1571,22 @@ class Gateway:
                 self._mark_profile_idle(profile.id)
             raise
 
-        observation = openai_observation.classify(
-            result.status, _filter_openai_headers(result.headers), now)
+        codex_headers = _filter_openai_headers(result.headers)
+        observation = openai_observation.classify(result.status, codex_headers, now)
+        # Credits ride along on both 200s and 429s and never decide a state on
+        # their own, so they are recorded before the observation is folded in:
+        # the QuotaExhausted branch in router._apply reads credits_has to
+        # decide whether this account can still serve (issue #6).
+        credits = openai_observation.parse_credits(codex_headers)
+        if credits is not None:
+            with self._lock:
+                self._record_credits(profile.id, credits)
 
         old_rt = self._runtime.get(profile.id)
         old_state = old_rt.state if old_rt is not None else None
         with self._lock:
             self._observe(profile.id, observation, now)
+        self._maybe_request_usage_recheck(profile.id, observation)
         new_rt = self._runtime.get(profile.id)
         self._persist()
 
@@ -1092,10 +1623,7 @@ class Gateway:
                 self._current_profile_id = profile.id
             self._persist()
             if previous_profile_id is not None and previous_profile_id != profile.id:
-                prev_name = self._profile_name(pool, previous_profile_id)
-                activity.record("rotation", f"Rotated {prev_name} → {profile.name}")
-                notifications.notify_if_enabled("rotated", "Claude Unlimited",
-                                                  f"Rotated {prev_name} → {profile.name}.", pool.settings)
+                self._announce_rotation(pool, previous_profile_id, profile, reason)
                 with self._lock:
                     self._last_active.pop(previous_profile_id, None)
 
@@ -1129,7 +1657,9 @@ class Gateway:
         # and whether it wants SSE back.
         parsed_body = _parsed_request(body)
         body_chunks = self._wrap_with_usage_capture(result.body_chunks, client_headers, profile.id, project_id,
-                                                     requested_model=_requested_model(parsed_body))
+                                                     requested_model=_requested_model(parsed_body),
+                                                     eco_stats=eco_stats, sent_bytes=len(body),
+                                                     quota_5h_percent=_codex_5h_percent(result.headers))
         body_chunks = self._wrap_with_in_flight_clear(body_chunks, profile.id)
 
         # The upstream Responses call is always streamed, but the client
@@ -1142,7 +1672,15 @@ class Gateway:
             message = openai_translate.assemble_message_from_sse(body_chunks)
             payload = json.dumps(message).encode("utf-8")
             client_headers = {"content-type": "application/json"}
-            return GatewayResult(status=result.status, headers=client_headers,
+            # A stream that began 200 and then failed still has to be reported
+            # as a failure to a non-streaming client; answering 200 with an
+            # empty message is what made a failed turn look like a model that
+            # simply said nothing.
+            status = 502 if message.get("type") == "error" else result.status
+            if status != result.status:
+                activity.record("error", f"{profile.name} — upstream response failed",
+                                meta=str((message.get("error") or {}).get("message", ""))[:200])
+            return GatewayResult(status=status, headers=client_headers,
                                   body_chunks=iter([payload]), profile_id=profile.id)
 
         return GatewayResult(status=result.status, headers=client_headers, body_chunks=body_chunks,
@@ -1405,6 +1943,13 @@ class Gateway:
                                                   cooldown_until=None, resets_at=None)
             previous_profile_id = self._current_profile_id
             self._current_profile_id = profile_id
+            # Hold it against concurrent traffic. The shared pointer alone is
+            # not enough: with hundreds of requests in flight, ones that had
+            # already picked another account finish and set the pointer back,
+            # so a Take Over during a burst flapped between accounts within
+            # the same second. The override stands until the user takes over
+            # something else, or this Profile stops being usable.
+            self._manual_profile_id = profile_id
             # Take Over is an explicit "I'm on THIS one now" — clear the
             # profile it moved away from so it doesn't keep showing "Used now"
             # for the rest of its grace window (in_flight_ids()), exactly as a
@@ -1459,7 +2004,45 @@ class Gateway:
                          meta=f"{requested_model} unavailable, used {profile.default_model} instead")
         return retry_resp, retry_observation
 
-    def _forced_decision(self, pool: Pool, forced_profile_id: str) -> RoutingDecision:
+    def _announce_rotation(self, pool: Pool, previous_profile_id: str, profile: Profile, reason: str) -> None:
+        """The Activity line and notification for a pointer move. Named by
+        cause: "Rotated" reads as "the account ran out", which is wrong for
+        an account that only spent its Fable week and asked to be left."""
+        prev_name = self._profile_name(pool, previous_profile_id)
+        if reason == "window_handover":
+            activity.record("rotation", f"{prev_name} cannot hold this conversation — handed over to {profile.name}",
+                             meta="the account is not out of quota; the conversation outgrew its backend's window")
+            notifications.notify_if_enabled("rotated", "Claude Unlimited",
+                                              f"{prev_name} cannot hold this conversation — handed over to {profile.name}.",
+                                              pool.settings)
+            return
+        if reason == "fable_limit_handover":
+            activity.record("rotation", f"{prev_name} has spent its Fable weekly limit — handed over to {profile.name}",
+                             meta="the account is not out of quota; its Fable week is, and it is set to leave")
+            notifications.notify_if_enabled("rotated", "Claude Unlimited",
+                                              f"{prev_name} has spent its Fable weekly limit — handed over to {profile.name}.",
+                                              pool.settings)
+            return
+        activity.record("rotation", f"Rotated {prev_name} → {profile.name}")
+        notifications.notify_if_enabled("rotated", "Claude Unlimited",
+                                          f"Rotated {prev_name} → {profile.name}.", pool.settings)
+
+    def _note_fable_limit_served_anyway(self, pool: Pool, profile_id: str, now: datetime, how: str) -> None:
+        """One Activity line per account per spent Fable week for a request
+        that is served on it ANYWAY — a pin that is honoured, or a pool with
+        nowhere else to go. _sync_snapshot forgets the note once the account
+        is no longer spent. Safe with or without self._lock: it only touches
+        the noted set and writes Activity."""
+        rt = self._runtime.get(profile_id)
+        if rt is None or not fable_spent(rt, now) or profile_id in self._fable_limit_noted:
+            return
+        self._fable_limit_noted.add(profile_id)
+        activity.record("rotation", f"{self._profile_name(pool, profile_id)} has spent its Fable weekly limit",
+                         meta=how)
+
+    def _forced_decision(self, pool: Pool, forced_profile_id: str,
+                         now: Optional[datetime] = None,
+                         fit: Optional[RequestFit] = None) -> RoutingDecision:
         """Routing for a `forced_profile_id` request (see handle()) — always
         picks exactly that Profile, bypassing priority/threshold ranking the
         same way force_active() does, EXCEPT for AUTH_INVALID: force_active()
@@ -1479,7 +2062,75 @@ class Gateway:
         rt = self._runtime.get(forced_profile_id)
         if rt is not None and rt.state == ProfileState.AUTH_INVALID:
             return RoutingDecision(profile_id=None, reason="forced_profile_needs_reauth")
+        if rt is not None and not fits(rt, fit):
+            # Still honoured — never substituted — but a request known to
+            # overflow this account's window buys nothing by being sent: the
+            # backend's error would be one the client cannot recover from.
+            # handle() answers "prompt is too long" instead, the session
+            # compacts, and stays on the account it was pinned to.
+            return RoutingDecision(profile_id=None, reason="no_profile_fits_request")
+        if rt is not None and now is not None and must_leave(rt, now):
+            # The pin is HONOURED — never silently substituted, which is the
+            # whole point of pinning. The user simply gets the
+            # provider's own limit error on Fable, and one Activity line so it
+            # is not a mystery why a pinned session started failing.
+            self._note_fable_limit_served_anyway(pool, forced_profile_id, now,
+                                                 "pinned session (cu code --profile) — served anyway, not rotated")
         return RoutingDecision(profile_id=forced_profile_id, reason="forced")
+
+    def _note_assumed_windows(self, pool: Pool, guard: "RequestGuard") -> None:
+        """One Activity line per GPT id the guard had to ASSUME a window for,
+        so an id missing from gpt_windows' table is never a silent guess.
+        Safe without self._lock: a set add and an Activity write."""
+        for profile_id, info in guard.windows.items():
+            if not info.assumed or info.model in self._window_assumed_noted:
+                continue
+            self._window_assumed_noted.add(info.model)
+            activity.record("config", f"{self._profile_name(pool, profile_id)} — assuming a {info.window:,}-token "
+                                      f"window for {info.model}",
+                             meta=f"{info.model} is not in gpt_windows.py ({info.backend} backend); "
+                                  f"add it there and re-run scripts/check_gpt_windows.py")
+
+    # Re-announce the same session's "prompt is too long" at most this often.
+    _CAPACITY_NOTE_INTERVAL_SECONDS = 600.0
+
+    def _prompt_too_long_result(self, pool: Pool, snapshot: PoolSnapshot, guard: "RequestGuard",
+                                headers: dict, branch: Optional[tuple],
+                                forced_profile_id: Optional[str]) -> GatewayResult:
+        """The guard's terminal answer: HTTP 400 in Anthropic's own error
+        envelope, wording byte-exact to what Claude Code's reactive
+        compaction parses (gpt_windows.prompt_too_long_message). The limit
+        quoted is the largest budget among the accounts this request was
+        allowed to use, so the client compacts by a real gap."""
+        if forced_profile_id is not None:
+            considered = [forced_profile_id]
+        elif self._manual_profile_id is not None and self._manual_profile_id in guard.windows:
+            considered = [self._manual_profile_id]
+        else:
+            considered = [rt.profile_id for rt in snapshot.profiles
+                          if rt.state == ProfileState.ELIGIBLE and rt.profile_id in guard.windows]
+        budgets = [guard.windows[pid].budget for pid in considered if pid in guard.windows]
+        if not budgets:
+            budgets = [info.budget for info in guard.windows.values()] or [gpt_windows.MIN_BUDGET]
+        maximum = max(budgets)
+        estimate = guard.fit.estimated_tokens
+        message = gpt_windows.prompt_too_long_message(estimate, maximum)
+
+        key = (forced_profile_id, branch)
+        last = self._capacity_noted_at.get(key)
+        if last is None or _pin_clock() - last >= self._CAPACITY_NOTE_INTERVAL_SECONDS:
+            cutoff = _pin_clock() - self._CAPACITY_NOTE_INTERVAL_SECONDS
+            self._capacity_noted_at = {k: v for k, v in self._capacity_noted_at.items() if v > cutoff}
+            self._capacity_noted_at[key] = _pin_clock()
+            names = ", ".join(self._profile_name(pool, pid) for pid in considered) or "no account"
+            how = ("pinned session (cu code --profile) — not rotated" if forced_profile_id is not None
+                   else "Take over — not rotated" if self._manual_profile_id is not None
+                   else "no eligible account can hold it")
+            activity.record("rotation", f"Conversation exceeds {names}'s window — asked Claude Code to compact",
+                             meta=f"~{estimate:,} estimated tokens > {maximum:,}; {how}; "
+                                  f"client={_client_label(headers)}")
+        return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
+                              error="request_exceeds_every_window", error_detail=message)
 
     def _persist(self) -> None:
         """Best-effort snapshot of the Dashboard-visible runtime fields to
@@ -1511,6 +2162,12 @@ class Gateway:
                     "resets_at_7d": rt.resets_at_7d.isoformat() if rt.resets_at_7d else None,
                     "window_label": rt.window_label,
                     "window_label_7d": rt.window_label_7d,
+                    "model_usage": [
+                        {"name": w.name, "percent": w.percent,
+                         "resets_at": w.resets_at.isoformat() if w.resets_at else None,
+                         "active": w.active}
+                        for w in rt.model_usage
+                    ],
                     # Restored so a restart doesn't silently present a Profile
                     # as healthy when it is not. See _restorable_state_fields
                     # for which states survive and which are re-derived.
@@ -1521,6 +2178,8 @@ class Gateway:
                     # restarts.
                     "refresh_backoff_until": backoff[pid][0],
                     "refresh_rate_limited_streak": backoff[pid][1],
+                    "credits_has": rt.credits_has,
+                    "credits_balance": rt.credits_balance,
                 }
                 for pid, rt in self._runtime.items()
             }
@@ -1531,7 +2190,10 @@ class Gateway:
 
     @staticmethod
     def _wrap_with_usage_capture(chunks, resp_headers: dict, profile_id: str, project_id: Optional[str],
-                                  requested_model: Optional[str] = None):
+                                  requested_model: Optional[str] = None,
+                                  eco_stats: Optional["eco.CompactionStats"] = None,
+                                  sent_bytes: int = 0,
+                                  quota_5h_percent: Optional[float] = None):
         """Tees the response body through UsageCapture (see its module
         docstring for the safety invariant: every byte forwarded exactly
         unchanged) and records one usage_history event as soon as the
@@ -1565,8 +2227,23 @@ class Gateway:
             finally:
                 if capture.model and capture.usage:
                     try:
-                        usage_history.record(profile_id, project_id, capture.model, capture.usage,
-                                             requested_model=requested_model)
+                        # Savings land on the SAME row as the token counts, so
+                        # "what did ECO save" is answerable per request rather
+                        # than as a floating total. Tokens are calibrated from
+                        # what this very request was billed; bytes are exact.
+                        saved = eco_stats.bytes_saved if eco_stats else 0
+                        billed = (int(capture.usage.get("input_tokens") or 0)
+                                  + int(capture.usage.get("cache_creation_input_tokens") or 0)
+                                  + int(capture.usage.get("cache_read_input_tokens") or 0))
+                        usage_history.record(
+                            profile_id, project_id, capture.model, capture.usage,
+                            requested_model=requested_model,
+                            eco_bytes_saved=saved or None,
+                            eco_tokens_saved=usage_history.calibrated_tokens_saved(
+                                saved, sent_bytes, billed) if saved else None,
+                            eco_mode=_eco_mode_of(eco_stats) if saved else None,
+                            speech_mode=_speech_level_of(eco_stats),
+                            quota_5h_percent=quota_5h_percent)
                     except Exception:
                         pass  # usage history is best-effort — must never affect a real request
 
@@ -1574,11 +2251,17 @@ class Gateway:
 
     # ---- branch pinning (call with self._lock held) ------------------------
 
-    def _live_pin(self, key: tuple, attempted: set) -> Optional[str]:
+    def _live_pin(self, key: tuple, attempted: set,
+                  snapshot: Optional[PoolSnapshot] = None, now: Optional[datetime] = None,
+                  fit: Optional[RequestFit] = None) -> Optional[str]:
         """The account this branch is pinned to, if that pin is still usable:
-        not expired, the Profile still ELIGIBLE, and not already tried and
-        failed on this request. Anything else is treated as no pin, so the
-        caller re-assigns (and the re-assignment overwrites the stale one)."""
+        not expired, the Profile still ELIGIBLE, not already tried and failed
+        on this request, and not an account that has asked to be left because
+        its Fable week is spent (issue #2). Anything else is treated as no
+        pin, so the caller re-assigns (and the re-assignment overwrites the
+        stale one) — which is how the pin MOVES rather than the one request
+        being diverted: the work and its prompt cache stay together on the
+        new account."""
         pin = self._branch_pins.get(key)
         if pin is None:
             return None
@@ -1590,6 +2273,20 @@ class Gateway:
         runtime = self._runtime.get(pin.profile_id)
         if runtime is None or runtime.state != ProfileState.ELIGIBLE:
             return None
+        if not fits(runtime, fit):
+            # Unconditionally, unlike the Fable case below: staying is a
+            # guaranteed failure, so the pin moves for good. If nowhere else
+            # can hold it either, the fallthrough answers "prompt too long".
+            return None
+        if now is not None and must_leave(runtime, now):
+            # Only give the pin up when somewhere else can actually take the
+            # branch. Moving it to an account that must equally be left would
+            # cost it its warm cache and change nothing.
+            others = [rt for rt in (snapshot.profiles if snapshot is not None else ())
+                      if rt.profile_id != pin.profile_id and rt.state == ProfileState.ELIGIBLE
+                      and rt.automatic and not must_leave(rt, now)]
+            if others:
+                return None
         pin.last_touch = _pin_clock()
         return pin.profile_id
 
@@ -1597,6 +2294,10 @@ class Gateway:
         now = _pin_clock()
         existing = self._branch_pins.get(key)
         if existing is not None:
+            if existing.profile_id != profile_id:
+                # "On this account for 42m" must not count the time the agent
+                # spent on the account it just failed over from.
+                existing.created_at = now
             existing.profile_id = profile_id
             existing.last_touch = now
             return
@@ -1629,15 +2330,102 @@ class Gateway:
         return bool(distribute or pool.settings.distribute_sessions_default
                     or (is_subagent and self._forced_subagent_profile(pool) is not None))
 
-    def _record_branch_move(self, pool: Pool, from_id: str, to_id: str) -> None:
+    @staticmethod
+    def _app_pinned(headers: dict) -> bool:
+        """The caller named its own branch (APP_SESSION_HEADER): route it per
+        branch — one account per worker, kept while that account is usable."""
+        return project_attribution.app_session_id(headers) is not None
+
+    # How long the whole pool must have been idle before the rotation pointer
+    # is allowed to move back to a higher-priority account (issue #4). Long
+    # enough that no session is plausibly mid-task: moving back throws away a
+    # warm prompt cache, which is the reason choose() is sticky in the first
+    # place, so the return must cost a session nothing.
+    _RETURN_TO_PREFERRED_IDLE_SECONDS = 600.0  # 10 minutes
+
+    def _maybe_return_to_preferred(self, pool: Pool, snapshot: PoolSnapshot) -> PoolSnapshot:
+        """Issue #4: after a failover the pool stays on the fallback for as
+        long as it works, even once the preferred account's window has reset,
+        because choose() is sticky while the current Profile is ELIGIBLE. That
+        stickiness is deliberate — it protects the prompt cache and, with
+        branch pinning, keeps live agents where they are — so the return is
+        opt-in, off by default, and only ever happens on an idle pool.
+
+        Caller holds self._lock. Returns the snapshot to route on; the only
+        thing it ever changes is the rotation POINTER, which choose() then
+        re-sorts by priority. It moves no branch pin: a pinned branch keeps
+        its own account until that account stops serving it, unchanged.
+        """
+        if not pool.settings.return_to_preferred:
+            return snapshot
+        # "Take over" is an explicit, standing user choice — it outranks a
+        # preference the user set once, the same way it outranks rotation.
+        if self._manual_profile_id is not None:
+            return snapshot
+        current_id = snapshot.current_profile_id
+        if current_id is None:
+            return snapshot
+        current = next((rt for rt in snapshot.profiles if rt.profile_id == current_id), None)
+        candidates = [rt for rt in snapshot.profiles
+                      if rt.state == ProfileState.ELIGIBLE and rt.automatic]
+        if not candidates:
+            return snapshot
+        preferred = min(candidates, key=lambda rt: rt.priority)
+        if preferred.profile_id == current_id:
+            return snapshot
+        # Only ever move UP the priority order. If the pool is on the fallback
+        # because the preferred account is spent, the preferred one is not a
+        # candidate at all and this does nothing; if the current account is
+        # simply the higher-priority one already, there is nothing to return
+        # to.
+        if current is not None and preferred.priority >= current.priority:
+            return snapshot
+        idle_for = self._seconds_since_last_activity_locked()
+        if idle_for is not None and idle_for < self._RETURN_TO_PREFERRED_IDLE_SECONDS:
+            return snapshot
+        self._current_profile_id = None
+        name = self._profile_name(pool, preferred.profile_id)
+        activity.record("rotation", f"returning to {name}",
+                         meta="higher-priority account is available again and the pool is idle")
+        return PoolSnapshot(profiles=snapshot.profiles, current_profile_id=None)
+
+    def _manual_choice(self, pool: Pool, snapshot: PoolSnapshot, now: datetime,
+                       fit: Optional[RequestFit] = None) -> RoutingDecision:
+        """Global (non-branch) routing: a standing "Take over" wins over the
+        rotation pointer while its Profile is still ELIGIBLE; otherwise this is
+        the unchanged sticky choose(). Cleared as soon as that Profile stops
+        being usable, so a manual override can never strand the pool."""
+        manual = self._manual_profile_id
+        if manual is not None:
+            chosen = next((rt for rt in snapshot.profiles if rt.profile_id == manual), None)
+            if chosen is not None and chosen.state == ProfileState.ELIGIBLE:
+                if not fits(chosen, fit):
+                    # Honoured, not substituted — but not sent either (see
+                    # _forced_decision): the client is asked to compact.
+                    return RoutingDecision(profile_id=None, reason="no_profile_fits_request")
+                # A standing "Take over" is honoured even when that account
+                # has spent its Fable week and would otherwise leave: the user
+                # named it. They get the provider's own error, not a silent
+                # substitution — and one Activity line saying so.
+                if must_leave(chosen, now):
+                    self._note_fable_limit_served_anyway(pool, manual, now,
+                                                         "Take over — served anyway, not rotated")
+                return RoutingDecision(profile_id=manual, reason="manual_override")
+            self._manual_profile_id = None
+        return choose(snapshot, now, fit)
+
+    def _record_branch_move(self, pool: Pool, from_id: str, to_id: str, why: str = "unavailable") -> None:
         """A pinned agent had to leave its account: it stopped being eligible,
-        or failed this request. Branch-routed traffic never moves the shared
+        failed this request, or spent its Fable week and is set to be left
+        (`why == "fable_limit"`). Branch-routed traffic never moves the shared
         pointer (see _BRANCH_ROUTED_REASONS), so without this a pool running
         entirely per branch would never log or announce a switch at all.
         Call WITHOUT self._lock held — activity and notifications do I/O."""
         from_name, to_name = self._profile_name(pool, from_id), self._profile_name(pool, to_id)
-        activity.record("rotation", f"Agent moved {from_name} → {to_name}",
-                        meta=f"{from_name} stopped being available")
+        cause = (f"{from_name} has spent its Fable weekly limit" if why == "fable_limit"
+                 else f"the conversation outgrew {from_name}'s window" if why == "outgrew_window"
+                 else f"{from_name} stopped being available")
+        activity.record("rotation", f"Agent moved {from_name} → {to_name}", meta=cause)
         with self._lock:
             last = self._branch_move_notified_at.get(from_id)
             due = last is None or _pin_clock() - last >= BRANCH_MOVE_NOTIFY_INTERVAL_SECONDS
@@ -1650,7 +2438,8 @@ class Gateway:
     def _branch_decision(self, pool: Pool, snapshot: PoolSnapshot, now: datetime, key: Optional[tuple],
                          is_subagent: bool, parent_agent_id: Optional[str], attempted: set,
                          distribute: bool, may_create_pin: bool,
-                         moves: Optional[list] = None) -> RoutingDecision:
+                         moves: Optional[list] = None, app_pinned: bool = False,
+                         fit: Optional[RequestFit] = None) -> RoutingDecision:
         """Routing for per-branch modes, in precedence order. Falls through to
         the unchanged global sticky `choose()` whenever neither mode applies —
         so a non-Claude-Code client, or an unidentifiable request, behaves
@@ -1662,10 +2451,10 @@ class Gateway:
         # already loaded), so toggling it takes effect without a restart.
         distribute = distribute or pool.settings.distribute_sessions_default
         forced_profile = self._forced_subagent_profile(pool) if is_subagent else None
-        if key is None or not (distribute or forced_profile is not None):
-            return choose(snapshot, now)
+        if key is None or not (distribute or app_pinned or forced_profile is not None):
+            return self._manual_choice(pool, snapshot, now, fit)
 
-        pinned = self._live_pin(key, attempted)
+        pinned = self._live_pin(key, attempted, snapshot, now, fit)
         if pinned is not None:
             # Same account as last turn -> its prompt cache is still warm.
             return RoutingDecision(profile_id=pinned, reason="branch_pinned")
@@ -1676,25 +2465,109 @@ class Gateway:
 
         def _note_move(to_id: Optional[str]) -> None:
             if moves is not None and may_create_pin and prior is not None and to_id and to_id != prior.profile_id:
-                moves.append((prior.profile_id, to_id))
+                prior_rt = self._runtime.get(prior.profile_id)
+                if prior_rt is not None and prior_rt.state == ProfileState.ELIGIBLE and not fits(prior_rt, fit):
+                    why = "outgrew_window"
+                elif prior_rt is not None and prior_rt.state == ProfileState.ELIGIBLE and must_leave(prior_rt, now):
+                    why = "fable_limit"
+                else:
+                    why = "unavailable"
+                moves.append((prior.profile_id, to_id, why))
 
         # Needs an account. A subagent prefers the forced Profile; otherwise
-        # (including when that Profile is unavailable — the owner-specified
+        # (including when that Profile is unavailable — the specified
         # fallback) branches spread across eligible accounts.
         if forced_profile is not None and forced_profile.id not in attempted:
             runtime = self._runtime.get(forced_profile.id)
-            if runtime is not None and runtime.state == ProfileState.ELIGIBLE:
+            # "Forced in subagents" is an explicit user choice, honoured the
+            # same way a --profile pin is: it falls back only when that
+            # account cannot serve AT ALL. A spent Fable week on it is not
+            # that — the pin is kept, with one Activity line saying so. A
+            # conversation its backend cannot hold IS that: the flag
+            # documents "falls back when unavailable", so the branch spreads
+            # across the accounts that can take it instead.
+            if runtime is not None and runtime.state == ProfileState.ELIGIBLE and fits(runtime, fit):
+                if must_leave(runtime, now):
+                    self._note_fable_limit_served_anyway(pool, forced_profile.id, now,
+                                                         "forced in subagents — served anyway, not rotated")
                 _note_move(forced_profile.id)
                 if may_create_pin:
                     self._remember_pin(key, forced_profile.id, parent_agent_id)
                 return RoutingDecision(profile_id=forced_profile.id, reason="subagent_forced")
 
         decision = choose_for_new_branch(snapshot, now, self._branch_counts(),
-                                          exclude=frozenset(attempted))
+                                          exclude=frozenset(attempted), fit=fit)
         _note_move(decision.profile_id)
         if decision.profile_id is not None and may_create_pin:
             self._remember_pin(key, decision.profile_id, parent_agent_id)
         return decision
+
+    # Polling gives up to ~10 minutes of staleness, during
+    # which requests for a spent model keep landing on the account that cannot
+    # serve them. A 429 is the event that says "the data is already wrong".
+    #
+    # One read per Profile per BASE_INTERVAL_SECONDS: the whole point is to
+    # replace a scheduled read, not to add one, and an account that is being
+    # rate-limited is the last one to hammer with extra requests.
+    _USAGE_RECHECK_MIN_INTERVAL = usage_probe.BASE_INTERVAL_SECONDS
+
+    def _request_usage_recheck(self, profile_id: str) -> bool:
+        """Ask for ONE out-of-band usage read. Caller holds no lock.
+
+        Records a request; the daemon's existing probe tick performs it, so
+        usage_probe's provider pause, per-Profile backoff and persistence all
+        still apply — this only lets the read happen sooner. Returns whether
+        the request was accepted, for the tests."""
+        now = time.monotonic()
+        with self._lock:
+            last = self._usage_recheck_requested.get(profile_id)
+            if last is not None and now - last < self._USAGE_RECHECK_MIN_INTERVAL:
+                return False
+            self._usage_recheck_requested[profile_id] = now
+            self._usage_recheck_pending.add(profile_id)
+            return True
+
+    def _queue_recovered_usage_read(self, profile_id: str) -> None:
+        """Caller holds self._lock. A Profile just came back from needs
+        re-auth — a manual re-auth, an imported or re-pasted login, or a
+        refresh_token recovery. Its usage numbers are whatever it had before
+        it broke (often none), so read them now rather than at the next
+        scheduled read, and wake the probe loop so "now" is seconds, not the
+        30s tick. Not rate-capped like a 429 re-read: a new credential is a
+        fresh start, and this happens once per recovery. The probe's provider
+        pause and per-Profile backoff still apply."""
+        self._usage_recheck_requested[profile_id] = time.monotonic()
+        self._usage_recheck_pending.add(profile_id)
+        self.usage_recheck_wakeup.set()
+
+    def take_usage_recheck_requests(self) -> set:
+        """Drains the pending set for the probe tick. Draining does NOT reset
+        the rate-limit clock: a request that was honoured still counts against
+        the next one."""
+        with self._lock:
+            pending = set(self._usage_recheck_pending)
+            self._usage_recheck_pending.clear()
+            return pending
+
+    def _maybe_request_usage_recheck(self, profile_id: str, observation) -> None:
+        """A 429 whose account-level windows are both comfortably below the
+        switch threshold is not an account running out — it is something the
+        account-level numbers cannot see, and a per-model limit is the likely
+        candidate.
+
+        Deliberately narrow: a 429 on an account that IS near its threshold is
+        explained by the numbers we already have, and re-reading would tell us
+        nothing we do not know."""
+        if not isinstance(observation, ShortRateLimit):
+            return
+        rt = self._runtime.get(profile_id)
+        if rt is None:
+            return
+        headroom = rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+        for percent in (rt.last_usage_percent, rt.last_usage_percent_7d):
+            if percent is not None and percent >= headroom:
+                return   # the account-level numbers already explain this
+        self._request_usage_recheck(profile_id)
 
     def usage_observed_at(self) -> dict:
         """Profile id -> epoch seconds of its last usage reading."""
@@ -1707,6 +2580,21 @@ class Gateway:
         because branch-routed traffic never moves current_profile_id."""
         with self._lock:
             return self._branch_counts()
+
+    def agents_on_account_seconds(self) -> dict:
+        """Profile id -> seconds since the longest-serving live agent was
+        assigned to it. "Serving for 42m" in the widget: how long this account
+        has had agents on it without a break, not how long one request ran.
+        Accounts with no live pin are absent."""
+        now = _pin_clock()
+        cutoff = now - BRANCH_PIN_TTL_SECONDS
+        out: dict = {}
+        with self._lock:
+            for pin in self._branch_pins.values():
+                if pin.last_touch > cutoff:
+                    age = max(now - pin.created_at, 0.0)
+                    out[pin.profile_id] = max(out.get(pin.profile_id, 0.0), age)
+        return out
 
     def branch_pins(self) -> list[dict]:
         """Read-only view for the Dashboard: which branches are pinned where."""
@@ -1754,18 +2642,23 @@ class Gateway:
         """How long since any Profile last served a request, or None if this
         process has served none yet. Counts a request that is in flight right
         now as zero."""
-        now = time.monotonic()
         with self._lock:
-            # A slot older than the cap is a leaked/hung request, not live use;
-            # ignore it here too so it can't wedge is_idle (and the updater)
-            # forever — the same bound in_flight_ids() applies.
-            if any(now - self._in_flight_since.get(pid, now) < self._IN_FLIGHT_MAX_SECONDS
-                   for pid in self._in_flight):
-                return 0.0
-            if not self._last_active:
-                return None
-            latest = max(self._last_active.values())
-        return max(0.0, now - latest)
+            return self._seconds_since_last_activity_locked()
+
+    def _seconds_since_last_activity_locked(self) -> Optional[float]:
+        """The body of seconds_since_last_activity, for callers that already
+        hold self._lock — it is a plain Lock, not an RLock, so re-entering it
+        from inside the routing critical section would deadlock."""
+        now = time.monotonic()
+        # A slot older than the cap is a leaked/hung request, not live use;
+        # ignore it here too so it can't wedge is_idle (and the updater)
+        # forever — the same bound in_flight_ids() applies.
+        if any(now - self._in_flight_since.get(pid, now) < self._IN_FLIGHT_MAX_SECONDS
+               for pid in self._in_flight):
+            return 0.0
+        if not self._last_active:
+            return None
+        return max(0.0, now - max(self._last_active.values()))
 
     def is_idle(self, minimum_idle_seconds: float) -> bool:
         """True when nothing has used the pool for at least that long.
@@ -1775,6 +2668,20 @@ class Gateway:
         A daemon that has served nothing since starting counts as idle."""
         idle_for = self.seconds_since_last_activity()
         return idle_for is None or idle_for >= minimum_idle_seconds
+
+    def serving_now_ids(self) -> set[str]:
+        """Profile ids with a request literally open right now.
+
+        in_flight_ids() deliberately also reports a Profile that finished
+        within _USED_NOW_GRACE_SECONDS, because the Dashboard's "Used now"
+        light must not flicker between polls. That grace makes it useless as
+        an "is the pool busy" signal for a script (issue #3), so this is the
+        unsmoothed view: live slots only, still bounded by
+        _IN_FLIGHT_MAX_SECONDS so a leaked slot cannot pin it forever."""
+        now = time.monotonic()
+        with self._lock:
+            return {pid for pid in self._in_flight
+                    if now - self._in_flight_since.get(pid, now) < self._IN_FLIGHT_MAX_SECONDS}
 
     def in_flight_ids(self) -> set[str]:
         """Profile ids to show as "Used now" — either a request is
@@ -1800,16 +2707,105 @@ class Gateway:
         the current Pool first — safe to call anytime (e.g. from the
         Dashboard's GET /api/profiles), not just from inside handle()."""
 
+        pool = load_pool()
+        # Off the caller's thread entirely: these read the keychain (a
+        # subprocess on macOS) and can make a token-refresh network call, and
+        # a Dashboard or widget poll must never wait for either. A recovered
+        # Profile shows up on the next poll, a second later.
+        self._schedule_credential_checks(pool)
         with self._lock:
-            pool = load_pool()
             snapshot = self._sync_snapshot(pool)
             self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
             return dict(self._runtime)
+
+    def _schedule_credential_checks(self, pool: Pool) -> None:
+        """Runs run_credential_checks_now() on a background thread, at most one
+        at a time. Never raises into the caller."""
+        with self._lock:
+            if self._credential_check_running:
+                return
+            self._credential_check_running = True
+
+        def worker():
+            try:
+                self.run_credential_checks_now(pool)
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._credential_check_running = False
+
+        try:
+            threading.Thread(target=worker, daemon=True, name="credential-checks").start()
+        except Exception:
+            with self._lock:
+                self._credential_check_running = False
+
+    def wait_for_credential_checks(self, timeout: float = 5.0) -> bool:
+        """Blocks until the background credential-check worker is idle. For
+        tests and for a caller that wants the effect before reading state;
+        nothing in the request path waits."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not self._credential_check_running:
+                    return True
+            time.sleep(0.01)
+        return False
+
+    def run_credential_checks_now(self, pool: Optional[Pool] = None) -> None:
+        """The proactive/recovery credential refreshes, with NO lock held.
+
+        The gateway lock stays free while the keychain and the provider's token
+        endpoint are talked to: holding it across those made every Dashboard
+        and widget poll queue behind a refresh (20-45s on a loaded machine).
+        Each check has its own per-Profile throttle, so this is a cheap no-op
+        on almost every tick.
+        """
+        pool = pool if pool is not None else load_pool()
+        for p in pool.profiles:
+            with self._lock:
+                rt = self._runtime.get(p.id)
+            if rt is None:
+                if not p.enabled:
+                    continue
+                # First sync for this Profile: the preventive check still runs
+                # now (a restored Profile can already be near its real
+                # expiry), exactly as it did when this lived in _sync_snapshot.
+                # ELIGIBLE here only enables the preventive path, never the
+                # unconditional recovery one.
+                rt = ProfileRuntime(profile_id=p.id, priority=p.priority,
+                                    switch_threshold=p.switch_threshold, automatic=p.automatic,
+                                    state=ProfileState.ELIGIBLE)
+            if rt.state == ProfileState.DISABLED or not p.enabled:
+                continue
+            recovered = None
+            try:
+                if p.kind == "oauth":
+                    recovered = self._maybe_check_oauth_credential(p, rt)
+                elif p.kind == "codex":
+                    recovered = self._maybe_check_codex_credential(p, rt)
+            except Exception:
+                recovered = None   # a credential check must never break a poll
+            if recovered != ProfileState.ELIGIBLE:
+                continue
+            with self._lock:
+                current = self._runtime.get(p.id)
+                if current is not None and current.state == ProfileState.AUTH_INVALID:
+                    self._runtime[p.id] = _replace_runtime(current, state=ProfileState.ELIGIBLE)
+                    self._queue_recovered_usage_read(p.id)
 
     @staticmethod
     def _profile_name(pool: Pool, profile_id: str) -> str:
         p = pool.get(profile_id)
         return p.name if p is not None else profile_id
+
+    def _record_credits(self, profile_id: str, credits) -> None:
+        """Caller holds self._lock. See router.record_credits."""
+        snapshot = PoolSnapshot(profiles=list(self._runtime.values()),
+                                current_profile_id=self._current_profile_id)
+        updated = record_credits(snapshot, profile_id, credits.has_credits, credits.balance)
+        self._runtime = {rt.profile_id: rt for rt in updated.profiles}
 
     def _observe(self, profile_id: str, observation, now: datetime) -> None:
         snapshot = PoolSnapshot(profiles=list(self._runtime.values()), current_profile_id=self._current_profile_id)

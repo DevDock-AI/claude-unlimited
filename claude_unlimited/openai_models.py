@@ -9,9 +9,12 @@ The tiering is best-effort, matched by price/role parity between the Codex
 model catalog and Anthropic's published pricing; neither vendor documents an
 equivalence. The tiers are deliberately conservative, because Codex quota is
 spent on reasoning output weighted by model tier — not on the size of the
-request (docs/adr/0007). `gpt-6-astra` is the flagship and is reserved for the
-top Claude tier (Fable); everything below it runs on a cheaper model, so an
-ordinary session does not sit on the most expensive target by default.
+request (docs/adr/0007). `gpt-6-astra` is the flagship, and NO tier maps to it
+by default: Claude Code picks Fable on its own for ordinary work, so mapping
+Fable to the flagship meant a user who never chose the expensive model still
+had their Codex quota spent at the top tier. Fable therefore lands on
+`gpt-5.6-sol` at medium effort, and astra stays one explicit edit away in the
+parity table for anyone who wants it.
 Raising a row here raises what a session costs, so treat it as a spending
 decision — which is exactly why a catalogue refresh NEVER changes what a
 model already in _MODEL_MAP maps to. A Claude model the catalogue knows and
@@ -26,17 +29,26 @@ so tests that never initialize run entirely on the literals.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 from typing import Optional
 
 from . import model_catalogue
 from .model_catalogue import Catalogue, base_id
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+# "none" turns reasoning off entirely — verified live against gpt-5.6-terra and
+# gpt-5.6-sol (0 reasoning tokens), and reasoning output is what a Codex
+# subscription's quota charges for (ADR 0007). "minimal" was removed: the
+# current lineup rejects it outright — "Unsupported value: 'minimal' is not
+# supported with the 'gpt-5.6-sol' model. Supported values are: 'none', 'low',
+# 'medium', 'high', 'xhigh', and 'max'." — so offering it only ever produced a
+# failed request.
+VALID_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
 
 # Claude-side reasoning effort — the `output_config.effort` knob on the Messages
 # API (GA, no beta header). A DIFFERENT set from the Codex side above: Claude
-# has no "minimal"/"ultra". A parity row's claude_effort, when set, is injected
+# has no "none"/"ultra". A parity row's claude_effort, when set, is injected
 # onto oauth/api-served /v1/messages requests for that model (see proxy.py);
 # unset = passthrough (Claude Code's own choice), which is the zero-risk default.
 CLAUDE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -94,7 +106,7 @@ class OpenAIModelTarget:
 
 # Ordered most-capable-first — used only for the substring-match fallback below.
 _MODEL_MAP: dict[str, OpenAIModelTarget] = {
-    "claude-fable-5": OpenAIModelTarget("gpt-6-astra", "high"),
+    "claude-fable-5": OpenAIModelTarget("gpt-5.6-sol", "medium"),
     "claude-opus-5": OpenAIModelTarget("gpt-5.6-terra", "high"),
     "claude-sonnet-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
     "claude-haiku-4-5-20251001": OpenAIModelTarget("gpt-5.6-luna", "low"),
@@ -109,7 +121,7 @@ _DEFAULT_TARGET = OpenAIModelTarget("gpt-5.6-terra", "medium")
 # been updated for). Checked in order, first match wins, before
 # _DEFAULT_TARGET.
 _FAMILY_FALLBACKS: list[tuple[str, OpenAIModelTarget]] = [
-    ("claude-fable", OpenAIModelTarget("gpt-6-astra", "high")),
+    ("claude-fable", OpenAIModelTarget("gpt-5.6-sol", "medium")),
     ("claude-opus", OpenAIModelTarget("gpt-5.6-terra", "high")),
     ("claude-sonnet", OpenAIModelTarget("gpt-5.6-terra", "medium")),
     ("claude-haiku", OpenAIModelTarget("gpt-5.6-luna", "low")),
@@ -505,6 +517,82 @@ def selectable_claude_models(catalogue: Optional[Catalogue] = None) -> list[dict
     return [{"id": claude_id, "label": _claude_label(claude_id, None)} for claude_id in _MODEL_MAP]
 
 
+def _family_of(model_id: str) -> str:
+    """The versionless family key of a Claude id: claude-opus-4-8 ->
+    claude-opus. Used to ask "is this model newer than the one I already
+    decided about?", which a bare id cannot answer."""
+    stripped = base_id(model_id)
+    match = re.match(r"^([a-z]+(?:-[a-z]+)*?)-\d", stripped)
+    return match.group(1) if match else stripped
+
+
+def unmapped_claude_models(parity=None,
+                           catalogue: Optional[Catalogue] = None) -> list[dict]:
+    """Claude models worth telling the user they have not decided about yet.
+
+    NOT simply "every catalogue model with no saved row": the catalogue keeps
+    every point release it has ever seen, so that set is dominated by models
+    OLDER than what the user already runs (opus-4-5 next to a saved opus-5).
+    A banner listing those would nag permanently and, worse, offer to add
+    obsolete models to the `/model` picker. Measured against the real
+    catalogue it was 10 models, 9 of them stale.
+
+    So a model is reported only when it is genuinely ahead of a decision:
+
+    * its family already has a saved row and this model is NEWER than it
+      (claude-fable-6 while fable-5-1 is saved), or
+    * its family has no saved row at all, in which case only the family's
+      newest member is reported — one row to decide, not a back catalogue.
+
+    Unversioned ids (previews) are never reported: they are not a shipped
+    model anyone needs to budget for, and they have no version to compare.
+
+    Each entry carries the target a row would get, so the UI can say what
+    adding it would cost without computing tiers itself."""
+    cat = _catalogue_or_current(catalogue)
+    if cat is None or not cat.anthropic:
+        return []
+    saved = normalize_parity(parity, cat)
+    covered = {base_id(row["claude_model"]) for row in saved}
+    saved_peak: dict[str, float] = {}
+    for row in saved:
+        family = _family_of(row["claude_model"])
+        version = model_catalogue._version_of(row["claude_model"])
+        saved_peak[family] = max(saved_peak.get(family, 0.0), version)
+
+    candidates: dict[str, tuple[float, object]] = {}
+    for model in cat.anthropic:
+        if base_id(model.id) in covered:
+            continue
+        version = model_catalogue._version_of(model.id)
+        if version <= 0.0:                      # preview / unversioned
+            continue
+        family = _family_of(model.id)
+        if family in saved_peak:
+            if version <= saved_peak[family]:   # older than the saved decision
+                continue
+        else:
+            # Unknown family: keep only its newest member.
+            best = candidates.get(family)
+            if best is not None and best[0] >= version:
+                continue
+        candidates[family] = (version, model)
+
+    out: list[dict] = []
+    for model in cat.anthropic:                 # catalogue order, not dict order
+        entry = candidates.get(_family_of(model.id))
+        if entry is None or entry[1] is not model:
+            continue
+        target = _curated_fallback(model.id, cat)
+        out.append({
+            "claude_model": model.id,
+            "claude_label": _claude_label(model.id, cat),
+            "would_map_to": target.model,
+            "would_use_effort": target.reasoning_effort,
+        })
+    return out
+
+
 def advertised_models(parity=None,
                       catalogue: Optional[Catalogue] = None) -> list[tuple[str, str]]:
     """(model_id, display_name) pairs for the Anthropic-shaped /v1/models
@@ -529,3 +617,77 @@ def advertised_models(parity=None,
         # ` · ` segment so cli.py's _fetch_parity_labels keeps parsing it out.
         out.append((claude_id, f"{lead} | {backing} · {row['effort']}"))
     return out
+
+
+def model_bucket_name(model_id: Optional[str]) -> Optional[str]:
+    """The per-model usage bucket a requested Claude model is counted against,
+    as the provider names it: `claude-fable-5-1` -> "Fable".
+
+    Derived from the family prefix, never from a table: we control neither the
+    bucket names nor which plans have them, so a configured matrix would go
+    stale. A model whose family is not one of the
+    four heads is UNRESTRICTED — None, which every caller must read as "no
+    per-model limit applies", not as "blocked"."""
+    if not isinstance(model_id, str) or not model_id.strip():
+        return None
+    lowered = base_id(model_id).lower()
+    for family in _DEFAULT_FAMILIES:
+        if lowered.startswith(family):
+            # "claude-fable" -> "Fable". The provider titles the display name
+            # exactly this way; the comparison is case-insensitive anyway.
+            return family.split("-", 1)[1].capitalize()
+    return None
+
+
+def bucket_matches(model_id: Optional[str], bucket_name: Optional[str]) -> bool:
+    """Whether a per-model usage bucket governs this requested model. Case
+    folded, because the two names come from different sources: ours from the
+    model id, theirs from the provider's display name."""
+    bucket = model_bucket_name(model_id)
+    if bucket is None or not isinstance(bucket_name, str):
+        return False
+    return bucket.lower() == bucket_name.strip().lower()
+
+
+def codex_profile_windows(profile, parity=None, catalogue: Optional[Catalogue] = None) -> dict:
+    """What the capacity guard (docs/adr/0009) would budget for this codex
+    Profile: the GPT ids its in-force parity rows resolve to (plus the
+    default target, since an id outside the rows still maps somewhere), and
+    the SMALLEST window/budget among them — the number a session on this
+    account is actually bounded by. `assumed` is True when any of those ids
+    is not in gpt_windows' table. Never raises; a broken parity list simply
+    reports the default target."""
+    from . import gpt_windows
+
+    auth_mode = getattr(profile, "auth_mode", None)
+    base_url = getattr(profile, "base_url", None)
+    override = getattr(profile, "codex_model", None)
+    effort = getattr(profile, "codex_reasoning_effort", None)
+    claude_ids: list = [None]
+    try:
+        rows = normalize_parity(parity, catalogue)
+        for row in rows:
+            claude_model = row.get("claude_model")
+            if isinstance(claude_model, str) and claude_model:
+                claude_ids.append(claude_model)
+    except Exception:
+        rows = None
+    targets: list[str] = []
+    for claude_id in claude_ids:
+        try:
+            model = map_model(claude_id, override_model=override, override_reasoning_effort=effort,
+                              parity=rows, catalogue=catalogue).model
+        except Exception:
+            model = override
+        if model and model not in targets:
+            targets.append(model)
+    infos = [gpt_windows.window_for(m, auth_mode, base_url) for m in targets] \
+        or [gpt_windows.window_for(None, auth_mode, base_url)]
+    tightest = min(infos, key=lambda i: i.budget)
+    return {
+        "models": [i.model for i in infos],
+        "backend": tightest.backend,
+        "window": tightest.window,
+        "budget": tightest.budget,
+        "assumed": any(i.assumed for i in infos),
+    }

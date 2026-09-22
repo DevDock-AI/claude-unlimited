@@ -134,6 +134,92 @@ def test_unknown_model_returns_none_with_and_without_a_catalogue(vendored_catalo
     assert pricing.find_price("some-future-model-nobody-has-seen", catalogue=None) is None
 
 
+# ---- OpenAI / Codex pricing ----
+#
+# Every Codex request was recorded uncosted because find_price scanned only
+# catalogue.anthropic: the rates were in the catalogue all along, in the lineup
+# nobody looked at. These are the regression.
+
+
+def test_codex_models_resolve_through_the_catalogue(vendored_catalogue):
+    price = pricing.find_price("gpt-5.6-sol", catalogue=vendored_catalogue)
+    assert price is not None, "the OpenAI lineup must be scanned too"
+    assert price.prefix == "gpt-5.6-sol"
+
+
+def test_codex_models_resolve_without_a_catalogue():
+    price = pricing.find_price("gpt-5.6-sol", catalogue=None)
+    assert price is not None
+    assert price.input_per_mtok == 4 and price.output_per_mtok == 20
+
+
+def test_a_codex_request_is_costed_rather_than_dropped():
+    # The shape openai_translate records: cached prefix split out of input,
+    # and never any cache-write tokens.
+    cost = pricing.estimate_cost_usd("gpt-5.6-sol", {
+        "input_tokens": 5_000, "output_tokens": 900,
+        "cache_read_input_tokens": 120_000, "cache_creation_input_tokens": 0,
+    })
+    assert cost is not None, "None here is what printed $0.00 in the UI"
+    assert cost == pytest.approx(0.02 + 0.018 + 0.048, abs=1e-6)
+
+
+def test_both_lineups_price_from_one_catalogue():
+    cat = mc.parse({
+        "claude-sonnet-5": {"litellm_provider": "anthropic", "mode": "chat",
+                            "input_cost_per_token": 4e-06, "output_cost_per_token": 2e-05},
+        "gpt-5.6-terra": {"litellm_provider": "openai", "mode": "chat",
+                          "input_cost_per_token": 2e-06, "output_cost_per_token": 1.2e-05},
+    }, today=TODAY)
+    assert pricing.find_price("claude-sonnet-5", catalogue=cat).input_per_mtok == pytest.approx(4)
+    assert pricing.find_price("gpt-5.6-terra", catalogue=cat).input_per_mtok == pytest.approx(2)
+
+
+def test_an_unstated_openai_cache_write_is_not_given_anthropics_surcharge():
+    # Anthropic's 1.25x/2x are Anthropic's. A model whose rate the source does
+    # not state bills a write as ordinary input, and there is no 1-hour tier.
+    cat = mc.parse({
+        # parse() rejects a catalogue with an empty lineup, so both are present.
+        "claude-sonnet-5": {"litellm_provider": "anthropic", "mode": "chat",
+                            "input_cost_per_token": 3e-06, "output_cost_per_token": 1.5e-05},
+        "gpt-5.2": {"litellm_provider": "openai", "mode": "chat",
+                    "input_cost_per_token": 1.75e-06, "output_cost_per_token": 1.4e-05},
+    }, today=TODAY)
+    price = pricing.find_price("gpt-5.2", catalogue=cat)
+    assert price.cache_write_5m_per_mtok == pytest.approx(1.75)
+    assert price.cache_write_1h_per_mtok == pytest.approx(1.75)
+    # Cache reads do share Anthropic's 10% rule: it is OpenAI's own discount.
+    assert price.cache_read_per_mtok == pytest.approx(0.175)
+
+
+def test_a_stated_openai_cache_write_rate_is_used_as_stated():
+    cat = mc.parse({
+        "claude-sonnet-5": {"litellm_provider": "anthropic", "mode": "chat",
+                            "input_cost_per_token": 3e-06, "output_cost_per_token": 1.5e-05},
+        "gpt-5.6-sol": {"litellm_provider": "openai", "mode": "chat",
+                        "input_cost_per_token": 4e-06, "output_cost_per_token": 2e-05,
+                        "cache_creation_input_token_cost": 5e-06,
+                        "cache_read_input_token_cost": 4e-07},
+    }, today=TODAY)
+    price = pricing.find_price("gpt-5.6-sol", catalogue=cat)
+    assert price.cache_write_5m_per_mtok == pytest.approx(5)
+    assert price.cache_read_per_mtok == pytest.approx(0.40)
+
+
+@pytest.mark.parametrize("literal", [p for p in pricing.MODEL_PRICES if p.prefix.startswith("gpt-")],
+                         ids=lambda p: p.prefix)
+def test_the_openai_literals_agree_with_the_catalogue(literal, vendored_catalogue):
+    """A fallback run must not cost differently from a normal one. Where the
+    shipped snapshot carries a model, its rates and the literal's must match.
+    (Offline like every other test here — the vendored file, never a fetch.)"""
+    live = pricing.find_price(literal.prefix, catalogue=vendored_catalogue)
+    if live is None or live.prefix != literal.prefix:
+        pytest.skip(f"{literal.prefix} is not in the current catalogue")
+    for field in ("input_per_mtok", "output_per_mtok", "cache_write_5m_per_mtok",
+                  "cache_write_1h_per_mtok", "cache_read_per_mtok"):
+        assert getattr(live, field) == pytest.approx(getattr(literal, field)), field
+
+
 def test_estimate_cost_uses_catalogue_rates_when_the_catalogue_is_live(monkeypatch):
     cat = mc.parse({
         "claude-sonnet-5": {"litellm_provider": "anthropic", "mode": "chat",

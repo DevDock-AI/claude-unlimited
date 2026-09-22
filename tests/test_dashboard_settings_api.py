@@ -180,3 +180,50 @@ def test_reset_requires_csrf(running_server):
     base, _, _ = running_server
     status, body = _request(f"{base}/api/reset", "POST", {})
     assert status == 403
+
+
+def test_fable_limit_all_profiles_is_off_and_round_trips(running_server):
+    """The global override for every profile's "leave when Fable is spent"
+    switch. It moves sessions between accounts, so it ships OFF and is only
+    ever on because someone turned it on."""
+    base, token, _ = running_server
+    status, body = _request(f"{base}/api/settings")
+    assert body["settings"]["fable_limit_all_profiles"] is False
+    # The retired pool-wide per-model-divert key is gone from the wire...
+    retired = "model_limit_" + "routing"
+    assert retired not in body["settings"]
+
+    status, body = _request(f"{base}/api/settings", "PATCH",
+                             {"fable_limit_all_profiles": True},
+                             headers={"X-CSRF-Token": token})
+    assert status == 200
+    assert body["settings"]["fable_limit_all_profiles"] is True
+
+    _, body = _request(f"{base}/api/settings")
+    assert body["settings"]["fable_limit_all_profiles"] is True
+
+    status, body = _request(f"{base}/api/settings", "PATCH",
+                             {"fable_limit_all_profiles": "yes"},
+                             headers={"X-CSRF-Token": token})
+    assert status == 400
+
+    # ...and is not a settings field any more.
+    status, body = _request(f"{base}/api/settings", "PATCH", {retired: True},
+                             headers={"X-CSRF-Token": token})
+    assert status == 400
+
+
+def test_context_1m_accepts_force_1m_and_the_preview_says_so(running_server):
+    """The fourth value: 1M on every route. The preview carries the guard
+    block only when a codex account is in the route, so on this empty pool
+    it is just the decision."""
+    base, csrf, _ = running_server
+    status, body = _request(f"{base}/api/settings", "PATCH", {"context_1m": "force_1m"},
+                            headers={"X-CSRF-Token": csrf})
+    assert status == 200, body
+    status, body = _request(f"{base}/api/settings")
+    assert body["settings"]["context_1m"] == "force_1m"
+    assert body["context_1m_preview"] == {"enabled": True, "reason": "forced_1m"}
+    status, body = _request(f"{base}/api/settings", "PATCH", {"context_1m": "force_2m"},
+                            headers={"X-CSRF-Token": csrf})
+    assert status == 400

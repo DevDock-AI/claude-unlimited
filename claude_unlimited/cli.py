@@ -32,6 +32,7 @@ from typing import Optional
 from . import __version__
 from . import anthropic_oauth
 from . import daemon_installer
+from . import hud as hud_installer
 from . import i18n
 from . import updater
 from . import profiles as profile_repo
@@ -152,6 +153,14 @@ def doctor() -> int:
 
     print("Live proxy: ready — rotation, credential substitution, and usage tracking active.")
 
+    if hud_installer.is_supported():
+        # Also the least surprising place to repair it: someone running
+        # `doctor` because the HUD vanished gets it back from this line.
+        installed = (hud_installer.BUNDLE_DIR / hud_installer.BUNDLE_NAME).is_dir()
+        if not installed:
+            installed = hud_installer.ensure_installed(version=__version__) == "installed"
+        print(f"HUD - Heads-Up Display: {'OK — installed in ~/Applications' if installed else 'not installed (run `cu hud install`)'}")
+
     if sys.platform == "darwin":
         notif_ok = shutil.which("osascript") is not None
         notif_via = "osascript"
@@ -268,13 +277,23 @@ def _spawn_background_daemon(port: int) -> None:
     # tied to the console — it dies when the terminal closes and catches the
     # terminal's Ctrl-C. Windows needs explicit creation flags instead.
     detach_kwargs = {}
+    argv = [sys.executable, "-m", "claude_unlimited", "start", "--port", str(port)]
     if os.name == "nt":
         detach_kwargs["creationflags"] = (
             subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        # Confirmed on real hardware: stdout/stderr redirected to a file (as
+        # here) makes CPython fully block-buffer them, same as any non-TTY
+        # destination — the daemon's startup banner and everything after it
+        # sat unflushed in daemon.out.log/.err.log indefinitely, even though
+        # the daemon was up and answering requests. -u forces unbuffered I/O.
+        # macOS/Linux dodge this because launchd/systemd set PYTHONUNBUFFERED
+        # on the *service* unit; this spawn path (used by `code`'s implicit
+        # daemon start) is a separate launcher those units never cover.
+        argv.insert(1, "-u")
     else:
         detach_kwargs["start_new_session"] = True
     subprocess.Popen(
-        [sys.executable, "-m", "claude_unlimited", "start", "--port", str(port)],
+        argv,
         stdout=out_log, stderr=err_log, stdin=subprocess.DEVNULL,
         **detach_kwargs,
     )
@@ -742,15 +761,21 @@ def purge(port: int = DEFAULT_PORT, assume_yes: bool = False) -> int:
 
     app_dir = Path.home() / ".claude-unlimited"
     install_root = Path.home() / ".local" / "share" / "claude-unlimited"
-    cli_link = Path.home() / ".local" / "bin" / "claude-unlimited"
+    bin_dir = Path.home() / ".local" / "bin"
+    # Both names ship, so both have to go. Removing only `claude-unlimited`
+    # left `cu` behind as a dangling symlink after every purge.
+    cli_links = [bin_dir / name for name in updater.CLI_NAMES]
 
     _banner()
     print("This removes Claude Unlimited and everything it created:")
-    print(f"  - stored credentials for every Profile (from your OS keystore)")
+    print("  - stored credentials for every Profile (from your OS keystore)")
     print(f"  - {app_dir}  (config, usage history, activity log, isolated account sessions)")
     print(f"  - {install_root}  (the app and its virtualenv)")
-    print(f"  - {cli_link}")
+    for link in cli_links:
+        print(f"  - {link}")
     print("  - the background service registration, if installed")
+    if hud_installer.is_supported():
+        print(f"  - {hud_installer.BUNDLE_DIR / hud_installer.BUNDLE_NAME} and its login item")
     if (APP_DIR_PATH() / "claude-desktop-backup").is_dir():
         print("  - the Claude desktop app's routing through the pool (its own settings")
         print("    are restored to how they were before `claude-unlimited desktop`)")
@@ -806,13 +831,20 @@ def purge(port: int = DEFAULT_PORT, assume_yes: bool = False) -> int:
     _remove_isolated_claude_logins(isolated_dirs)
     _revert_desktop_config_for_purge()
 
+    if hud_installer.is_supported():
+        # Before the install root goes: nothing here needs it, but a HUD left
+        # running would keep polling a daemon that no longer exists.
+        hud_installer.remove()
+        print(f"Removed: {hud_installer.BUNDLE_DIR / hud_installer.BUNDLE_NAME}")
+
     for path in (app_dir, install_root):
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
             print(f"Removed: {path}")
-    if cli_link.exists() or cli_link.is_symlink():
-        cli_link.unlink(missing_ok=True)
-        print(f"Removed: {cli_link}")
+    for link in cli_links:
+        if link.exists() or link.is_symlink():
+            link.unlink(missing_ok=True)
+            print(f"Removed: {link}")
 
     print()
     print("Claude Unlimited is gone. ~/.claude was left untouched.")
@@ -859,6 +891,126 @@ def _routing_env(port: int, *, token: Optional[str] = None) -> dict[str, str]:
         "ANTHROPIC_BASE_URL": _pool_base_url(port),
         "ANTHROPIC_AUTH_TOKEN": token if token is not None else _fetch_placeholder_token(LOOPBACK_HOST, port),
     }
+
+
+# The 1M-context policy lives in context_window.py (pure, shared with the
+# daemon's dashboard preview). These are the launch-time halves: reading the
+# installed client's version, and actually applying the decision.
+from .context_window import (  # noqa: E402  - kept beside its users
+    ASSUME_FIRST_PARTY_ENV,
+    _one_million_decision,
+    _parse_client_version,
+    codex_profiles_in_route,
+)
+
+
+# Where `claude` lives when PATH does not say. The daemon runs under launchd /
+# systemd / Task Scheduler with a minimal PATH, so `shutil.which` finds
+# nothing there and the dashboard's 1M preview reported
+# "client_version_unverified" on a machine with a perfectly good 2.1.278
+# installed — a wrong answer, not a missing one. On Windows the installed file
+# is `claude.exe`, never the bare name (confirmed on real hardware: npm/the
+# updater's alias-healing put it at %USERPROFILE%\.local\bin\claude.exe) —
+# without the suffix these candidates never match and the same bug resurfaces.
+_CLAUDE_NAME = "claude.exe" if os.name == "nt" else "claude"
+_CLAUDE_FALLBACK_PATHS = (
+    Path.home() / ".local" / "bin" / _CLAUDE_NAME,
+    Path.home() / ".claude" / "local" / _CLAUDE_NAME,
+    Path("/usr/local/bin/claude"),
+    Path("/opt/homebrew/bin/claude"),
+)
+
+
+def _claude_executable() -> Optional[str]:
+    """The `claude` binary, PATH first and then the usual install locations.
+    None when it genuinely cannot be found."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in _CLAUDE_FALLBACK_PATHS:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _installed_client_version() -> Optional[tuple]:
+    """The installed Claude Code version, or None when it cannot be read —
+    which the policy treats as unverified, never as new enough."""
+    executable = _claude_executable()
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run([executable, "--version"], capture_output=True,
+                                    text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return _parse_client_version(completed.stdout)
+
+
+def _apply_one_million_context(pool, enabled_profiles, forced_profile) -> None:
+    """Decide and apply the 1M-context policy for this launch, and say what it
+    decided. Only ever ADDS the variable: the user's own environment wins, and
+    a refusal is explained rather than silent."""
+    mode = getattr(getattr(pool, "settings", None), "context_1m", "auto")
+    version = _installed_client_version() if mode == "auto" else None
+    should_set, reason = _one_million_decision(
+        mode, enabled_profiles, forced_profile, os.environ, version)
+    if should_set:
+        os.environ[ASSUME_FIRST_PARTY_ENV] = "1"
+        # Deliberately "on models that support it": the variable lifts the
+        # gateway cap, it does not give Haiku or Sonnet 4.6 a window they
+        # never had. Claiming a flat "1M enabled" would be wrong on exactly
+        # the models a user is most likely to be running.
+        if reason == "forced_1m":
+            print("Full context window forced for this session — 1M on the models that have it "
+                  "(Sonnet 5, Opus 4.7/4.8/5, Fable 5/5.1, Mythos 5/5.1), whatever the route.")
+        else:
+            print("Full context window enabled for this session — 1M on the models that have it "
+                  "(Sonnet 5, Opus 4.7/4.8/5, Fable 5/5.1, Mythos 5/5.1).")
+        for line in _codex_guard_lines(pool, enabled_profiles, forced_profile):
+            print(line)
+        return
+    note = _ONE_M_REASON_NOTES.get(reason)
+    if note is not None:
+        print(f"Context window stays at 200K: {note}")
+
+
+def _codex_guard_lines(pool, enabled_profiles, forced_profile) -> list:
+    """One line per ChatGPT/Codex account the session can reach, with the
+    window the gateway's capacity guard holds it to (docs/adr/0009) — so a
+    1M session on a mixed pool knows where its long turns will and will not
+    go. Empty when the route has no codex account."""
+    codex = codex_profiles_in_route(enabled_profiles, forced_profile)
+    if not codex:
+        return []
+    from . import openai_models
+    parity = getattr(getattr(pool, "settings", None), "model_parity", None)
+    lines = []
+    for p in codex:
+        summary = openai_models.codex_profile_windows(p, parity)
+        assumed = " (window assumed — not in gpt_windows.py)" if summary["assumed"] else ""
+        lines.append(f"  {p.name}: up to ~{summary['budget'] // 1000}K estimated tokens per turn on "
+                     f"{'/'.join(summary['models'])}{assumed}; longer turns go to a Claude account, "
+                     f"or Claude Code is asked to compact when none can take them.")
+    return lines
+
+
+# Only the reasons worth interrupting a launch for. "client_default",
+# "user_forced_200k" and "user_already_set" are the user's own doing and need
+# no commentary; "no_profiles" already fails louder elsewhere.
+_ONE_M_REASON_NOTES = {
+    "codex_only_route": "only ChatGPT/Codex accounts can take this session, and a GPT backend "
+                        "holds about 272K. Add a Claude account to the rotation (long turns then "
+                        "go there) — or choose Force 1M in Settings to set it anyway.",
+    "custom_gateway_unknown": "an API profile points somewhere other than Anthropic, and we "
+                              "cannot verify what context window it serves.",
+    "client_version_unverified": "this Claude Code version has not been verified for it.",
+}
 
 
 CLAUDE_APP_BUNDLE_ID = "com.anthropic.claudefordesktop"
@@ -1348,6 +1500,9 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
         updater.ensure_cli_aliases()
     except Exception:
         pass
+    # The HUD reaches an existing install the same way, and for the same
+    # reason: it has to be the NEW code that installs it.
+    hud_installer.ensure_installed_quietly(__version__)
     if not shutil.which("claude"):
         print("Claude Code CLI (`claude`) not found on PATH. Install/update Claude Code first.", file=sys.stderr)
         return 1
@@ -1375,6 +1530,11 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
         # below would pin the session and quietly override it.
         distribute = distribute or pool.settings.distribute_sessions_default
     except Exception:
+        # `pool` must still be bound: everything below this block reads it, and
+        # a NameError here would turn "your config could not be read" into a
+        # crash. None reads as "no settings", which every consumer treats as
+        # the conservative default.
+        pool = None
         enabled_profiles = []
 
     if profile_arg:
@@ -1418,6 +1578,7 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
     # forward-compatible for any id the built-in table lacks. setdefault so a
     # user who exports 0 can opt out.
     os.environ.setdefault("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
+    _apply_one_million_context(pool, enabled_profiles, forced_profile)
     _apply_model_labels(forced_profile, enabled_profiles,
                         host=LOOPBACK_HOST, port=port, token=token)
     if forced_profile is not None:
@@ -1488,6 +1649,50 @@ def install(port: int) -> int:
         return 1
     print("Run `claude-unlimited status` to check it, or `claude-unlimited uninstall` to remove it.")
     return 0
+
+
+def hud(action: str) -> int:
+    """Install, inspect or remove the macOS HUD by hand.
+
+    Everything here happens on its own anyway — on install, on update, and on
+    the first `cu code` after either. This exists for the person who removed it
+    and wants it back, or who wants it gone without purging the whole tool."""
+    _banner()
+    if not hud_installer.is_supported():
+        print("HUD - Heads-Up Display is macOS only.")
+        return 1
+
+    bundle = hud_installer.BUNDLE_DIR / hud_installer.BUNDLE_NAME
+    if action == "remove":
+        hud_installer.remove()
+        print(f"Removed {bundle} and its login item. It stays removed — "
+              "`cu hud install` brings it back.")
+        return 0
+
+    if action == "status":
+        print(f"Bundle: {bundle if bundle.is_dir() else 'not installed'}")
+        print(f"Starts at login: {'yes' if hud_installer.LAUNCH_AGENT.is_file() else 'no'}")
+        try:
+            stamp = hud_installer.STAMP.read_text(encoding="utf-8").strip()
+        except OSError:
+            stamp = "unknown"
+        print(f"Installed version: {stamp}")
+        return 0 if bundle.is_dir() else 1
+
+    # `install` re-installs even when the stamp says it is current: someone
+    # typing this command is asking for the download, not for a status check.
+    result = hud_installer.ensure_installed(version=__version__, force=True)
+    messages = {
+        "installed": f"Installed {bundle} — it starts with you from now on.",
+        "unsupported": "HUD - Heads-Up Display is macOS only.",
+        "no_digest": "This release does not publish a HUD build yet.",
+        "download_failed": "Could not download the HUD. Check your connection and try again.",
+        "digest_mismatch": "The download did not match the checksum this release ships. Nothing was installed.",
+        "bad_archive": "The download was not a usable HUD bundle. Nothing was installed.",
+        "failed": "Could not write into ~/Applications.",
+    }
+    print(messages.get(result, result))
+    return 0 if result == "installed" else 1
 
 
 def uninstall() -> int:
@@ -1854,6 +2059,8 @@ def main(argv=None) -> int:
     sub.add_parser("uninstall", help="stop the daemon from starting automatically on login")
     sub.add_parser("service-start", help="start the installed background daemon now")
     sub.add_parser("service-stop", help="stop the installed background daemon")
+    hud_p = sub.add_parser("hud", help="install, check or remove the macOS HUD (it installs itself by default)")
+    hud_p.add_argument("action", nargs="?", default="status", choices=("install", "status", "remove"))
     restart_p = sub.add_parser("restart", help="stop and start the daemon, service-managed or not")
     restart_p.add_argument("--port", type=int, default=DEFAULT_PORT)
     purge_parser = sub.add_parser(
@@ -1888,6 +2095,8 @@ def main(argv=None) -> int:
         return service_start()
     if args.cmd == "service-stop":
         return service_stop()
+    if args.cmd == "hud":
+        return hud(args.action)
     if args.cmd == "restart":
         return restart(args.port)
     if args.cmd == "purge":

@@ -141,7 +141,7 @@ def test_a_disabled_forced_profile_is_ignored(pool_env):
 
 
 def test_forced_subagents_works_for_a_codex_profile(pool_env):
-    # The owner's actual setup is a codex account as the subagent target, so
+    # A common setup is a codex account as the subagent target, so
     # Profile.kind must not affect the routing decision. Asserted at the
     # decision level: actually serving it would exercise openai_bridge, which
     # is a different module's business.
@@ -370,17 +370,392 @@ def test_agents_moved_off_an_unavailable_account_are_logged_and_notified_once(po
     assert notified.count("rotated") == 1     # one per account, not per agent
 
 
-def test_the_request_body_is_not_parsed_when_no_per_branch_mode_applies(pool_env, monkeypatch):
-    """Identifying a branch JSON-parses the whole (possibly multi-MB) body;
-    ordinary rotation must not pay for a key it would ignore."""
+def _count_body_parses(monkeypatch):
+    """Every json.loads of the inbound body goes through _parsed_request, so
+    counting it counts the parses. A conversation body can be megabytes."""
     calls = []
-    real_branch_key = gateway_module.project_attribution.branch_key
-    monkeypatch.setattr(gateway_module.project_attribution, "branch_key",
-                        lambda headers, body=b"": calls.append(1) or real_branch_key(headers, body))
-    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    real = gateway_module._parsed_request
+    monkeypatch.setattr(gateway_module, "_parsed_request",
+                        lambda body: calls.append(1) or real(body))
+    return calls
+
+
+def test_the_request_body_is_not_parsed_when_nothing_needs_it(pool_env, monkeypatch):
+    """Identifying a branch JSON-parses the whole (possibly multi-MB) body;
+    ordinary rotation must not pay for a key it would ignore. Routing no
+    longer reads the requested model either — a spent Fable week moves the
+    whole session, whatever the model — so plain rotation parses nothing,
+    even with the leave-on-Fable switches on."""
+    from claude_unlimited.config import Settings
+
+    calls = _count_body_parses(monkeypatch)
+    save_pool(Pool(profiles=[prof("a", leave_on_fable_limit=True), prof("b")],
+                   settings=Settings(fable_limit_all_profiles=True)))
     gw = healthy_gateway()
     serve(gw, hdrs(agent="ag1"))
     assert calls == []
-    serve(gw, hdrs(agent="ag1"), distribute=True)
-    assert calls == [1]
 
+
+def test_the_body_is_parsed_at_most_once_per_request(pool_env, monkeypatch):
+    """Branch pinning needs the session id out of the body — one parse, never
+    one per reader."""
+    calls = _count_body_parses(monkeypatch)
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+
+    serve(gw, hdrs(agent="ag1"), distribute=True)
+    assert calls == [1], "branch pinning: one parse, not two"
+
+
+
+# ---- "serving for" in the widget ------------------------------------------
+
+def test_agents_on_account_reports_the_longest_serving_live_agent(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    gw = healthy_gateway()
+    start = real_time.monotonic()
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start)
+    serve(gw, hdrs(agent="ag1"), distribute=True)
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start + 600)
+    serve(gw, hdrs(agent="ag2"), distribute=True)   # a later agent must not shorten it
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start + 900)
+    assert round(gw.agents_on_account_seconds()["a"]) == 900
+
+
+def test_agents_on_account_forgets_expired_pins(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[prof("a")]))
+    gw = healthy_gateway()
+    serve(gw, hdrs(agent="ag1"), distribute=True)
+    later = real_time.monotonic() + gateway_module.BRANCH_PIN_TTL_SECONDS + 1
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: later)
+    assert gw.agents_on_account_seconds() == {}
+
+
+def test_a_repinned_agent_starts_its_time_on_the_new_account_from_zero(pool_env, monkeypatch):
+    # 40 minutes on A, then A runs out: B must not claim those 40 minutes.
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    start = real_time.monotonic()
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start)
+    first = serve(gw, hdrs(agent="ag1"), distribute=True).profile_id
+    with gw._lock:
+        gw._runtime[first].state = ProfileState.EXHAUSTED
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start + 2400)
+    second = serve(gw, hdrs(agent="ag1"), distribute=True).profile_id
+    assert second != first
+    monkeypatch.setattr(gateway_module, "_pin_clock", lambda: start + 2460)
+    assert round(gw.agents_on_account_seconds()[second]) == 60
+
+
+# ---- an app that is not Claude Code ------------------------------------------
+
+def app_hdrs(session="cv-worker-1"):
+    from claude_unlimited.project_attribution import APP_SESSION_HEADER
+    return {APP_SESSION_HEADER: session}
+
+
+def test_an_app_naming_its_session_keeps_one_account(pool_env):
+    """A CV-screening app firing hundreds of concurrent requests used to ride
+    the pool's single rotation pointer, so consecutive requests landed on
+    different accounts and no provider-side prompt cache ever warmed."""
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    first = serve(gw, app_hdrs()).profile_id
+    for _ in range(5):
+        assert serve(gw, app_hdrs()).profile_id == first
+
+
+def test_two_workers_spread_across_accounts_and_each_stays_put(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    one, two = serve(gw, app_hdrs("w1")).profile_id, serve(gw, app_hdrs("w2")).profile_id
+    assert {one, two} == {"a", "b"}
+    assert serve(gw, app_hdrs("w1")).profile_id == one
+    assert serve(gw, app_hdrs("w2")).profile_id == two
+
+
+def test_a_worker_still_rotates_when_its_account_stops_being_usable(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    first = serve(gw, app_hdrs()).profile_id
+    with gw._lock:
+        gw._runtime[first].state = ProfileState.EXHAUSTED
+    assert serve(gw, app_hdrs()).profile_id != first
+
+
+def test_a_client_without_the_header_is_unchanged(pool_env):
+    # No opt-in, no behaviour change: the shared sticky pointer, as before.
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    assert serve(gw, {}).profile_id == "a"
+    assert gw.branch_pins() == []
+
+
+# ---- take over holds under concurrency ---------------------------------------
+
+def test_take_over_holds_while_other_traffic_keeps_arriving(pool_env):
+    """The reported bug: with hundreds of requests in flight, requests that had
+    already chosen another account set the pointer back, so the pool flapped
+    between accounts within the same second after a Take Over."""
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2)]))
+    gw = healthy_gateway()
+    assert serve(gw, {}).profile_id == "a"
+    gw._current_profile_id = "a"
+
+    assert gw.force_active("b") is True
+    for _ in range(10):
+        assert serve(gw, {}).profile_id == "b"
+    # Even if something moves the shared pointer underneath it.
+    gw._current_profile_id = "a"
+    assert serve(gw, {}).profile_id == "b"
+
+
+def test_a_taken_over_account_that_stops_being_usable_releases_the_override(pool_env):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2)]))
+    gw = healthy_gateway()
+    gw.force_active("b")
+    assert serve(gw, {}).profile_id == "b"
+    with gw._lock:
+        gw._runtime["b"].state = ProfileState.EXHAUSTED
+    assert serve(gw, {}).profile_id == "a"
+    assert gw._manual_profile_id is None, "a stuck override would strand the pool"
+
+
+def test_taking_over_another_account_replaces_the_override(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    gw.force_active("b")
+    gw.force_active("a")
+    assert serve(gw, {}).profile_id == "a"
+
+
+# ---- "leave this profile when its Fable limit is spent" (issue #2) ----------
+
+def _spend_fable_on(gw, profile_id, percent=100.0):
+    from claude_unlimited.observation import ModelWindow
+
+    with gw._lock:
+        gw._runtime[profile_id].model_usage = (
+            ModelWindow(name="Fable", percent=percent,
+                        resets_at=datetime(2030, 1, 1, tzinfo=timezone.utc)),
+        )
+
+
+def _serve_model(gw, headers, model, **kw):
+    body = ('{"model": "%s"}' % model).encode()
+    result = gw.handle("POST", "/v1/messages", headers, body, **kw)
+    if result.body_chunks:
+        list(result.body_chunks)
+    return result
+
+
+def _leaving(pid, **kw):
+    return prof(pid, leave_on_fable_limit=True, **kw)
+
+
+def test_the_resolved_switch_survives_the_per_tick_runtime_rebuild(pool_env):
+    """_sync_snapshot reconstructs ProfileRuntime field by field in TWO places
+    (first seen, and every later tick). A field missing from either is
+    silently dropped a second later — the trap that has already lost
+    model_usage, the credit balance and blocked_models."""
+    from claude_unlimited.config import Settings
+
+    save_pool(Pool(profiles=[_leaving("a"), prof("b")], settings=Settings()))
+    gw = healthy_gateway()
+    for _ in range(3):        # several ticks, as an open dashboard would cause
+        rts = gw.runtime_snapshot()
+        assert rts["a"].leave_on_fable_limit is True
+        assert rts["b"].leave_on_fable_limit is False
+
+    # The global override resolves to True for a profile whose own flag is off,
+    # and flipping it applies on the next tick, like any other configuration.
+    save_pool(Pool(profiles=[_leaving("a"), prof("b")], settings=Settings(fable_limit_all_profiles=True)))
+    for _ in range(3):
+        rts = gw.runtime_snapshot()
+        assert rts["b"].leave_on_fable_limit is True
+    save_pool(Pool(profiles=[_leaving("a"), prof("b")], settings=Settings()))
+    assert gw.runtime_snapshot()["b"].leave_on_fable_limit is False
+
+
+def test_a_spent_fable_week_moves_the_whole_session_when_the_switch_is_on(pool_env):
+    """Every model, not just Fable requests — an Opus turn leaves too."""
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+    _spend_fable_on(gw, "a")
+
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "b"
+    assert _serve_model(gw, hdrs(), "claude-fable-5-1").profile_id == "b"
+    # ...and it stays there (sticky on the new account), rather than bouncing.
+    assert _serve_model(gw, hdrs(), "claude-sonnet-5").profile_id == "b"
+
+    import claude_unlimited.activity as activity_module
+    texts = [e.text for e in activity_module.list_events(limit=50)]
+    assert any("A has spent its Fable weekly limit — handed over to B" in t for t in texts)
+    assert not any(t.startswith("Rotated A") for t in texts), "it did not run out; its Fable week did"
+
+
+def test_with_the_switch_off_a_spent_fable_week_changes_nothing(pool_env):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2)]))
+    gw = healthy_gateway()
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+    _spend_fable_on(gw, "a")
+    assert _serve_model(gw, hdrs(), "claude-fable-5-1").profile_id == "a"
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+
+
+def test_the_global_override_makes_a_profile_leave_whose_own_switch_is_off(pool_env):
+    from claude_unlimited.config import Settings
+
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2)],
+                   settings=Settings(fable_limit_all_profiles=True)))
+    gw = healthy_gateway()
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+    _spend_fable_on(gw, "a")
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "b"
+
+
+def test_a_pinned_branch_MOVES_when_its_account_has_spent_its_fable_week(pool_env):
+    """Invariant 4: a branch pin must not silently defeat the feature. The pin
+    itself moves, so the branch's cache follows its work to the new account
+    instead of one request being diverted and the next bouncing back."""
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+
+    first = _serve_model(gw, hdrs(agent="ag1"), "claude-fable-5-1", distribute=True)
+    _spend_fable_on(gw, first.profile_id)
+
+    moved = _serve_model(gw, hdrs(agent="ag1"), "claude-opus-5", distribute=True)
+    assert moved.profile_id != first.profile_id
+
+    # The pin moved, not just this request: the next turn stays on the new
+    # account rather than bouncing back to the spent one.
+    again = _serve_model(gw, hdrs(agent="ag1"), "claude-fable-5-1", distribute=True)
+    assert again.profile_id == moved.profile_id
+
+    import claude_unlimited.activity as activity_module
+    moves = [e for e in activity_module.list_events(limit=50) if e.text.startswith("Agent moved")]
+    assert moves and "has spent its Fable weekly limit" in (moves[0].meta or "")
+
+
+def test_a_pinned_branch_does_not_move_when_nowhere_else_can_take_it(pool_env):
+    """Giving up a warm cache buys nothing if the new account must equally be
+    left."""
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+
+    first = _serve_model(gw, hdrs(agent="ag1"), "claude-fable-5-1", distribute=True)
+    _spend_fable_on(gw, "a")
+    _spend_fable_on(gw, "b")
+
+    assert _serve_model(gw, hdrs(agent="ag1"), "claude-fable-5-1",
+                        distribute=True).profile_id == first.profile_id
+
+
+def test_a_pinned_branch_stays_when_the_spent_account_has_its_switch_off(pool_env):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2)]))
+    gw = healthy_gateway()
+
+    first = _serve_model(gw, hdrs(agent="ag1"), "claude-fable-5-1", distribute=True)
+    _spend_fable_on(gw, first.profile_id)
+
+    assert _serve_model(gw, hdrs(agent="ag1"), "claude-fable-5-1",
+                        distribute=True).profile_id == first.profile_id
+
+
+def test_an_explicit_profile_pin_is_honoured_even_when_that_account_must_leave(pool_env):
+    """The user named one account. Silently serving a
+    different one is exactly what pinning exists to prevent. One Activity
+    line says why the session may start failing on Fable — not one per turn."""
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+    _serve_model(gw, hdrs(), "claude-fable-5-1")   # prime the runtime
+    _spend_fable_on(gw, "a")
+
+    for _ in range(3):
+        result = _serve_model(gw, hdrs(), "claude-fable-5-1", forced_profile_id="a")
+        assert result.profile_id == "a"
+
+    import claude_unlimited.activity as activity_module
+    notes = [e for e in activity_module.list_events(limit=50)
+             if e.text == "A has spent its Fable weekly limit"]
+    assert len(notes) == 1
+    assert "pinned session" in (notes[0].meta or "")
+
+
+def test_take_over_is_honoured_even_when_that_account_must_leave(pool_env):
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+    _serve_model(gw, hdrs(), "claude-opus-5")
+    assert gw.force_active("a") is True
+    _spend_fable_on(gw, "a")
+
+    for _ in range(3):
+        assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+    assert gw._manual_profile_id == "a", "a spent Fable week is not 'stopped being usable'"
+
+    import claude_unlimited.activity as activity_module
+    notes = [e for e in activity_module.list_events(limit=50)
+             if e.text == "A has spent its Fable weekly limit"]
+    assert len(notes) == 1
+    assert "Take over" in (notes[0].meta or "")
+
+
+def test_a_forced_subagent_profile_keeps_its_subagents_when_it_must_leave(pool_env):
+    """Same rule as a --profile pin: "forced in subagents" falls back only
+    when that account cannot serve at all, and a spent Fable week is not
+    that."""
+    save_pool(Pool(profiles=[prof("main", priority=1),
+                             _leaving("subs", priority=9, forced_for_subagents=True)]))
+    gw = healthy_gateway()
+    assert _serve_model(gw, hdrs(agent="ag1"), "claude-opus-5").profile_id == "subs"
+    _spend_fable_on(gw, "subs")
+    assert _serve_model(gw, hdrs(agent="ag1"), "claude-opus-5").profile_id == "subs"
+    assert _serve_model(gw, hdrs(agent="ag2"), "claude-fable-5-1").profile_id == "subs"
+
+
+def test_with_no_alternative_the_session_stays_and_is_served_anyway(pool_env):
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+    _spend_fable_on(gw, "a")
+    _spend_fable_on(gw, "b")
+    for _ in range(3):
+        assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+
+    import claude_unlimited.activity as activity_module
+    notes = [e for e in activity_module.list_events(limit=50)
+             if e.text == "A has spent its Fable weekly limit"]
+    assert len(notes) == 1
+    assert "no other account" in (notes[0].meta or "")
+
+
+def test_a_spent_account_comes_back_when_its_bucket_shows_room_again(pool_env):
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+    _spend_fable_on(gw, "a")
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "b"
+    _spend_fable_on(gw, "a", percent=5.0)
+    # Sticky on "b" while it works — but "a" is a candidate again, so when
+    # "b" must leave, the session comes back to it instead of staying put.
+    _spend_fable_on(gw, "b")
+    assert _serve_model(gw, hdrs(), "claude-opus-5").profile_id == "a"
+
+
+def test_the_pinned_session_note_is_repeated_for_the_next_spent_week(pool_env):
+    save_pool(Pool(profiles=[_leaving("a", priority=1), _leaving("b", priority=2)]))
+    gw = healthy_gateway()
+    _serve_model(gw, hdrs(), "claude-opus-5")
+    _spend_fable_on(gw, "a")
+    _serve_model(gw, hdrs(), "claude-opus-5", forced_profile_id="a")
+    _spend_fable_on(gw, "a", percent=3.0)       # the week reset
+    _serve_model(gw, hdrs(), "claude-opus-5", forced_profile_id="a")
+    _spend_fable_on(gw, "a")                    # spent again
+    _serve_model(gw, hdrs(), "claude-opus-5", forced_profile_id="a")
+    _serve_model(gw, hdrs(), "claude-opus-5", forced_profile_id="a")
+
+    import claude_unlimited.activity as activity_module
+    notes = [e for e in activity_module.list_events(limit=50)
+             if e.text == "A has spent its Fable weekly limit"]
+    assert len(notes) == 2

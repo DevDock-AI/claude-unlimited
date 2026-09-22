@@ -84,9 +84,25 @@ class Profile:
     # If it becomes unavailable, subagents fall back to the balanced branch
     # selector rather than failing. See gateway.py's branch pinning.
     forced_for_subagents: bool = False
+    # "When this account's Fable weekly limit runs out, switch to another
+    # profile." OFF by default. While the account's Fable bucket is spent the
+    # WHOLE session leaves it — every model, not just Fable requests — and it
+    # is not a rotation candidate until the bucket resets or a usage read
+    # shows room again. Derived per request from the usage windows, never
+    # written into the runtime state. Settings.fable_limit_all_profiles turns
+    # it on for every Profile at once. Meaningless for an api-kind Profile
+    # (an API key reports no Fable limit) but kept so it round-trips.
+    leave_on_fable_limit: bool = False
 
 
 UPDATE_MODES = ("auto_install", "auto_download", "manual")
+# ECO tiers. "off" is the shipped default; see Settings.eco_tier.
+ECO_TIERS = ("off", "light", "aggressive")
+# Primitive speech levels; see speech.py. "off" is the shipped default.
+SPEECH_LEVELS = ("off", "lite", "full", "ultra")
+
+# How `cu code` handles Claude Code's 1M context window. See Settings.context_1m.
+CONTEXT_1M_MODES = ("auto", "client_default", "prefer_200k", "force_1m")
 
 
 @dataclass
@@ -125,6 +141,58 @@ class Settings:
     # — the config file keeps its old shape until the user's next save writes
     # the list, so no on-load rewrite is needed.
     model_parity: object = field(default_factory=dict)
+
+    # ECO — Efficient Context Optimization. Rewrites what a TOOL printed into a
+    # shorter form before the request leaves the daemon; never the system
+    # prompt, user text, tool inputs, or an is_error block.
+    #
+    # OFF by default and user-activated only: it changes what the model sees,
+    # so it must be chosen, never inherited. "light" only ever collapses
+    # provably redundant text and always leaves a count behind; "aggressive"
+    # additionally discards content the model cannot infer.
+    eco_tier: str = "off"  # off | light | aggressive
+    # Primitive speech (speech.py): the model replies in fewer words. OFF by
+    # default for the same reason as eco_tier — it changes what the model is
+    # told, so it has to be chosen.
+    speech_level: str = "off"  # off | lite | full | ultra
+    # Let a Codex account that has topped-up prepaid credits keep serving once
+    # its plan window is spent, instead of being rotated away from (issue #6).
+    # OFF by default, and that default is not negotiable: a plan window is
+    # already paid for, credits are real money charged per request, so a pool
+    # that started spending them on its own would be a genuinely bad surprise.
+    # While it is on, the Dashboard, the profile card and the HUD all say the
+    # account is running on credits and show the balance.
+    codex_spend_credits: bool = False
+    # After a failover, go back to your highest-priority account once it is
+    # usable again (issue #4). OFF by default: staying put is deliberate —
+    # moving back throws away a warm prompt cache and, with branch pinning,
+    # would move live agents — so the return only ever happens on a pool that
+    # has been idle long enough for that to cost nothing.
+    return_to_preferred: bool = False
+    # Global override for Profile.leave_on_fable_limit: while on, every Profile
+    # behaves as if its own switch were on — an account whose Fable weekly
+    # limit is spent hands the whole session to another account. While off,
+    # each Profile's own switch decides. OFF by default: it changes which
+    # account a session lands on, so it must be chosen. It never overrides an
+    # explicit `--profile` pin or a standing Take over.
+    fable_limit_all_profiles: bool = False
+    # 1M context for `cu code` sessions. Claude Code budgets a native-1M model
+    # (Sonnet 5, Opus 4.7/4.8/5, Fable 5/5.1, Mythos 5/5.1) at 200K whenever
+    # ANTHROPIC_BASE_URL is not api.anthropic.com, because it cannot verify that
+    # whatever sits on that URL really serves 1M. For an oauth or Anthropic-API
+    # route through this daemon it does — see cli.py's ASSUME_FIRST_PARTY_ENV
+    # block for the measured evidence.
+    #
+    #   auto           tell Claude Code the route is first-party when every
+    #                  profile that could serve the session is Anthropic, or
+    #                  the only non-Anthropic ones are codex Profiles the
+    #                  per-request capacity guard keeps oversized turns off
+    #                  (docs/adr/0009);
+    #   client_default leave Claude Code to decide (200K through a gateway);
+    #   prefer_200k    never ask for 1M;
+    #   force_1m       ask for 1M on EVERY route, whatever it is (the guard
+    #                  stays active; the user's own env still wins).
+    context_1m: str = "auto"
 
 
 @dataclass
@@ -191,6 +259,7 @@ def load_pool() -> Pool:
             codex_model=p.get("codex_model"),
             codex_reasoning_effort=p.get("codex_reasoning_effort"),
             forced_for_subagents=bool(p.get("forced_for_subagents", False)),
+            leave_on_fable_limit=p.get("leave_on_fable_limit") is True,
         )
         for p in data.get("profiles", [])
     ]
@@ -208,6 +277,25 @@ def load_pool() -> Pool:
         distribute_sessions_default=bool(settings_data.get("distribute_sessions_default", False)),
         keep_usage_fresh=bool(settings_data.get("keep_usage_fresh", True)),
         model_parity=settings_data.get("model_parity") or {},
+        # Unknown values fall back to off: a hand-edited or newer config must
+        # never switch on something that changes what the model is sent.
+        eco_tier=settings_data.get("eco_tier") if settings_data.get("eco_tier") in ECO_TIERS else "off",
+        speech_level=(settings_data.get("speech_level")
+                      if settings_data.get("speech_level") in SPEECH_LEVELS else "off"),
+        # Same rule: this one spends money, so anything that is not an
+        # explicit true reads as off.
+        codex_spend_credits=settings_data.get("codex_spend_credits") is True,
+        return_to_preferred=bool(settings_data.get("return_to_preferred", False)),
+        # Off by default and strict: only an explicit true turns it on. The
+        # older pool-wide per-model-divert key is deliberately NOT read — it
+        # meant something else (divert one model's requests, not move the
+        # session) and is simply ignored if an old config still carries it.
+        fable_limit_all_profiles=settings_data.get("fable_limit_all_profiles") is True,
+        # An unknown value falls back to the DEFAULT, not to off: this one is
+        # not a "changes what the model sees" switch, and a typo should not
+        # quietly cost the user 800K of context.
+        context_1m=(settings_data.get("context_1m")
+                    if settings_data.get("context_1m") in CONTEXT_1M_MODES else "auto"),
     )
 
     return Pool(
@@ -221,6 +309,28 @@ class TooManySubagentProfilesError(ValueError):
     """More than one Profile claimed `forced_for_subagents`."""
 
 
+def _refuse_to_write_the_users_real_config() -> None:
+    """A test process must never write the real ~/.claude-unlimited/config.json.
+
+    The suite redirects CONFIG_FILE per test, but a thread started inside a
+    test can outlive it: once pytest's monkeypatch is undone, that thread sees
+    the REAL path again. That happened — a background credential check wrote
+    its test pool over four live Profiles. Cheap, unconditional backstop:
+    inside pytest, writing the real config raises instead.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    real = Path.home() / ".claude-unlimited" / "config.json"
+    try:
+        same = CONFIG_FILE.resolve() == real.resolve()
+    except OSError:
+        same = str(CONFIG_FILE) == str(real)
+    if same:
+        raise RuntimeError(
+            "refusing to write the real config from a test: CONFIG_FILE was not redirected "
+            "(a thread outliving its test, or a missing fixture)")
+
+
 def save_pool(pool: Pool) -> None:
     # At most one Profile may be the forced subagent target: "every subagent
     # goes here" has no meaning if two Profiles claim it. Refused outright
@@ -231,6 +341,7 @@ def save_pool(pool: Pool) -> None:
         raise TooManySubagentProfilesError(
             "Only one profile can be forced for subagents; already set on: "
             + ", ".join(p.name for p in forced))
+    _refuse_to_write_the_users_real_config()
     ensure_app_dir()
     payload = {
         "profiles": [asdict(p) for p in pool.profiles],
@@ -250,6 +361,8 @@ _SETTINGS_FIELDS = {
     "update_mode", "language", "notifications_enabled", "notify_update_available",
     "notify_approaching_threshold", "notify_rotated", "notify_quota_reset", "notify_needs_attention",
     "distribute_sessions_default", "keep_usage_fresh", "model_parity",
+    "eco_tier", "speech_level", "codex_spend_credits", "return_to_preferred",
+    "fable_limit_all_profiles", "context_1m",
 }
 
 
@@ -340,8 +453,20 @@ def validated_settings_changes(changes: dict) -> dict:
     changes = dict(changes)
     if "keep_usage_fresh" in changes and not isinstance(changes["keep_usage_fresh"], bool):
         raise ValueError("keep_usage_fresh must be true or false")
+    if "codex_spend_credits" in changes and not isinstance(changes["codex_spend_credits"], bool):
+        raise ValueError("codex_spend_credits must be true or false")
+    if "return_to_preferred" in changes and not isinstance(changes["return_to_preferred"], bool):
+        raise ValueError("return_to_preferred must be true or false")
+    if "fable_limit_all_profiles" in changes and not isinstance(changes["fable_limit_all_profiles"], bool):
+        raise ValueError("fable_limit_all_profiles must be true or false")
+    if "context_1m" in changes and changes["context_1m"] not in CONTEXT_1M_MODES:
+        raise ValueError(f"context_1m must be one of {CONTEXT_1M_MODES}")
     if "update_mode" in changes and changes["update_mode"] not in UPDATE_MODES:
         raise ValueError(f"update_mode must be one of {UPDATE_MODES}")
+    if "eco_tier" in changes and changes["eco_tier"] not in ECO_TIERS:
+        raise ValueError(f"eco_tier must be one of {ECO_TIERS}")
+    if "speech_level" in changes and changes["speech_level"] not in SPEECH_LEVELS:
+        raise ValueError(f"speech_level must be one of {SPEECH_LEVELS}")
     if "model_parity" in changes:
         changes["model_parity"] = _validated_model_parity(changes["model_parity"])
     if "language" in changes:

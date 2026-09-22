@@ -74,3 +74,31 @@ def test_profiles_api_reports_zero_tokens_and_none_cost_for_unused_profile(runni
     profile = body["profiles"][0]
     assert profile["tokens_total"] == 0
     assert profile["cost_usd_total"] is None
+
+
+@pytest.mark.parametrize("kind,extra,served,asked", [
+    ("oauth", {"account_uuid": "uuid-z"}, "claude-opus-5", None),
+    ("codex", {}, "gpt-5.6-sol", "claude-opus-5"),
+    ("api", {}, "claude-sonnet-5", None),
+])
+def test_profiles_api_reports_what_each_account_last_ran(running_server, kind, extra, served, asked):
+    # The widget's "serving now" block. Every kind records through the same
+    # usage_history path; a codex account also keeps what was ASKED for.
+    p = profile_repo.create_profile(name="Z", kind=kind, credential="tok-long-enough-key", **extra)
+    usage_history.record(p.id, "-Users-nobody-old", "claude-haiku-4-5", {"input_tokens": 1})
+    usage_history.record(p.id, "-Users-nobody-proj", served, {"input_tokens": 1}, requested_model=asked)
+
+    _, body = _get(f"{running_server}/api/profiles")
+    item = body["profiles"][0]
+    assert item["last_model"] == served
+    assert item["last_requested_model"] == asked
+    assert item["last_used_at"]
+    assert item["last_project"] and item["last_project"].endswith("proj")
+    assert item["agents_since"] is None       # no live agent pinned in this test
+
+
+def test_profiles_api_last_use_is_null_for_an_unused_account(running_server):
+    profile_repo.create_profile(name="N", kind="api", credential="tok-long-enough-key")
+    _, body = _get(f"{running_server}/api/profiles")
+    item = body["profiles"][0]
+    assert (item["last_model"], item["last_project"], item["last_used_at"], item["agents_since"]) == (None, None, None, None)

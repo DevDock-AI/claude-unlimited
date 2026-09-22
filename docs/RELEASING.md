@@ -6,36 +6,106 @@ automatically from that tag.
 
 ## Cutting a release
 
+0. Re-verify the hardcoded GPT window table against the Codex CLI's cache
+   (docs/adr/0009 — a stale window is a routing bug):
+
+   ```bash
+   python3 scripts/check_gpt_windows.py
+   ```
+
 1. Bump the version in **`claude_unlimited/__init__.py`**:
 
    ```python
    __version__ = "0.2.0"
    ```
 
-2. Commit it on its own:
+2. **Build the macOS HUD and commit its checksum** (on a Mac — see below for
+   why this cannot be CI):
 
    ```bash
-   git commit -am "chore(release): 0.2.0"
+   cd macos-widget && ./build.sh --release
    ```
 
-3. Tag and push:
+   That writes `macos-widget/dist/HUD-0.2.0-macos.zip` — a **universal**
+   binary (Apple Silicon + Intel; the build refuses to finish otherwise) — and
+   `macos-widget/HUD.sha256`. The **checksum file is committed**; the zip is
+   not.
+
+3. Commit the version and the checksum. Stage the two files by name — never
+   `git commit -a`, which silently leaves out any file git does not track yet:
+
+   ```bash
+   git add claude_unlimited/__init__.py macos-widget/HUD.sha256
+   git commit -m "chore(release): 0.2.0"
+   ```
+
+4. Tag and push:
 
    ```bash
    git tag v0.2.0
    git push origin main --follow-tags
    ```
 
-That's it. `.github/workflows/release.yml` then:
+   `.github/workflows/release.yml` then:
 
-- verifies the tag matches `__version__` (a mismatch fails the release rather
-  than shipping a version that lies about itself);
-- runs the full test suite and the JS syntax check;
-- **only then** publishes a GitHub Release, with notes generated from the
-  commit subjects since the previous tag.
+   - verifies the tag matches `__version__` (a mismatch fails the release rather
+     than shipping a version that lies about itself);
+   - runs the full test suite and the JS syntax check;
+   - **only then** creates a **draft** GitHub Release, with notes generated
+     from the commit subjects since the previous tag.
+
+5. Once the workflow has finished, attach the HUD and publish:
+
+   ```bash
+   scripts/publish_release.sh v0.2.0 [release-notes.md]
+   ```
+
+   Pass a notes file to replace the generated list of commit subjects with
+   hand-written release notes; they are set while the release is still a draft.
+
+   It refuses unless the release is still a draft, the zip matches the
+   `HUD.sha256` committed **at the tag**, and the binary is universal; it
+   uploads the zip, downloads it back and checks the digest again, and only
+   then publishes the release and marks it latest.
+
+**Why a draft.** Releases in this repository are **immutable** once published:
+GitHub refuses to attach anything afterwards. Publishing first and uploading
+the HUD second — the old order — cannot work, and a release published without
+its HUD would stay that way forever. The updater only sees published releases,
+so nobody updates to the new version until step 5 has attached and verified it.
 
 A release is never published from code that did not pass. This matters more
 than usual here: the in-app updater installs whatever the latest release
 points at.
+
+**How the HUD reaches users.** Nothing asks them. `install.sh` installs it on a
+fresh Mac; an existing install gets it from the NEW code the first time it
+runs after an update (the daemon starts, or `cu code`), because the update
+itself is applied by the old updater. The daemon retries a failed download on
+a slow backoff (10 min → 6 h), so a Mac that updated offline still gets it.
+`cu hud remove` is remembered: nothing automatic puts it back until
+`cu hud install`.
+
+## Why the HUD is built by hand
+
+The release workflow runs on `ubuntu-latest` and could not build a macOS app
+anyway, but there is a second reason a macOS CI job would not help: the HUD's
+shader sources are licensed to **compile and ship** but
+explicitly **not** to publish. They live outside this repository, so only a
+machine that has them can produce the real build. CI would produce one without
+them.
+
+That is also why the checksum is committed rather than published in the
+release body. `updater.stage_release` already proves the installed tree is the
+commit GitHub named for the tag, so a digest read out of that tree inherits the
+check; a digest read off the release page would only be the same transport,
+asked twice. If `HUD.sha256` names a different version than the one being
+installed, the installer does nothing — which is the correct behaviour for a
+release that shipped no HUD.
+
+The bundle is **ad-hoc signed**, so `claude_unlimited/hud.py` strips the
+quarantine attribute after unpacking; without that, a downloaded app refuses to
+launch. When there is a paid Developer ID to notarize with, that step goes away.
 
 ## Versioning
 

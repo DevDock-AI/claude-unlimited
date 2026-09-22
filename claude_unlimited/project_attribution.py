@@ -36,6 +36,12 @@ from typing import Optional
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SESSION_ID_HEADER = "x-claude-code-session-id"
+# Any other client can opt into the same per-branch routing by naming its own
+# stable id — one per worker, queue or conversation. Without it a non-Claude-
+# Code app shares the pool's single rotation pointer with everything else, so a
+# burst of concurrent requests lands on whichever account the pointer happened
+# to hold, and the provider's prompt cache (which is per account) never warms.
+APP_SESSION_HEADER = "x-claude-unlimited-session"
 AGENT_ID_HEADER = "x-claude-code-agent-id"
 PARENT_AGENT_ID_HEADER = "x-claude-code-parent-agent-id"
 
@@ -53,6 +59,12 @@ def _header(headers: dict, name: str) -> Optional[str]:
 
 def session_id_from_headers(headers: dict) -> Optional[str]:
     return _header(headers, SESSION_ID_HEADER)
+
+
+def app_session_id(headers: dict) -> Optional[str]:
+    """The caller's own branch id (APP_SESSION_HEADER), for a client that is
+    not Claude Code."""
+    return _header(headers, APP_SESSION_HEADER)
 
 
 def agent_id_from_headers(headers: dict) -> str:
@@ -73,7 +85,7 @@ def is_subagent(headers: dict) -> bool:
     return _header(headers, AGENT_ID_HEADER) is not None
 
 
-def lineage_session_id(headers: dict, body: bytes = b"") -> Optional[str]:
+def lineage_session_id(headers: dict, body: bytes = b"", parsed: Optional[dict] = None) -> Optional[str]:
     """The session id shared by a whole conversation tree (main + subagents).
 
     Prefers the body's `metadata.user_id.session_id`, which Claude Code keeps
@@ -81,9 +93,15 @@ def lineage_session_id(headers: dict, body: bytes = b"") -> Optional[str]:
     back to the header. Best-effort by construction, like everything else
     here: any parse failure returns None, and the caller then routes the
     request exactly as it would have before (never an error)."""
-    if body:
+    from_app = app_session_id(headers)
+    if from_app:
+        return from_app
+    if parsed is not None or body:
         try:
-            user_id = json.loads(body).get("metadata", {}).get("user_id")
+            # `parsed` is the caller's single parse of this body, passed in so
+            # model-aware routing does not cost a second one. Without it this parses, exactly as before.
+            root = parsed if parsed is not None else json.loads(body)
+            user_id = root.get("metadata", {}).get("user_id")
             if isinstance(user_id, str):
                 session_id = json.loads(user_id).get("session_id")
                 if isinstance(session_id, str) and session_id:
@@ -93,11 +111,11 @@ def lineage_session_id(headers: dict, body: bytes = b"") -> Optional[str]:
     return session_id_from_headers(headers)
 
 
-def branch_key(headers: dict, body: bytes = b"") -> Optional[tuple]:
+def branch_key(headers: dict, body: bytes = b"", parsed: Optional[dict] = None) -> Optional[tuple]:
     """`(lineage_session_id, agent_id)` — the identity of one conversation
     branch, or None when this isn't identifiable Claude Code traffic (in which
     case the request must route unpinned, through the normal path)."""
-    session_id = lineage_session_id(headers, body)
+    session_id = lineage_session_id(headers, body, parsed)
     if not session_id:
         return None
     return (session_id, agent_id_from_headers(headers))

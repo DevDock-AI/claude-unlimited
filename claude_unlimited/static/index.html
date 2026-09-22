@@ -2,6 +2,9 @@
 <html>
 <head>
 <meta charset="utf-8">
+<!-- Without this the Dashboard renders at desktop width on a phone and
+     every tap target is a third of its size. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="csrf-token" content="__CSRF_TOKEN__">
 <title>Claude Unlimited</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
@@ -78,9 +81,12 @@
   @keyframes live-exit-fade { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(0.96); } }
 
   /* ---- rail ---- */
+  /* Sticky and exactly one viewport tall, so the tools at its foot (HUD,
+     language, daemon status) never need a scroll to the bottom of a long page. */
   .rail { width: 80px; flex-shrink: 0; background: var(--bg-rail); border-right: 1px solid var(--border);
           display: flex; flex-direction: column; align-items: center; padding: 20px 0; gap: 20px;
-          position: relative; z-index: 1; }
+          position: sticky; top: 0; height: 100vh; box-sizing: border-box; align-self: flex-start;
+          overflow-y: auto; z-index: 1; }
   .rail-mark { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(160deg,#43C6FF,#2E7FCF);
                display:flex;align-items:center;justify-content:center; font-weight:800; font-size:var(--fs-body); color:#04141F; }
   .rail-nav { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
@@ -95,6 +101,16 @@
                font-weight: 700; letter-spacing: 0.02em; display: flex; align-items: center; justify-content: center;
                cursor: pointer; text-transform: uppercase; }
   .rail-lang:hover { color: var(--text); border-color: var(--accent-border); }
+  /* One unit, so the rail's 20px gap separates the PAIR from the rest
+     rather than pushing these two apart. */
+  .rail-tools { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  /* Sits directly above the language selector and matches its footprint. */
+  .rail-widget { width: 40px; height: 26px; border-radius: 7px; border: 1px solid var(--border);
+                 background: var(--bg-field); color: var(--text-faint); display: flex; align-items: center;
+                 justify-content: center; cursor: pointer;
+                 transition: color 140ms ease, border-color 140ms ease; }
+  .rail-widget:hover { color: var(--accent); border-color: var(--accent-border); }
+  .rail-widget svg { width: 15px; height: 15px; }
   .rail-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); animation: pulse-dot 2.4s ease-in-out infinite; }
 
   /* ---- Floating support button — reuses the MAX badge's shimmer/spark
@@ -120,7 +136,9 @@
                        background-size: 260% 100%; animation: plan-shimmer 5s linear infinite;
                        border: 1px solid rgba(255,208,140,0.5); box-shadow: 0 8px 24px rgba(0,0,0,0.35);
                        transition: transform 0.15s ease; }
-  .floating-support:hover { transform: scale(1.08); }
+  .floating-support:hover { transform: scale(1.08); opacity: 1; }
+  /* Recedes so it cannot permanently obscure the chart beneath it. */
+  .floating-support { opacity: 0.88; transition: opacity 160ms ease, transform 160ms ease; }
   .floating-support svg { width: 13px; height: 13px; flex-shrink: 0; position: relative; z-index: 1; }
   .floating-support span { position: relative; z-index: 1; }
   .floating-support .spark { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: #FFE9B8;
@@ -134,7 +152,9 @@
   }
 
   /* ---- shell ---- */
-  .main { flex: 1; padding: 24px 30px 60px; position: relative; z-index: 1; display: flex; justify-content: center; }
+  /* Bottom padding clears the fixed support pill, which would otherwise
+     overlap whatever content ends the page (the Overview heatmap). */
+  .main { flex: 1; padding: 24px 30px 24px; position: relative; z-index: 1; display: flex; justify-content: center; }
   .main-inner { max-width: 1180px; width: 100%; min-width: 0; }
   .view[style*="display:none"] { display: none; }
 
@@ -166,9 +186,19 @@
   .btn.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-border); }
   .btn.btn-disabled { opacity: .45; cursor: not-allowed; pointer-events: none; }
 
+  /* Every statistics section is its own card. Without this rule the panels
+     rendered as bare text on the page background — .panel-title was styled
+     but .panel itself never was. */
+  .panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 14px;
+           padding: 14px 16px 16px; min-width: 0; }
+  .panel + .panel { margin-top: 10px; }
   .panel-title { font-size: var(--fs-micro); font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
                  color: var(--text-faint); margin: 22px 0 10px; display: flex; align-items: center; justify-content: space-between; }
   .panel-title:first-child { margin-top: 0; }
+  /* A panel title may carry a trailing qualifier ("calls per day", "≈ estimate",
+     "peak $1.20"). Without this it renders glued to the title. */
+  .panel-title em { font-style: normal; font-weight: 500; text-transform: none;
+                    letter-spacing: 0; color: var(--text-faint); margin-left: 8px; }
 
   /* ---- stat strip (Overview) ---- */
   .stat-strip { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-bottom: 4px; }
@@ -364,6 +394,35 @@
   .section { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
              animation: fade-up 400ms ease-out both; margin-bottom: 16px; }
   .section.danger { border-color: var(--bad-border); }
+
+  /* Settings is grouped into sections reached from a secondary nav; only one
+     group is on screen at a time. The nav sticks so it stays reachable while a
+     long group (Daemon) scrolls. .section already carries margin-bottom, so
+     .set-panes adds no gap of its own — that would double the spacing. */
+  .set-layout { display: grid; grid-template-columns: 184px minmax(0, 1fr); gap: 20px; align-items: start; }
+  .set-nav { position: sticky; top: 20px; display: flex; flex-direction: column; gap: 2px;
+             background: var(--bg-panel); border: 1px solid var(--border); border-radius: 14px; padding: 8px; }
+  /* Each section gets its own mark: the list is scanned, not read. */
+  .set-nav-item { display: flex; align-items: center; gap: 9px; }
+  .set-nav-item svg { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.85; }
+  .set-nav-item[data-sgroup-nav="eco"] svg { color: var(--good); opacity: 1; }
+  .set-nav-item[data-sgroup-nav="danger"] svg { color: var(--bad); }
+  .set-nav-item { font: inherit; font-size: var(--fs-body); font-weight: 600; text-align: left;
+                  color: var(--text-faint); background: transparent; border: 0; border-radius: 9px;
+                  padding: 9px 12px; cursor: pointer; transition: background 140ms ease, color 140ms ease; }
+  .set-nav-item:hover { color: var(--text); background: var(--bg-field); }
+  .set-nav-item.active { background: var(--accent-soft); color: var(--accent); }
+  .set-nav-item.danger.active { background: var(--bad-soft); color: var(--bad); }
+  .set-panes { min-width: 0; }
+  /* A class, not inline display: sections that hide themselves (Models parity
+     with no codex profile) own their own style.display. */
+  .sgroup-off { display: none !important; }
+
+  @media (max-width: 860px) {
+    .set-layout { grid-template-columns: 1fr; }
+    .set-nav { position: static; flex-direction: row; overflow-x: auto; }
+    .set-nav-item { white-space: nowrap; }
+  }
   .section-head { padding: 16px 20px; border-bottom: 1px solid var(--border); }
   /* Opt-in, NOT applied to every head: most heads stack a title above a
      subtitle, and flexing those would put them side by side. */
@@ -375,7 +434,11 @@
   .section-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
 
   .field-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
-  .field-text { display: flex; flex-direction: column; gap: 2px; }
+  /* `flex: 1 1 <basis>` + min-width:0 is load-bearing, not tidying: without it
+     the text block takes its max-content width, so a two-line description
+     pushes the control onto its own line below. English copy happened to fit;
+     a longer translation did not. */
+  .field-text { display: flex; flex-direction: column; gap: 2px; flex: 1 1 260px; min-width: 0; }
   .field-title { font-size: var(--fs-body); font-weight: 700; }
   .field-sub { font-size: var(--fs-micro); color: var(--text-faint); }
 
@@ -465,12 +528,18 @@
     margin: -4px 0 4px; padding: 10px 12px; border: 1px solid var(--warn-border);
     border-radius: 9px; background: var(--warn-soft); color: var(--warn);
     font-size: var(--fs-micro); line-height: 1.5; }
+  /* display:flex above would otherwise beat the hidden attribute. */
+  .forced-subagents-warning[hidden] { display: none; }
   .forced-subagents-warning svg { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
   /* Card/row tag marking the profile that holds it. */
   .subagent-tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px;
     border: 1px solid var(--accent-border); border-radius: 999px; background: var(--accent-soft);
     color: var(--accent); font-size: var(--fs-micro); font-weight: 600; white-space: nowrap; }
   .subagent-tag svg { width: 11px; height: 11px; }
+  /* Per-model weekly usage under an account name in the table ("Fable weekly 26%"). */
+  .model-usage-line { display: flex; flex-wrap: wrap; gap: 0 10px; min-width: 0; margin-top: 1px; }
+  .model-usage-chip { font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums;
+    min-width: 0; overflow-wrap: anywhere; }   /* wraps inside a narrow name cell, never over the next column */
   .live-agents-pill { display: inline-flex; align-items: center; padding: 2px 7px;
     border: 1px solid var(--border); border-radius: 999px; background: var(--bg-panel-alt);
     color: var(--text-dim); font-size: var(--fs-micro); font-weight: 600; white-space: nowrap;
@@ -489,6 +558,114 @@
   /* No inline <code> here: applyTranslations() writes textContent, so any
      markup inside a [data-i18n] element is discarded at render time. */
   .routing-note { color: var(--text-faint); }
+  /* Settings → ECO: the per-tier filter list. A fixed name column so both
+     tier cards align with each other; stacks on narrow widths. */
+  .eco-filters { display: grid; grid-template-columns: 10em 1fr; gap: 6px 14px; margin-top: 9px; }
+  .eco-filter { display: contents; }
+  .eco-filter-name { font-weight: 600; color: var(--text); }
+  .eco-filter-desc { color: var(--text-dim); }
+  .eco-guarantees { margin: 4px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; color: var(--text-dim); }
+  @media (max-width: 640px) { .eco-filters { grid-template-columns: 1fr; gap: 2px; } .eco-filter-desc { margin-bottom: 6px; } }
+  /* ---- Statistics ---- */
+  .stats-money { font-size: 38px; font-weight: 700; letter-spacing: -0.03em; color: var(--accent);
+                 font-variant-numeric: tabular-nums; line-height: 1; }
+  .stats-money-sub { font-size: var(--fs-body); color: var(--text-dim); margin-top: 8px; }
+  /* The standing caveat under the total: every cost here is priced at list
+     rates, which for a subscription account is an equivalent, not a bill. */
+  .stats-note { font-size: var(--fs-micro); color: var(--text-faint); margin-top: 12px; line-height: 1.45; }
+  .stats-kvs { display: flex; flex-direction: column; gap: 9px; margin-top: 14px; padding-top: 13px;
+               border-top: 1px solid var(--border-soft); }
+  .stats-kv { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: var(--fs-body); }
+  .stats-kv span { color: var(--text-dim); }
+  .stats-kv b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stats-legend b { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; }
+  .stats-legend i { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
+  .stats-rank { display: flex; flex-direction: column; gap: 11px; }
+  .stats-r .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+  .stats-r .top b { font-size: var(--fs-body); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stats-r .top span { font-size: var(--fs-micro); color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .stats-r .track { height: 7px; border-radius: 4px; background: var(--track); overflow: hidden; }
+  .stats-r .track i { display: block; height: 100%; border-radius: 4px; }
+  /* Period selector: a single segmented control, so the options read as one
+     choice rather than a row of unrelated buttons. */
+  .seg-row { display: inline-flex; background: var(--bg-field); border: 1px solid var(--border);
+             border-radius: 9px; padding: 3px; gap: 2px; }
+  .seg-row .seg-btn { font-size: var(--fs-body); font-weight: 600; padding: 5px 11px; border-radius: 6px;
+                      color: var(--text-dim); cursor: pointer; border: 0; background: transparent;
+                      transition: background 140ms ease, color 140ms ease; white-space: nowrap; }
+  .seg-row .seg-btn:hover { color: var(--text); background: var(--bg-panel-alt, rgba(255,255,255,0.05)); }
+  .seg-row .seg-btn.on { background: var(--accent); color: var(--accent-ink); }
+
+  /* The chart library, themed. The library draws axes and the cursor; these rules keep
+     them on the dashboard's palette instead of its defaults. */
+  .uplot, .uplot * { font-family: inherit !important; }
+  .u-title { display: none; }
+  .u-legend { font-size: var(--fs-micro); color: var(--text-dim); padding-top: 8px; }
+  .u-legend .u-marker { width: 9px; height: 9px; border-radius: 3px; }
+  .u-legend th, .u-legend td { font-weight: 400; }
+  .u-select { background: var(--accent-soft); }
+  .u-cursor-x, .u-cursor-y { border-color: var(--border) !important; }
+  .stats-tip { position: absolute; z-index: 30; pointer-events: none; transform: translate(-50%, -115%);
+               background: var(--bg-panel); border: 1px solid var(--border); border-radius: 9px;
+               padding: 7px 10px; font-size: var(--fs-micro); color: var(--text);
+               box-shadow: 0 12px 30px rgba(0,0,0,0.45); white-space: nowrap; opacity: 0;
+               transition: opacity 120ms ease; }
+  .stats-tip.on { opacity: 1; }
+  .stats-tip b { font-variant-numeric: tabular-nums; }
+  .stats-tip .row { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+  .stats-tip .row i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+
+  /* Line chart */
+  .stats-line { position: relative; height: 170px; }
+  .stats-line svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .stats-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 11px;
+                  font-size: var(--fs-micro); color: var(--text-dim); }
+  .stats-legend b { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; }
+  .stats-legend i { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
+
+  /* Base (desktop) grids. These must sit OUTSIDE the media query: with only
+     the override present, every width got the single-column layout. */
+  .stats-hero { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 10px; align-items: start; }
+  .stats-cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+
+  /* Activity, ECO and speech share one row. Each panel carries its own
+     margin-top for the stacked layout; in the row the grid spaces them. */
+  .stats-trio { margin-top: 10px; align-items: stretch; }
+  .stats-trio > .panel { margin-top: 0 !important; min-width: 0; }
+  .stats-trio .heat-cal { overflow-x: auto; }
+
+  @media (max-width: 1100px) {
+    .stats-hero { grid-template-columns: 1fr; }
+    .stats-cols { grid-template-columns: 1fr; }
+  }
+  /* Activity: weekday rows x week columns, five levels off one hue. */
+  /* Cells are capped, not fluid: a 5-week range must not inflate them to 200px.
+     Grows to fill only up to 18px, then the grid stays left-aligned. */
+  .heat-cal { display: grid; gap: 3px; align-items: center; justify-content: start; }
+  .heat-cal .heat-lab { font-size: var(--fs-micro); color: var(--text-faint); text-align: right; padding-right: 4px; }
+  .heat-cal i { aspect-ratio: 1; border-radius: 3px; display: block; min-height: 9px; }
+  .heat-cal i.l0 { background: var(--track); }
+  .heat-cal i.l1 { background: rgba(47,217,196,0.22); }
+  .heat-cal i.l2 { background: rgba(47,217,196,0.42); }
+  .heat-cal i.l3 { background: rgba(47,217,196,0.68); }
+  .heat-cal i.l4 { background: var(--codex); }
+  .heat-scale { display: flex; align-items: center; gap: 6px; justify-content: flex-end;
+                margin-top: 10px; font-size: var(--fs-micro); color: var(--text-faint); }
+  .heat-scale i { width: 11px; height: 11px; border-radius: 3px; display: block; }
+  .heat-scale i.l0 { background: var(--track); }
+  .heat-scale i.l1 { background: rgba(47,217,196,0.22); }
+  .heat-scale i.l2 { background: rgba(47,217,196,0.42); }
+  .heat-scale i.l3 { background: rgba(47,217,196,0.68); }
+  .heat-scale i.l4 { background: var(--codex); }
+
+  .stats-eco { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .stats-eco-side { text-align: right; font-size: var(--fs-micro); color: var(--text-faint); line-height: 1.7; }
+  .stats-eco-side b { color: var(--text); font-size: var(--fs-body); font-variant-numeric: tabular-nums; }
+  .stats-eco-note { font-size: var(--fs-micro); color: var(--text-faint); }
+  .stats-speech { display: flex; flex-direction: column; gap: 6px; }
+  .stats-speech-row { display: grid; grid-template-columns: minmax(80px, 140px) auto 1fr; gap: 12px; align-items: baseline; }
+  .stats-speech-row .mono-num { font-size: var(--fs-body); font-weight: 700; color: var(--text); }
+  .stats-empty { color: var(--text-faint); font-size: var(--fs-body); padding: 26px 0; text-align: center; }
   .parity-del:hover { background: var(--bad); color: #fff; border-color: var(--bad); }
   #parityAddBtn { background: var(--good-soft); color: var(--good); border-color: var(--good);
     font-weight: 600; transition: background .12s, color .12s; }
@@ -602,6 +779,9 @@
   .banner-text { font-size: var(--fs-body); font-weight: 600; color: var(--bad); }
   .banner-sub { font-size: var(--fs-micro); color: var(--text-faint); }
   .banner-spacer { flex: 1; }
+  /* Inside a section body the banner is a row like any other, so it drops the
+     page-level margin and wraps on a narrow window instead of squashing. */
+  .parity-banner { margin: 0 0 4px; flex-wrap: wrap; }
   .banner-btn { font-size: var(--fs-body); font-weight: 700; color: var(--bad); border: 1px solid var(--bad-border);
                 padding: 6px 14px; border-radius: 7px; cursor: pointer; }
 
@@ -671,6 +851,43 @@
   .used-now-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); flex-shrink: 0;
                    animation: pulse-dot 2.4s ease-in-out infinite; }
   @media (prefers-reduced-motion: reduce) { .used-now-dot { animation: none; } }
+  /* Real money is being spent on this account right now — amber, not the
+     green "used now" treatment, and it always carries the balance. */
+  /* What a session launched right now would actually get. Stated plainly,
+     because "why am I still on 200K?" is the question this setting raises. */
+  .context1m-verdict { margin-top: 10px; padding: 9px 12px; border-radius: 8px;
+                        font-size: var(--fs-micro); border: 1px solid var(--border);
+                        background: var(--bg-panel-alt); color: var(--text-dim); }
+  .context1m-verdict.is-on { color: var(--good); background: var(--good-soft);
+                              border-color: var(--good); }
+  .context1m-verdict.is-off { color: var(--warn); background: var(--warn-soft);
+                               border-color: var(--warn-border); }
+  /* One line per ChatGPT/Codex account the capacity guard is sizing for. */
+  .context1m-verdict > div + div { margin-top: 4px; }
+  /* A failed settings read must not look like a page of real settings. */
+  .settings-error { display: flex; align-items: center; gap: 14px; justify-content: space-between;
+                     margin: 0 0 16px; padding: 12px 14px; border-radius: 10px;
+                     border: 1px solid var(--bad-border, var(--warn-border)); background: var(--bad-soft, var(--warn-soft)); }
+  .settings-error-title { font-size: var(--fs-body); font-weight: 600; color: var(--bad, var(--warn)); }
+  .settings-error-detail { font-size: var(--fs-micro); color: var(--text-dim); margin-top: 3px; }
+  .settings-error .btn { flex-shrink: 0; }
+  /* Controls stay visible (so the page does not jump) but cannot be operated
+     from a state nobody verified. */
+  .settings-unreadable .set-panes { opacity: .45; pointer-events: none; }
+  /* Keyboard focus has to be visible or tabbing through the dashboard is a
+     guessing game. :focus-visible only shows it for keyboard use, so mouse
+     clicks stay unchanged. */
+  :focus-visible { outline: 2px solid var(--accent, #7C6CFF); outline-offset: 2px; border-radius: 6px; }
+  .rail-item:focus-visible, .toggle:focus-visible { outline-offset: 3px; }
+  .toast-close { margin-left: 6px; align-self: flex-start; background: none; border: 0; padding: 4px;
+                  border-radius: 6px; color: var(--text-faint); cursor: pointer; display: flex;
+                  min-width: 24px; min-height: 24px; align-items: center; justify-content: center; }
+  .toast-close svg { width: 13px; height: 13px; }
+  .toast-close:hover { color: var(--text); background: var(--bg-panel-alt); }
+  .credits-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 9px; font-weight: 700;
+                   text-transform: uppercase; letter-spacing: .02em; color: var(--warn); background: var(--warn-soft);
+                   border: 1px solid var(--warn-border); padding: 2px 8px; border-radius: 20px; margin-left: 6px;
+                   white-space: nowrap; }
   .bar-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .threshold-chip { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-body); font-weight: 600;
                      padding: 5px 10px; border-radius: 7px; background: var(--bg-panel-alt); color: var(--text);
@@ -759,6 +976,7 @@
 
   .heat-grid { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; margin-top: 10px; }
   .heat-cell { aspect-ratio: 1; border-radius: 2.5px; animation: fade-in 500ms ease-out both; }
+  .chart-card:last-child { padding-bottom: 56px; }
   .heat-labels { display: flex; justify-content: space-between; font-size: 9px; color: var(--text-faint); margin-top: 5px; }
 
   /* Styled hover tooltip for chart elements (bar segments, donut slices,
@@ -771,7 +989,10 @@
     position: fixed; transform: translate(-50%, calc(-100% - 7px));
     background: var(--bg-panel); border: 1px solid var(--border); color: var(--text);
     font-size: var(--fs-micro); font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    white-space: nowrap; padding: 5px 9px; border-radius: 7px; box-shadow: 0 6px 16px rgba(0,0,0,0.28);
+    /* Wraps past 280px and is clamped into the viewport by _positionTooltip —
+       a long one-line tooltip on the rail ran off the left edge. */
+    width: max-content; max-width: min(280px, calc(100vw - 16px)); white-space: normal; line-height: 1.45;
+    padding: 5px 9px; border-radius: 7px; box-shadow: 0 6px 16px rgba(0,0,0,0.28);
     opacity: 0; pointer-events: none; transition: opacity 120ms ease; z-index: 9999;
   }
   .js-tooltip.on { opacity: 1; }
@@ -840,7 +1061,7 @@
 <div class="app" id="appRoot">
 <div class="ambient-glow"></div>
 <div class="cursor-glow" id="cursorGlow"></div>
-<div class="toast-container" id="toastContainer"></div>
+<div class="toast-container" id="toastContainer" role="status" aria-live="polite" aria-atomic="false"></div>
 <a class="floating-repo" id="floatingRepoLink" href="https://github.com/DevDock-AI/claude-unlimited" target="_blank" rel="noopener noreferrer" data-i18n-title="rail.repo" title="View the source on GitHub">
   <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.79 23.4c.6.11.82-.26.82-.58v-2.2c-3.34.73-4.04-1.42-4.04-1.42-.55-1.4-1.34-1.77-1.34-1.77-1.1-.75.08-.73.08-.73 1.21.09 1.85 1.25 1.85 1.25 1.08 1.85 2.83 1.31 3.52 1 .11-.79.42-1.32.76-1.62-2.67-.3-5.47-1.34-5.47-5.96 0-1.32.47-2.39 1.24-3.23-.12-.31-.54-1.55.12-3.22 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.67.24 2.91.12 3.22.77.84 1.24 1.91 1.24 3.23 0 4.63-2.8 5.65-5.48 5.95.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .5Z"/></svg>
 </a>
@@ -860,6 +1081,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><path d="M3.5 20c0-3.3 2.5-5.5 5.5-5.5s5.5 2.2 5.5 5.5"/><circle cx="17" cy="8" r="2.4"/><path d="M15.2 14.8c2.5.3 4.3 2.3 4.3 5.2"/></svg>
       <span class="rail-item-label" data-i18n="nav.profiles">Profiles</span>
     </div>
+    <div class="rail-item" data-view="stats" data-i18n-title="nav.stats" title="Statistics">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+      <span class="rail-item-label" data-i18n="nav.stats">Statistics</span>
+    </div>
     <div class="rail-item" data-view="activity" data-i18n-title="nav.activity" title="Activity">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-7L13 19l2-7h6"/></svg>
       <span class="rail-item-label" data-i18n="nav.activity">Activity</span>
@@ -874,7 +1099,14 @@
     </div>
   </div>
   <div class="rail-spacer"></div>
-  <div class="rail-lang" id="railLangSelect" data-value="en"><span class="select-value">EN</span></div>
+  <div class="rail-tools">
+    <div class="rail-widget" id="railWidgetBtn" data-i18n-tooltip="widget.title" data-tooltip="Open HUD - Heads-Up Display — the desktop dock showing your accounts and usage" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="7" y="3" width="10" height="18" rx="4"/><circle cx="12" cy="8" r="1.6"/><circle cx="12" cy="13" r="1.6"/>
+      </svg>
+    </div>
+    <div class="rail-lang" id="railLangSelect" data-value="en"><span class="select-value">EN</span></div>
+  </div>
   <div class="rail-dot" title="daemon running"></div>
 </div>
 <div class="main">
@@ -945,7 +1177,7 @@
           </div>
         </div>
         <div class="side-card">
-          <div class="chart-sub" data-i18n="panel.usage_by_project_caveat">Best-effort — attributed by matching Claude Code's session id against its own local session files.</div>
+          <div class="chart-sub" data-i18n="panel.usage_by_project_caveat">Best-effort — attributed by matching Claude Code's session id against its own local session files. Counts requests, not tokens.</div>
           <div class="model-list" id="projectUsageList"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
         </div>
 
@@ -1086,12 +1318,33 @@
         <span data-i18n="profiles.col_profile">Profile</span>
         <span data-i18n="profiles.col_usage_1">5h / Tokens</span>
         <span data-i18n="profiles.col_usage_2">7d / Cost</span>
-        <span data-i18n="modal.add_profile.threshold_label">Threshold</span>
+        <span data-i18n="modal.add_profile.threshold_label">Switch threshold</span>
         <span data-i18n="modal.add_profile.priority_label">Priority</span>
         <span></span>
       </div>
       <div id="profilesTableBody"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
     </div>
+  </div>
+
+  <div class="view" data-view-panel="stats" style="display:none">
+    <div class="topbar">
+      <div>
+        <div class="page-title" data-i18n="nav.stats">Statistics</div>
+        <div class="page-sub" data-i18n="stats.subtitle">Cost, tokens and requests across every account</div>
+      </div>
+      <div class="topbar-actions">
+        <div class="seg-row" id="statsRangeRow">
+          <div class="seg-btn" data-range="1d" data-i18n="stats.range_1d">Today</div>
+          <div class="seg-btn" data-range="1w" data-i18n="stats.range_1w">7d</div>
+          <div class="seg-btn on" data-range="1m" data-i18n="stats.range_1m">30d</div>
+          <div class="seg-btn" data-range="3m" data-i18n="stats.range_3m">3m</div>
+          <div class="seg-btn" data-range="6m" data-i18n="stats.range_6m">6m</div>
+          <div class="seg-btn" data-range="1y" data-i18n="stats.range_1y">1y</div>
+          <div class="seg-btn" data-range="all" data-i18n="stats.range_all">All</div>
+        </div>
+      </div>
+    </div>
+    <div id="statsBody"></div>
   </div>
 
   <div class="view" data-view-panel="activity" style="display:none">
@@ -1108,16 +1361,16 @@
     <div class="toolbar">
       <div class="filter-chips" id="activityFilters" style="flex:1;"></div>
       <div class="date-range">
-        <input type="datetime-local" id="activitySince">
+        <input type="datetime-local" id="activitySince" data-i18n-aria-label="activity.filter_since">
         <span class="date-range-sep">–</span>
-        <input type="datetime-local" id="activityUntil">
+        <input type="datetime-local" id="activityUntil" data-i18n-aria-label="activity.filter_until">
         <div class="btn" id="activityDateClearBtn" data-i18n="activity.clear_dates">Clear</div>
       </div>
     </div>
     <div class="activity-panel" id="activityList"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
   </div>
 
-  <div class="view" data-view-panel="settings" style="display:none">
+  <div class="view" data-view-panel="settings" id="view-settings" style="display:none">
     <div class="topbar">
       <div>
         <div class="page-title" data-i18n="nav.settings">Settings</div>
@@ -1125,7 +1378,25 @@
       </div>
     </div>
 
-    <div class="section">
+    <div class="settings-error" id="settingsLoadError" role="alert" style="display:none">
+      <div>
+        <div class="settings-error-title" data-i18n="settings.load_error">Your settings could not be read, so what you see below is not what the daemon has. Nothing here will be saved until this succeeds.</div>
+        <div class="settings-error-detail"></div>
+      </div>
+      <button type="button" class="btn" id="settingsRetryBtn" data-i18n="settings.retry">Try again</button>
+    </div>
+
+    <div class="set-layout">
+      <nav class="set-nav" id="settingsNav" aria-label="Settings sections">
+        <button type="button" class="set-nav-item active" data-sgroup-nav="general"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="7" cy="18" r="2"/></svg><span data-i18n="settings.nav.general">General</span></button>
+        <button type="button" class="set-nav-item" data-sgroup-nav="routing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h6l4 10h6"/><path d="M17 4l3 3-3 3"/><path d="M4 17h6"/></svg><span data-i18n="settings.nav.routing">Routing</span></button>
+        <button type="button" class="set-nav-item" data-sgroup-nav="daemon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span data-i18n="settings.nav.daemon">Daemon</span></button>
+        <button type="button" class="set-nav-item" data-sgroup-nav="data"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg><span data-i18n="settings.nav.data">Data</span></button>
+        <button type="button" class="set-nav-item" data-sgroup-nav="eco"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/></svg><span data-i18n="settings.eco.nav">ECO</span></button>
+        <button type="button" class="set-nav-item danger" data-sgroup-nav="danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4m0 4h.01"/></svg><span data-i18n="settings.nav.danger">Danger zone</span></button>
+      </nav>
+      <div class="set-panes" id="settingsPanes">
+    <div data-sgroup="general" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.updates.title">Updates</div>
       </div>
@@ -1178,7 +1449,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="general" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.language.title">Language</div>
       </div>
@@ -1196,7 +1467,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="routing" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.routing.title">Session routing</div>
         <div class="section-sub" data-i18n="settings.routing.sub">How new sessions and their subagents are placed on your accounts</div>
@@ -1208,6 +1479,22 @@
             <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the least-busy account. Same as launching every session with --distribute. Off by default.</div>
           </div>
           <div class="toggle off" id="distributeDefaultToggle" data-field="distribute_sessions_default"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.routing.return_label">Go back to your first-choice account when it's free</div>
+            <div class="field-sub" data-i18n="settings.routing.return_sub">After a switch, return to the highest-priority account that can serve — but only once nothing has been sent for ten minutes, so no session is moved mid-task. Off by default.</div>
+          </div>
+          <div class="toggle off" id="returnPreferredToggle" data-field="return_to_preferred"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="divider"></div>
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.routing.fable_all_label">Switch every profile when its Fable limit is spent</div>
+            <div class="field-sub" data-i18n="settings.routing.fable_all_sub">Overrides each profile's own "Leave this profile when its Fable limit is spent" switch: while this is on, any account whose Fable weekly limit is spent hands its whole session — every model — to another account. Off by default, and then each profile decides for itself. Never overrides cu code --profile or Take over.</div>
+          </div>
+          <div class="toggle off" id="fableLimitAllToggle" data-field="fable_limit_all_profiles"><div class="toggle-knob"></div></div>
         </div>
         <div class="routing-explainer">
           <div data-i18n="settings.routing.explainer">A Claude Code session is not one caller: the agent you type at (the "main agent") and every subagent it spawns send their own requests. Normally they all share one account, chosen by rotation. Turn this on and each new agent goes to the account with the fewest agents already working on it, across all your sessions — ties go to your priority order, then to the least-used account. Over time this spreads your usage across accounts instead of draining one first.</div>
@@ -1225,7 +1512,53 @@
       </div>
     </div>
 
-    <div class="section" id="modelParitySection" style="display:none">
+    <div data-sgroup="routing" class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.context1m.title">1M context window</div>
+        <div class="section-sub" data-i18n="settings.context1m.sub">How much conversation a session can hold before it has to compact</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.context1m.mode">Context window for cu code</div>
+            <div class="field-sub" data-i18n="settings.context1m.mode_desc">Auto asks for the full 1M window when a Claude account can take the session; a ChatGPT/Codex account beside it is guarded turn by turn. Off by default it would be 200K.</div>
+          </div>
+          <div class="seg-row" id="context1mRow">
+            <div class="seg-btn on" data-context1m="auto" data-i18n="settings.context1m.auto">Auto</div>
+            <div class="seg-btn" data-context1m="client_default" data-i18n="settings.context1m.client_default">Claude Code default</div>
+            <div class="seg-btn" data-context1m="prefer_200k" data-i18n="settings.context1m.prefer_200k">Prefer 200K</div>
+            <div class="seg-btn" data-context1m="force_1m" data-i18n="settings.context1m.force_1m">Force 1M</div>
+          </div>
+        </div>
+        <div class="context1m-verdict" id="context1mVerdict"></div>
+        <div class="routing-explainer">
+          <div data-i18n="settings.context1m.explainer">Several Claude models hold a million tokens — Sonnet 5, Opus 4.7, 4.8 and 5, Fable 5 and 5.1, Mythos 5 and 5.1. Claude Code only uses that window when it is talking straight to Anthropic; pointed at any other address, including this daemon on your own machine, it falls back to 200K because it cannot tell what is on the other end. For a Claude or Anthropic-API account that caution is unnecessary: the daemon relays to Anthropic with your own credential, so the million really is there. A ChatGPT/Codex account in the same pool is a GPT model with a ~272K window of its own — so the daemon sizes every turn before routing it, sends a ChatGPT account only what fits, and gives longer turns to a Claude account. Auto says so whenever a Claude account can take the session.</div>
+          <div class="routing-when" data-i18n="settings.context1m.limits">Auto stays quiet whenever it cannot be sure: a pool with only ChatGPT/Codex accounts (nothing there holds more than ~272K, so 1M would only mean compacting sooner), an API profile pointing somewhere other than Anthropic, or a Claude Code version this build has not checked. Force 1M overrides all three. Your own CLAUDE_CODE_DISABLE_1M_CONTEXT always wins, and a bigger window does not mean a bigger quota — the same conversation just compacts far less often. The one visible sign of the guard in a mixed pool is a compaction that comes earlier than it would on Claude accounts alone, when nothing but a ChatGPT account is left to take a long turn.</div>
+          <div class="routing-note" data-i18n="settings.context1m.force_desc">Force 1M sets the window on every session whatever the route — a ChatGPT/Codex-only pool, a pinned ChatGPT account, an API profile pointing elsewhere, even a Claude Code version this build has not checked. The capacity guard stays on: a ChatGPT/Codex account still takes only turns that fit its ~272K, and a turn nothing can hold gets a prompt-too-long so Claude Code compacts. It cannot enlarge a model that is not natively 1M (Sonnet 4.6 and Haiku 4.5 stay at 200K — only the eight native-1M Claude models change), and a backend you pointed it at may reject what the client now sends.</div>
+        </div>
+      </div>
+    </div>
+
+    <div data-sgroup="routing" class="section" id="codexCreditsSection" style="display:none">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.credits.title">ChatGPT credits</div>
+        <div class="section-sub" data-i18n="settings.credits.sub">What happens to a Codex account once its plan window is spent</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.credits.spend_label">Keep serving on purchased credits</div>
+            <div class="field-sub" data-i18n="settings.credits.spend_sub">Off by default. Your plan window is already paid for; credits are charged per request.</div>
+          </div>
+          <div class="toggle off" id="codexSpendCreditsToggle" data-field="codex_spend_credits"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="routing-explainer">
+          <div data-i18n="settings.credits.explainer">When a ChatGPT account runs out of its plan window, Claude Unlimited rotates away from it and comes back when the window resets. If you have bought credits on that account, they can carry it through instead — but every request then costs real money, so this stays off until you turn it on. While it is on, an account running on credits is marked as such on its card, in the table and in the HUD, with the balance beside it. Accounts with no credits are unaffected, and so is every Claude account.</div>
+        </div>
+      </div>
+    </div>
+
+    <div data-sgroup="routing" class="section" id="modelParitySection" style="display:none">
       <div class="section-head with-actions">
         <div class="section-title" data-i18n="settings.parity.title">Models parity</div>
         <div class="section-actions">
@@ -1233,6 +1566,13 @@
         </div>
       </div>
       <div class="section-body">
+        <div class="banner parity-banner" id="parityNewBanner" style="display:none">
+          <span class="banner-dot"></span>
+          <span class="banner-text" data-i18n="settings.parity.new_title">New Claude models aren't in your list</span>
+          <span class="banner-sub" id="parityNewBannerSub"></span>
+          <div class="banner-spacer"></div>
+          <div class="banner-btn" id="parityAddMissingBtn" data-i18n="settings.parity.add_missing">Add them</div>
+        </div>
         <div class="field-sub" data-i18n="settings.parity.desc">The models listed here are exactly what Claude Code's model picker offers for Codex-served sessions. Each row maps a Claude model to a Codex model and reasoning effort; the Claude effort applies when a Claude account serves the request.</div>
         <table class="model-map-table" id="parityTable">
           <thead><tr>
@@ -1248,7 +1588,7 @@
           <div class="btn" id="parityAddBtn" data-i18n="settings.parity.add_row">+ Add model</div>
         </div>
         <div class="field-sub" data-i18n="settings.parity.cost_note">Higher tiers and higher effort cost more of a Codex plan's quota.</div>
-        <div class="field-sub" data-i18n="settings.parity.picker_note">Claude Code's picker can relabel at most the four standard tiers (Fable, Opus, Sonnet, Haiku); extra rows are served and usable by id, but may not appear in the picker. Restart your <code>cu code</code> session to refresh the picker.</div>
+        <div class="field-sub" data-i18n="settings.parity.picker_note">Claude Code's picker can relabel at most the four standard tiers (Fable, Opus, Sonnet, Haiku); extra rows are served and usable by id, but may not appear there. Restart your <code>cu code</code> session to refresh the picker.</div>
         <div class="field-row">
           <div class="field-text"></div>
           <div class="btn primary" id="paritySaveBtn" data-i18n="settings.parity.save">Save</div>
@@ -1256,7 +1596,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="daemon" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.daemon.title">Daemon</div>
         <div class="section-sub" data-i18n="settings.daemon.sub">The background process that runs the proxy and this dashboard</div>
@@ -1281,14 +1621,14 @@
         <div class="field-row">
           <div class="field-text">
             <div class="field-title" data-i18n="settings.daemon.usage_fresh_label">Keep usage up to date</div>
-            <div class="field-sub" data-i18n="settings.daemon.usage_fresh_sub">While you're active, reads each subscription account's usage every 5–10 minutes from the providers' read-only usage endpoints — no messages are sent. Pauses after 30 minutes idle, and waits longer whenever a provider pushes back.</div>
+            <div class="field-sub" data-i18n="settings.daemon.usage_fresh_sub">While you're active, reads each subscription account's usage every 5–10 minutes from the providers' read-only usage endpoints — no messages are sent. Pauses after 30 minutes idle, and waits longer whenever a provider pushes back. For a Claude account it also shows any per-model weekly limit, such as Fable.</div>
           </div>
           <div class="toggle" id="usageFreshToggle" data-field="keep_usage_fresh"><div class="toggle-knob"></div></div>
         </div>
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="daemon" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.process.title">Process</div>
         <div class="section-sub" data-i18n="settings.process.sub">Live resource usage and manual control for the daemon process itself</div>
@@ -1327,7 +1667,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="daemon" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.network.title">Network</div>
         <div class="section-sub" data-i18n="settings.network.sub">Manual one-time setup — never edited automatically</div>
@@ -1376,7 +1716,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="general" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.notifications.title">Notifications</div>
         <div class="section-sub" data-i18n="settings.notifications.sub">Desktop notifications via macOS Notification Center</div>
@@ -1401,7 +1741,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="data" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.export_import.title">Export &amp; import</div>
         <div class="section-sub" data-i18n="settings.data_portability.sub">Move your setup to another machine, or snapshot your configuration</div>
@@ -1431,7 +1771,7 @@
       </div>
     </div>
 
-    <div class="section">
+    <div data-sgroup="data" class="section">
       <div class="section-head">
         <div class="section-title" data-i18n="settings.storage.title">Storage</div>
       </div>
@@ -1451,7 +1791,91 @@
       </div>
     </div>
 
-    <div class="section danger">
+    <div data-sgroup="eco" class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.eco.title">ECO — Efficient Context Optimization</div>
+        <div class="section-sub" data-i18n="settings.eco.sub">Shorten what tools printed before it is sent, so the same work costs fewer tokens</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.eco.mode">ECO mode</div>
+            <div class="field-sub" data-i18n="settings.eco.mode_desc">Off by default. Only text a tool printed is ever rewritten — never your messages, the system prompt, tool inputs, or an error.</div>
+          </div>
+          <div class="seg-row" id="ecoTierRow">
+            <div class="seg-btn on" data-eco="off" data-i18n="settings.eco.off">Off</div>
+            <div class="seg-btn" data-eco="light" data-i18n="settings.eco.light">Light</div>
+            <div class="seg-btn" data-eco="aggressive" data-i18n="settings.eco.aggressive">Aggressive</div>
+          </div>
+        </div>
+        <div class="routing-explainer eco-explainer">
+          <div class="routing-when" data-i18n="settings.eco.scope">What ECO rewrites: only the text a tool printed back — a command's output, search results, a file listing. Sent exactly as written: your messages, the model's replies, the system prompt, tool inputs, and any result marked as an error. Output under 500 characters is never touched. It runs before an account is chosen, so it works the same for Claude, Codex and API profiles.</div>
+          <div class="routing-example">
+            <div class="routing-example-title" data-i18n="settings.eco.light_title">Light — collapses repetition, keeps every error</div>
+            <div class="routing-example-body" data-i18n="settings.eco.light_intro">Collapses repeated lines and groups long lists. Nothing an error printed is dropped, and every cut leaves a count behind.</div>
+            <div class="eco-filters">
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.dedup">Repeated lines</div><div class="eco-filter-desc" data-i18n="settings.eco.f.dedup_desc">40 identical "retrying…" lines become one line plus "… (39 duplicate lines, ECO)". Logs over 2,000 lines are capped, with the rest counted. JSON and source code are skipped — there, repeated lines are values.</div></div>
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.build">Build and test logs</div><div class="eco-filter-desc" data-i18n="settings.eco.f.build_desc">Every error line is kept, in its original place. The first 5 warnings and 3 deprecation notices are kept; 84 "Compiling …" lines become "Compiled 84 packages". Anything left out is counted.</div></div>
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.git_status">git status</div><div class="eco-filter-desc" data-i18n="settings.eco.f.git_status_desc">A count per group — staged, modified, untracked — with the first 10 paths of each, instead of every path.</div></div>
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.grep">Search results</div><div class="eco-filter-desc" data-i18n="settings.eco.f.grep_desc">path:line matches grouped by file, first 10 per file, e.g. "app.js  (37 matches)" followed by 10 of them and "… +27 more".</div></div>
+            </div>
+          </div>
+          <div class="routing-example">
+            <div class="routing-example-title" data-i18n="settings.eco.aggressive_title">Aggressive — everything in Light, plus</div>
+            <div class="routing-example-body" data-i18n="settings.eco.aggressive_intro">Also discards detail the model cannot reconstruct. It still names what went, but the text itself is gone.</div>
+            <div class="eco-filters">
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.long">Very long output</div><div class="eco-filter-desc" data-i18n="settings.eco.f.long_desc">250 lines or more: the first 120 and last 60 lines are kept — what the command was doing and how it ended — with "… +4820 lines truncated (ECO)" in between.</div></div>
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.git_diff">git diff</div><div class="eco-filter-desc" data-i18n="settings.eco.f.git_diff_desc">Each file gets one summary line with its added and removed line counts, such as +42 -7; each hunk keeps its first 100 lines, and the rest is counted.</div></div>
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.git_log">git log</div><div class="eco-filter-desc" data-i18n="settings.eco.f.git_log_desc">Each commit's header and message are kept; a diff embedded in the log is dropped.</div></div>
+            <div class="eco-filter"><div class="eco-filter-name" data-i18n="settings.eco.f.listing">tree, ls, find</div><div class="eco-filter-desc" data-i18n="settings.eco.f.listing_desc">tree is capped at 200 lines. ls -l drops the permission, owner, size and date columns and ends with a count per extension; folders such as node_modules and .git are counted, not listed. find groups paths by folder, 10 names each.</div></div>
+            </div>
+          </div>
+          <div class="routing-example">
+            <div class="routing-example-title" data-i18n="settings.eco.safety_title">What ECO guarantees</div>
+            <ul class="eco-guarantees">
+              <li data-i18n="settings.eco.safety.deterministic">The same output is always rewritten the same way, on every turn — so the prompt cache keeps hitting instead of costing more than ECO saves.</li>
+              <li data-i18n="settings.eco.safety.never_worse">Never longer, never empty. If a rewrite does not make the output shorter, the original is sent.</li>
+              <li data-i18n="settings.eco.safety.marked">Every cut says how much went — a count such as "… +27 more" or "(39 duplicate lines, ECO)" — and running ECO again over text it already shortened changes nothing.</li>
+              <li data-i18n="settings.eco.safety.fails_open">If anything inside ECO fails, the original request is sent. ECO can never be the reason a request fails.</li>
+            </ul>
+          </div>
+          <div class="routing-note" data-i18n="settings.eco.measured">How savings are counted: the bytes removed are exact, recorded per request. Tokens are estimated from what that same request was actually billed, and cost from that model's input price — Statistics marks both as approximate.</div>
+        </div>
+      </div>
+    </div>
+
+    <div data-sgroup="eco" class="section" id="speechSection">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.speech.title">Primitive speech</div>
+        <div class="section-sub" data-i18n="settings.speech.sub">The model answers in fewer words — every fact kept</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.speech.mode">Speech level</div>
+            <div class="field-sub" data-i18n="settings.speech.mode_desc">Off by default. Adds a short instruction to each agent turn, and a one-line reminder to each message you type, so the model's replies cost fewer output tokens. Nothing you or the model already wrote is reworded.</div>
+          </div>
+          <div class="seg-row" id="speechLevelRow">
+            <div class="seg-btn on" data-speech="off" data-i18n="settings.speech.off">Off</div>
+            <div class="seg-btn" data-speech="lite" data-i18n="settings.speech.lite">Lite</div>
+            <div class="seg-btn" data-speech="full" data-i18n="settings.speech.full">Full</div>
+            <div class="seg-btn" data-speech="ultra" data-i18n="settings.speech.ultra">Ultra</div>
+          </div>
+        </div>
+        <div class="routing-explainer">
+          <div class="routing-example">
+            <div class="routing-example-body" data-i18n="settings.speech.lite_ex">Lite — full sentences without filler: “The token expiry check causes this: it uses &lt; instead of &lt;=.”</div>
+            <div class="routing-example-body" data-i18n="settings.speech.full_ex">Full — fragments, no articles: “Bug in auth middleware. Expiry check uses &lt; not &lt;=. Fix:”</div>
+            <div class="routing-example-body" data-i18n="settings.speech.ultra_ex">Ultra — as short as stays unambiguous: “Inline object prop, new reference each render, re-render. Use useMemo.”</div>
+          </div>
+          <div class="routing-when" data-i18n="settings.speech.kept">Always kept exactly: code, commands, file paths, error messages, numbers, and words like not, only and unless. Written normally at every level: files, code comments, commits, documentation, and pull request or issue text. Security warnings and destructive or irreversible steps are spelled out in full sentences. The model is also told not to narrate its own reasoning ("Privately…", "Let me…"). Replies stay in your language.</div>
+          <div data-i18n="settings.speech.where">Applies to every session, subagent and account type, Codex included. Helper calls such as titles and summaries are left alone. The instruction goes after Claude Code's own system prompt, so prompt caching keeps working; changing the level in the middle of a session costs one uncached turn. What it saves is measured from real replies in Statistics.</div>
+          <div class="routing-note" data-i18n="settings.speech.credit">Adapted from the Caveman skill by Julius Brussee (MIT License). Not affiliated with it.</div>
+        </div>
+      </div>
+    </div>
+
+    <div data-sgroup="danger" class="section danger">
       <div class="section-head">
         <div class="section-title" style="color:var(--bad)" data-i18n="settings.danger.title">Danger zone</div>
       </div>
@@ -1463,6 +1887,8 @@
           </div>
           <div class="btn danger" id="resetBtn" data-i18n="settings.danger.reset_btn">Reset</div>
         </div>
+      </div>
+    </div>
       </div>
     </div>
   </div>
@@ -1523,7 +1949,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.reauth">Re-authenticates a Profile that needs it — defaults to whichever ones the daemon reports as "needs re-auth", and lets you pick if there's more than one. Logs back into the exact same account, never a new one.</div>
+          <div class="field-sub" data-i18n="help.cmd.reauth">Re-authenticates a Profile that needs it — defaults to whichever ones the daemon reports as "needs re-auth", and lets you pick if there's more than one. Logs back into the exact same account, never a new one. Once it is back, its usage is read straight away.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -1613,6 +2039,42 @@
             <td data-i18n="help.routing.r_default">Normal rotation: every agent shares the account with the lowest priority number, until it hits its threshold or runs out, then all of them move to the next one.</td>
           </tr>
         </table>
+        <div class="field-sub" data-i18n="help.routing.context1m_note">Context size: several Claude models hold a million tokens, but Claude Code drops to 200K whenever it is pointed at anything other than Anthropic's own address — including this daemon. For a Claude or Anthropic-API account that caution is unnecessary, so cu code asks for the full window back. A ChatGPT/Codex account in the rotation no longer costs you the window: the daemon sizes every turn and keeps any that would overflow a GPT model's ~272K window on a Claude account; when no account can hold it, Claude Code is asked to compact. Settings → 1M context window.</div>
+        <div class="field-sub" data-i18n="help.routing.model_limit_note">A plan can limit one model on its own weekly clock — you can run out of Fable while the account's own windows still look healthy. Each profile has a switch, "Leave this profile when its Fable limit is spent", off by default. With it on, the moment that account's Fable weekly limit is spent the whole session moves to another account — every model, not just Fable requests — and rotation skips the account until the limit resets or a fresh usage read shows room; it is never marked exhausted. With it off, the account keeps serving and only Fable requests get the provider's limit error. Settings → Session routing → "Switch every profile when its Fable limit is spent" turns it on for every profile at once. ChatGPT accounts are covered through the model mapping: OpenAI only reports whether a model is usable, so a ChatGPT account counts as spent when the GPT model Fable maps to is unavailable. A --profile pin and Take over are honoured regardless, with one Activity line saying the limit is spent; a pinned branch moves for good once another account can take it, and if no account can, the session stays put and you get the provider's own error.</div>
+        <div class="field-sub" data-i18n="help.routing.return_note">After a switch the pool stays on the new account for as long as it works, even once your first-choice account refills — moving back would throw away a warm prompt cache and could move an agent mid-task. Settings → Session routing → "Go back to your first-choice account when it's free" changes that, and only ever acts after ten minutes with nothing sent.</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.app.title">Calling the daemon from your own app</div>
+        <div class="section-sub" data-i18n="help.app.sub">Anything that speaks the Anthropic Messages API</div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="help.app.intro">Point your app's base URL at this daemon and use the local token from Settings → Network as its API key. Nothing else changes.</div>
+        <div class="field-sub" data-i18n="help.app.body">Claude Code labels every request with the session and agent it came from, and that label is what keeps a conversation on one account. Your app sends no such label, so each request is routed on its own and a batch can land on several accounts, each paying a fresh cache miss. Send a stable id of your own instead, and every request carrying it is treated as one session: it stays on the account it started on for as long as that account can serve it, keeping its prompt cache warm, and rotates only when that account hits its threshold, runs out or becomes unavailable. Give each worker, conversation or job its own id and they spread across your pool.</div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-app-session">x-claude-unlimited-session: my-worker-1</code>
+            <div class="copy-btn" data-copy-target="cmd-app-session">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+        </div>
+        <div class="field-sub" data-i18n="help.app.takeover">Take over — from here or the HUD — still beats all of it, and holds every request on the account you picked until you release it.</div>
+        <div class="divider"></div>
+        <div class="field-sub" data-i18n="help.app.sessions">Every request carrying the same id is one branch, and each branch stays on one account while it works — so a batch of workers spreads across your accounts instead of scattering request by request.</div>
+        <div class="field-sub" data-i18n="help.app.idle">Need to know whether the pool is busy — to run a batch job only when nobody is working, for instance — read it from the status endpoint. "idle_seconds" is how long since any account last served a request (null when this daemon has served none yet), and "serving_now" lists the accounts with a request open at this instant. Don't use the "Used now" light for this: it deliberately stays on for 15 minutes after the last request so it doesn't flicker between refreshes.</div>
+        <div class="cmd-row">
+          <div class="code-row">
+            <code id="cmd-app-idle">curl -s 127.0.0.1:4317/api/status</code>
+            <div class="copy-btn" data-copy-target="cmd-app-idle">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1667,6 +2129,17 @@
           <div class="field-sub" data-i18n="help.cmd.service_stop">Stops the installed background daemon.</div>
         </div>
 
+        <div class="cmd-row" id="helpHudRow">
+          <div class="code-row">
+            <code id="cmd-hud">cu hud install | status | remove</code>
+            <div class="copy-btn" data-copy-target="cmd-hud">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.hud">macOS only. The HUD installs and updates itself with Claude Unlimited, so this is rarely needed: `install` brings it back after you removed it (or re-downloads it), `status` shows whether it is installed and starts at login, and `remove` takes it away and keeps it away — nothing puts it back until you run `install`.</div>
+        </div>
+
         <div class="cmd-row">
           <div class="code-row">
             <code id="cmd-restart">cu restart</code>
@@ -1675,7 +2148,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.restart">Stops and starts the daemon.</div>
+          <div class="field-sub" data-i18n="help.cmd.restart">Stops and starts the daemon, whether or not it's installed as a background service. Needed after an update replaces the code on disk, since the running process keeps serving the version it started with.</div>
         </div>
 
         <div class="cmd-row">
@@ -1686,7 +2159,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.purge">Removes Claude Unlimited and everything it created.</div>
+          <div class="field-sub" data-i18n="help.cmd.purge">Removes Claude Unlimited and everything it created — stored credentials, config, usage history, the app and its virtualenv, and the service registration — on macOS, the HUD too. Asks for confirmation. Your own ~/.claude setup is never touched.</div>
         </div>
       </div>
     </div>
@@ -1742,13 +2215,54 @@
 
     <div class="section">
       <div class="section-head">
+        <div class="section-title" data-i18n="help.exhausted.title">When every account is out of capacity</div>
+        <div class="section-sub" data-i18n="help.exhausted.sub">What your client is told, and what gets logged</div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="help.exhausted.body">When every enabled account has used up its window, requests are answered with 503 and the message "Claude Unlimited — all profiles are out of capacity", along with the time the first window reopens and a Retry-After header for clients that honour one. It is said once per outage — a single Activity line and a single notification, however many requests are rejected meanwhile — and Activity records "Capacity is back" when an account can serve again.</div>
+        <div class="field-sub" data-i18n="help.exhausted.difference">A pool whose accounts are all disabled or need re-authentication reports "No eligible Profile is available" instead: that is a configuration problem, not a quota one, and the two are never reported as the same thing.</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
         <div class="section-title" data-i18n="help.more.title">Where everything else happens</div>
       </div>
       <div class="section-body">
         <div class="field-sub" data-i18n="help.more.body">Adding and removing Profiles, thresholds, priority, budget caps, Export/Import, and notifications are all managed right here in the Dashboard — not on the command line. The commands above are only for the daemon's own lifecycle.</div>
       </div>
     </div>
-  </div>
+  
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.stats.title">Statistics</div>
+        <div class="section-sub" data-i18n="help.stats.sub">What your accounts actually cost, measured from real requests</div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="help.stats.body">Cost and tokens over time, broken down by model, project and account, over ranges from today to all time. Token and request counts come from requests that actually went through the daemon. Costs are estimates: every model is priced at its provider's published list rates, so for a subscription account — Claude or Codex — the figure is what the same traffic would have cost on the API, not money you were billed. "Asked for → served" shows which model each request requested against the one that answered it, which is how a Codex account translating your Claude models becomes visible. An activity grid shows how many calls you made on each day of the range.</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.eco.title">ECO</div>
+        <div class="section-sub" data-i18n="help.eco.sub">Efficient Context Optimization — fewer tokens for the same work</div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="help.eco.body">Claude Code re-sends the whole conversation every turn, so a long tool output is paid for again on every later turn. ECO rewrites what a tool printed into a shorter form before the request leaves your machine. Off by default — turn it on in Settings → ECO, which lists every rewrite each mode makes, with an example. Light collapses repeated lines and groups long lists, keeping every error and leaving a count behind; Aggressive also drops detail the model cannot reconstruct. It never touches your messages, the system prompt, tool inputs, or an error result, and if anything in it fails the original request is sent. Primitive speech, in the same Settings section, works the other way: the model replies in fewer words (Lite, Full or Ultra) while code, commands, errors and numbers stay exact, and files, commits and docs are still written normally.</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <div class="section-title" data-i18n="help.widget.title">HUD - Heads-Up Display</div>
+        <div class="section-sub" data-i18n="help.widget.sub">macOS only, English only</div>
+      </div>
+      <div class="section-body">
+        <div class="field-sub" data-i18n="help.widget.body">A floating dock showing every account as a circle with two usage rings: the 5-hour window outside, the weekly one inside (blue, red from 90%). The number under it names its window (5h or w); an account that needs re-auth says Reauth in red. The logo takes the account's colour from the Profiles page. On macOS it installs with Claude Unlimited and starts with you — there is nothing to build. It also adds a menu bar item showing the account currently serving. Drag it anywhere — near a screen edge it pulls onto the edge and docks there when you let go, turning to run along it — and hover a profile for its details. Right-click (or Control-click) a profile to take it over, to enable or disable it, or to choose whether its percentage shows the 5-hour or the weekly window — remembered per profile. The cog sets size, orientation, background and transparency. If you close it, reopen it with the button directly above the language selector, or with `cu hud install`; `cu hud remove` takes it away for good. It only ever talks to 127.0.0.1, and the only two things it changes are Take over and enabling or disabling a profile: the same actions as the Dashboard's, sent with the daemon's per-run security token.</div>
+      </div>
+    </div>
+</div>
 </div>
 </div>
 
@@ -1978,6 +2492,13 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>
               <div data-i18n="modal.add_profile.forced_subagents_warning">Heads up: every subagent in every Claude Code session will be routed to this profile, ignoring priority and rotation. Your main agent keeps rotating normally — that's the point (a Claude orchestrator with GPT subagents, for example). If this profile runs out or becomes unavailable, subagents fall back to alternating across your other accounts. Only one profile can hold this, and you can turn it off any time.</div>
             </div>
+            <div class="toggle-row" id="f_leave_fable_wrap">
+              <div class="toggle-row-text">
+                <div class="toggle-row-title" data-i18n="modal.add_profile.leave_fable_label">Leave this profile when its Fable limit is spent</div>
+                <div class="toggle-row-sub" data-i18n="modal.add_profile.leave_fable_sub">Some plans put Fable on its own weekly clock. When it runs out here, the whole session — every model — moves to another account, and this one is skipped until the limit resets. Off = stay put; only Fable requests get the provider's limit error.</div>
+              </div>
+              <div class="toggle off" id="f_leave_fable_toggle"><div class="toggle-knob"></div></div>
+            </div>
             <div class="field-group">
               <div class="field-label" data-i18n="modal.add_profile.tag_color_label">Tag color</div>
               <div class="tag-row" id="f_tag_row"></div>
@@ -2144,7 +2665,7 @@
           <div class="field-label" data-i18n="modal.import.conflict_label">If a profile already exists (same account)</div>
           <div class="seg-row" id="imp_conflict">
             <div class="seg-btn on" data-conflict-value="keep_existing" data-i18n="modal.import.conflict_keep_existing">Keep existing</div>
-            <div class="seg-btn" data-conflict-value="use_imported" data-i18n="modal.import.conflict_use_imported">Use imported</div>
+            <div class="seg-btn" data-conflict-value="use_imported" data-i18n="modal.import.conflict_use_imported">Use imported (updates credential)</div>
           </div>
         </div>
         <div class="check-row" id="imp_settings_wrap">
@@ -2180,7 +2701,7 @@
       </div>
       <div id="pd_api_fields" style="display:none">
         <div class="field-group">
-          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL</div>
+          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com)</div>
           <input class="text-input" id="pd_base_url_input" type="text" data-i18n-placeholder="modal.add_profile.base_url_placeholder" placeholder="https://api.anthropic.com">
         </div>
         <div class="field-group">
@@ -2293,6 +2814,13 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>
         <div data-i18n="modal.add_profile.forced_subagents_warning">Heads up: every subagent in every Claude Code session will be routed to this profile, ignoring priority and rotation. Your main agent keeps rotating normally — that's the point (a Claude orchestrator with GPT subagents, for example). If this profile runs out or becomes unavailable, subagents fall back to alternating across your other accounts. Only one profile can hold this, and you can turn it off any time.</div>
       </div>
+      <div class="field-row" id="pd_leave_fable_row">
+        <div class="field-text">
+          <div class="field-title" data-i18n="modal.add_profile.leave_fable_label">Leave this profile when its Fable limit is spent</div>
+          <div class="field-sub" data-i18n="modal.add_profile.leave_fable_sub">Some plans put Fable on its own weekly clock. When it runs out here, the whole session — every model — moves to another account, and this one is skipped until the limit resets. Off = stay put; only Fable requests get the provider's limit error.</div>
+        </div>
+        <div class="toggle off" id="pd_leave_fable_toggle"><div class="toggle-knob"></div></div>
+      </div>
       <div class="field-group">
         <div class="field-label" data-i18n="modal.add_profile.tag_color_label">Tag color</div>
         <div class="tag-row" id="pd_tag_row"></div>
@@ -2320,7 +2848,7 @@
     </div>
     <div class="modal-title" id="confirm_title">—</div>
     <div class="modal-body-text" id="confirm_body"></div>
-    <input class="confirm-input" id="confirm_input" autocomplete="off" spellcheck="false">
+    <input class="confirm-input" id="confirm_input" autocomplete="off" spellcheck="false" data-i18n-aria-label="modal.confirm.input_label">
     <div class="confirm-hint" data-i18n="modal.confirm.hint">Type the profile name to confirm</div>
     <div class="modal-actions">
       <div class="btn" id="confirmCancelBtn" data-i18n="modal.cancel">Cancel</div>
@@ -2330,6 +2858,8 @@
 </div>
 
 </div>
+<link rel="stylesheet" href="/vendor/charts.css">
+<script src="/vendor/charts.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

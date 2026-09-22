@@ -225,6 +225,34 @@ def test_add_profile_accepts_the_dashboard_form_payload(running_server):
     assert [p["live_agents"] for p in body["profiles"]] == [0, 0]
 
 
+def test_leave_on_fable_limit_is_on_the_wire_for_every_kind_and_settable(running_server):
+    """The Add Profile form and the detail panel both send it; /api/profiles
+    reports it for oauth, codex and api alike (the UI hides it for api)."""
+    base, token = running_server
+    headers = {"X-CSRF-Token": token, "Content-Type": "application/json"}
+    status, body = _request(f"{base}/api/profiles", "POST",
+                            {"kind": "api", "credential": "sk-ant-api-12345678", "switch_threshold": 98,
+                             "automatic": True, "auth_mode": "api_key", "name": "Key", "priority": 1,
+                             "forced_for_subagents": False, "leave_on_fable_limit": False}, headers=headers)
+    assert status == 201, body
+    assert body["profile"]["leave_on_fable_limit"] is False
+    status, body = _request(f"{base}/api/profiles", "POST",
+                            {"kind": "codex", "credential": "sk-openai-12345678", "switch_threshold": 98,
+                             "automatic": True, "auth_mode": "api_key", "name": "GPT", "priority": 2,
+                             "forced_for_subagents": False, "leave_on_fable_limit": True}, headers=headers)
+    assert status == 201, body
+    assert body["profile"]["leave_on_fable_limit"] is True
+    codex_id = body["profile"]["id"]
+
+    status, body = _request(f"{base}/api/profiles/{codex_id}", "PATCH",
+                            {"leave_on_fable_limit": False}, headers=headers)
+    assert status == 200, body
+    assert body["profile"]["leave_on_fable_limit"] is False
+
+    status, body = _request(f"{base}/api/profiles")
+    assert [(p["name"], p["leave_on_fable_limit"]) for p in body["profiles"]] == [("Key", False), ("GPT", False)]
+
+
 def test_presence_needs_csrf_and_marks_the_user_active(running_server, monkeypatch, tmp_path):
     import claude_unlimited.usage_probe as usage_probe
     scheduler = usage_probe.Scheduler(state_file=tmp_path / "ups.json")
@@ -251,3 +279,43 @@ def test_keep_usage_fresh_is_on_by_default_round_trips_and_must_be_boolean(runni
     status, _ = _request(f"{base}/api/settings", "PATCH", {"keep_usage_fresh": "no"}, headers=headers)
     assert status == 400
 
+
+
+def test_status_exposes_an_unsmoothed_idle_signal(running_server, monkeypatch):
+    """Issue #3: `in_use_now` carries a 15-minute grace so the Dashboard light
+    does not flicker, which makes it a false busy signal for scripts.
+    /api/status carries the real numbers instead."""
+    base, _ = running_server
+
+    status, body = _request(f"{base}/api/status")
+    assert status == 200
+    # Nothing served since this daemon started: idle for an unknown length of
+    # time, not "idle for 0 seconds".
+    assert body["idle_seconds"] is None
+    assert body["serving_now"] == []
+
+    gw = daemon._gateway
+    with gw._lock:
+        gw._in_flight.add("p-live")
+        gw._in_flight_since["p-live"] = __import__("time").monotonic()
+
+    status, body = _request(f"{base}/api/status")
+    assert body["serving_now"] == ["p-live"]
+    assert body["idle_seconds"] == 0.0
+
+
+def test_status_idle_signal_ignores_a_leaked_in_flight_slot(running_server):
+    """A slot older than _IN_FLIGHT_MAX_SECONDS is a hung request, not live
+    use — it must not pin the pool as busy forever."""
+    import time as _time
+
+    base, _ = running_server
+    gw = daemon._gateway
+    with gw._lock:
+        gw._in_flight.add("p-leaked")
+        gw._in_flight_since["p-leaked"] = _time.monotonic() - (gw._IN_FLIGHT_MAX_SECONDS + 1)
+        gw._last_active["p-leaked"] = _time.monotonic() - 30.0
+
+    status, body = _request(f"{base}/api/status")
+    assert body["serving_now"] == []
+    assert body["idle_seconds"] >= 29.0
