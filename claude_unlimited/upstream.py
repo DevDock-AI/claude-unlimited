@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Iterator
 from urllib.parse import urlsplit
 
+from . import net_scope
 from .proxy import UpstreamRequest
 
 
@@ -29,14 +30,20 @@ CHUNK_SIZE = 65536
 
 def send(req: UpstreamRequest, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> UpstreamResponse:
     parts = urlsplit(req.url)
-    if parts.scheme != "https":
+    plaintext = parts.scheme == "http" and net_scope.is_local_host(parts.hostname)
+    if parts.scheme != "https" and not plaintext:
         raise ValueError(
-            f"Refusing to send an upstream request over {parts.scheme!r} — only https:// "
-            "upstreams are allowed (loopback http:// is a different trust boundary, see "
-            "proxy.py's base_url validation in profiles.py)."
+            f"Refusing to send an upstream request over {parts.scheme!r} to {parts.hostname} — "
+            "a credential would cross the network in the clear. Plain http is allowed only for "
+            "a local address (see net_scope, the same rule profiles.py validates a base_url with)."
         )
 
-    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+    if plaintext:
+        # A model server on this machine or on the LAN: the request never
+        # leaves the local network, so there is nobody new to hide it from.
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    else:
+        conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
     path = parts.path or "/"
     if parts.query:
         path = f"{path}?{parts.query}"

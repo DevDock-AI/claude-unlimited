@@ -47,6 +47,12 @@ struct Profile: Decodable, Identifiable, Equatable {
     /// nil for none. The dock inks the provider mark with it, as the
     /// Dashboard does its profile icon.
     var tagColor: String? = nil
+    /// Lifetime spend and tokens at the provider's list rates, and an API
+    /// profile's optional token cap. An API key has no usage windows, so
+    /// these are what the dock shows for one instead of a percentage.
+    var costUsdTotal: Double? = nil
+    var tokensTotal: Int? = nil
+    var tokenThreshold: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, kind, enabled, state, plan
@@ -70,6 +76,9 @@ struct Profile: Decodable, Identifiable, Equatable {
         case creditsBalance = "credits_balance"
         case spendingOnCredits = "spending_on_credits"
         case tagColor = "tag_color"
+        case costUsdTotal = "cost_usd_total"
+        case tokensTotal = "tokens_total"
+        case tokenThreshold = "token_threshold"
     }
 
     /// The number the dock ring shows: the window that actually governs this
@@ -80,6 +89,13 @@ struct Profile: Decodable, Identifiable, Equatable {
     /// Its credentials were refused: nothing is served from it until the
     /// user signs in again, and the dock says so in red.
     var needsReauth: Bool { state == "auth_invalid" || statusWord == "needs re-auth" }
+    /// An API key: billed per token, no plan windows to draw.
+    var isAPIKey: Bool { kind == "api" }
+    /// Share of an API profile's token cap used, 0–100+; nil without a cap.
+    var tokenCapPercent: Double? {
+        guard let cap = tokenThreshold, cap > 0 else { return nil }
+        return Double(tokensTotal ?? 0) / Double(cap) * 100
+    }
 
     /// Shown on the detail card whenever this account's requests are being
     /// paid for per-request rather than by its plan.
@@ -455,6 +471,16 @@ enum Fmt {
     /// Cents matter here — a dock that rounds $0.04 to $0 looks broken.
     static func money(_ value: Double) -> String {
         String(format: "$%.2f", value)
+    }
+
+    /// A cost that has to fit under a tile: cents while it is small, whole
+    /// dollars once it is not, thousands abbreviated.
+    static func shortMoney(_ value: Double) -> String {
+        switch value {
+        case ..<10:     return String(format: "$%.2f", value)
+        case ..<1000:   return String(format: "$%.0f", value)
+        default:        return String(format: "$%.1fk", value / 1000)
+        }
     }
 
     static func compact(_ value: Int) -> String {

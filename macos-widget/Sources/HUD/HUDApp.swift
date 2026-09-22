@@ -84,7 +84,9 @@ struct ProfileTile: View {
     /// one window there is gets the single outer ring.
     private var dual: Bool { profile.usage5hPercent != nil && profile.usage7dPercent != nil }
     private var outerWindow: RingWindow { dual ? .fiveHour : profile.headlineWindow }
-    private var outerPercent: Double { profile.percent(for: outerWindow) ?? 0 }
+    private var outerPercent: Double {
+        profile.isAPIKey ? (profile.tokenCapPercent ?? 0) : (profile.percent(for: outerWindow) ?? 0)
+    }
     private var innerPercent: Double { profile.usage7dPercent ?? 0 }
     private func tint(_ c: Color) -> Color { profile.enabled ? c : palette.textFaint }
     /// The colour of the window the label shows — the serving orbs use it too.
@@ -106,7 +108,7 @@ struct ProfileTile: View {
                             lineWidth: ringWidth)
                 .padding(ringWidth / 2)
             Circle().trim(from: 0, to: min(outerPercent / 100, 1))
-                .stroke(tint(palette.ring(profile, window: outerWindow)),
+                .stroke(tint(profile.isAPIKey ? palette.apiRing(profile) : palette.ring(profile, window: outerWindow)),
                         style: StrokeStyle(lineWidth: ringWidth, lineCap: .round))
                 .padding(ringWidth / 2)
                 .rotationEffect(.degrees(-90))
@@ -362,6 +364,11 @@ struct DockColumn: View {
                         Text("Reauth").foregroundStyle(palette.bad)
                     } else if !profile.enabled {
                         Text("off").foregroundStyle(palette.textFaint)
+                    } else if profile.isAPIKey {
+                        // No plan windows: what it has cost so far, at list
+                        // rates. The ring, when there is one, is the token cap.
+                        Text(Fmt.shortMoney(profile.costUsdTotal ?? 0))
+                            .foregroundStyle(palette.apiRing(profile))
                     } else {
                         // Subscript names the window the number is: the rings
                         // show both, the number only one (right-click picks).
@@ -624,7 +631,36 @@ struct DetailCard: View {
         .padding(.top, 13)
     }
 
+    @ViewBuilder
     private var meters: some View {
+        if profile.isAPIKey { apiMeters } else { windowMeters }
+    }
+
+    /// An API key has no plan windows: its lifetime cost and tokens, and its
+    /// token cap when one is set — the same figures the Profiles page shows.
+    private var apiMeters: some View {
+        HStack(alignment: .top, spacing: 12) {
+            stat(Fmt.money(profile.costUsdTotal ?? 0), "Total cost", "est., list rates")
+            stat(Fmt.compact(profile.tokensTotal ?? 0), "Tokens", "all time")
+            if let cap = profile.tokenThreshold, cap > 0 {
+                meterView(title: "Token cap \(Fmt.compact(cap))", percent: profile.tokenCapPercent,
+                          resets: nil, isRing: true, color: palette.apiRing(profile))
+            }
+        }
+        .padding(.top, 13)
+    }
+
+    private func stat(_ value: String, _ title: String, _ note: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(value).font(.system(size: 21, weight: .bold)).monospacedDigit()
+                .foregroundStyle(palette.text).lineLimit(1).minimumScaleFactor(0.7)
+            Text(title).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(palette.textDim)
+            Text(note).font(.system(size: 10.5)).foregroundStyle(palette.textFaint)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var windowMeters: some View {
         HStack(alignment: .top, spacing: 12) {
             meter(.fiveHour, profile.usage5hPercent, profile.usage5hResetsAt)
             meter(.weekly, profile.usage7dPercent, profile.usage7dResetsAt)

@@ -288,6 +288,13 @@ extension DockPalette {
         window == .weekly ? weeklyRing(profile) : usage(profile, window: .fiveHour)
     }
 
+    /// An API key's ring and figure: by its token cap when it has one (red
+    /// from 95% — past the cap it is out of rotation), neutral text otherwise.
+    func apiRing(_ profile: Profile) -> Color {
+        guard let percent = profile.tokenCapPercent else { return text }
+        return color(UsageBand.of(percent, threshold: 100))
+    }
+
     func color(_ band: UsageBand) -> Color {
         switch band {
         case .unknown: return textFaint
@@ -377,6 +384,30 @@ enum DockTransparency: Double, CaseIterable {
     }
 }
 
+/// First-launch defaults for the dock's settings, as pure reads of a
+/// defaults store so they can be tested against a throwaway suite.
+/// `bool`/`double(forKey:)` return false/0 for a key never written, which
+/// silently meant off / Dark / Medium — each rule checks for absence instead.
+/// A saved choice always wins.
+enum DockDefaults {
+    nonisolated static func pinned(_ d: UserDefaults) -> Bool {
+        d.object(forKey: "alwaysOnTop") == nil ? true : d.bool(forKey: "alwaysOnTop")
+    }
+
+    nonisolated static func theme(_ d: UserDefaults, glassAvailable: Bool) -> DockTheme {
+        guard d.object(forKey: "theme") != nil else { return glassAvailable ? .glass : .dark }
+        let theme = DockTheme(rawValue: d.double(forKey: "theme")) ?? .dark
+        // A saved Glass on a system without it (a downgrade) would draw the
+        // blur fallback labelled as glass; Dark says what it is.
+        return theme == .glass && !glassAvailable ? .dark : theme
+    }
+
+    /// The saved size, or nil on a first launch (the caller then uses Large).
+    nonisolated static func savedTileSize(_ d: UserDefaults) -> Double? {
+        d.object(forKey: "tileSize") == nil ? nil : d.double(forKey: "tileSize")
+    }
+}
+
 /// Owns the dock window, the hover card beside it, and the pinned state.
 @MainActor
 final class DockController: NSObject, ObservableObject {
@@ -399,7 +430,11 @@ final class DockController: NSObject, ObservableObject {
         }
     }
 
-    @Published var pinned: Bool = UserDefaults.standard.bool(forKey: "alwaysOnTop") {
+    // Defaults for a first launch: on top, Liquid Glass where the system has
+    // it, Large. `bool`/`double(forKey:)` return false/0 for a key that was
+    // never written, which silently meant off / Dark / Medium — so each of
+    // these checks for the key's absence instead. A saved choice always wins.
+    @Published var pinned: Bool = DockDefaults.pinned(.standard) {
         didSet {
             UserDefaults.standard.set(pinned, forKey: "alwaysOnTop")
             applyLevel()
@@ -422,8 +457,7 @@ final class DockController: NSObject, ObservableObject {
     }
 
     @Published var theme: DockTheme = {
-        let saved = UserDefaults.standard.double(forKey: "theme")
-        return DockTheme(rawValue: saved) ?? .dark
+        DockDefaults.theme(.standard, glassAvailable: GlassBackground.isAvailable)
     }() {
         didSet { UserDefaults.standard.set(theme.rawValue, forKey: "theme") }
     }
@@ -447,7 +481,7 @@ final class DockController: NSObject, ObservableObject {
     /// the window kept its old frame — which is how profiles ended up spilling
     /// outside their container.
     @Published var tileSize: Double = {
-        let saved = UserDefaults.standard.double(forKey: "tileSize")
+        guard let saved = DockDefaults.savedTileSize(.standard) else { return DockSize.large.rawValue }
         let sizes = DockSize.allCases.map(\.rawValue)
         if sizes.contains(saved) { return saved }
         // A value from an earlier scale: keep the user's relative choice by
@@ -907,6 +941,9 @@ final class DockController: NSObject, ObservableObject {
         toggle.representedObject = [profile.id, !profile.enabled] as [Any]
         menu.addItem(toggle)
 
+        // An API key has no windows to choose between — no section at all
+        // rather than two greyed-out rows.
+        if profile.isAPIKey { return menu }
         menu.addItem(.separator())
         let header = NSMenuItem(title: "Percentage shows", action: nil, keyEquivalent: "")
         header.isEnabled = false

@@ -261,3 +261,68 @@ def test_claude_effort_passthrough_on_a_non_json_body():
     req = build_upstream_request(oauth_profile(), "tok", "POST", "/v1/messages", {},
                                  b"not json", claude_effort="high")
     assert req.body == b"not json"
+
+
+# ---- which upstreams may be plain http -------------------------------------
+# One rule, two enforcers: profiles.py refuses to SAVE a bad base_url and
+# upstream.py refuses to SEND to one. They read the same module so a Profile
+# can never be accepted and then rejected at request time.
+
+import pytest
+
+from claude_unlimited import net_scope, upstream
+from claude_unlimited.proxy import UpstreamRequest
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost:11434/v1/messages",
+    "http://127.0.0.1:5566/v1/messages",
+    "http://[::1]:8080/v1/messages",
+    "http://192.168.1.50:5566/v1/messages",
+    "http://10.1.2.3:8000/v1/messages",
+    "https://api.anthropic.com/v1/messages",
+])
+def test_local_and_https_upstreams_are_allowed(url, monkeypatch):
+    opened = {}
+
+    class _Conn:
+        def __init__(self, host, port, timeout=None):
+            opened.update(host=host, port=port)
+
+        def request(self, *a, **k):
+            pass
+
+        def getresponse(self):
+            class _R:
+                status = 200
+
+                def getheaders(self):
+                    return []
+
+                def read(self, _n):
+                    return b""
+            return _R()
+
+    monkeypatch.setattr(upstream.http.client, "HTTPConnection", _Conn)
+    monkeypatch.setattr(upstream.http.client, "HTTPSConnection", _Conn)
+    upstream.send(UpstreamRequest(method="POST", url=url, headers={}, body=b"{}"))
+    assert opened  # it got as far as opening a connection
+
+
+@pytest.mark.parametrize("url", [
+    "http://api.example.com/v1/messages",   # a name is never local
+    "http://8.8.8.8/v1/messages",           # public address
+])
+def test_plain_http_to_a_remote_upstream_is_refused(url):
+    with pytest.raises(ValueError):
+        upstream.send(UpstreamRequest(method="POST", url=url, headers={}, body=b"{}"))
+
+
+def test_the_send_path_and_the_save_path_agree():
+    for url in ("http://127.0.0.1:1234", "http://192.168.1.9:8000", "https://api.anthropic.com"):
+        net_scope.validate(url)                      # saving it is fine
+        assert net_scope.is_plaintext_allowed(url) or url.startswith("https")
+    for url in ("http://api.example.com", "http://1.1.1.1"):
+        with pytest.raises(net_scope.InvalidUpstreamURL):
+            net_scope.validate(url)
+        assert not net_scope.is_plaintext_allowed(url)

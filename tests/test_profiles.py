@@ -69,12 +69,50 @@ def test_create_oauth_profile_without_account_uuid_is_rejected(fake_store):
         profiles.create_profile(name="X", kind="oauth", credential="sk-ant-12345678")
 
 
-def test_create_api_profile_requires_https_base_url(fake_store):
+def test_create_api_profile_requires_https_for_a_remote_base_url(fake_store):
+    # base_url is the UPSTREAM the key is sent to: plain http off this machine
+    # puts it on the wire in the clear.
     with pytest.raises(profiles.ValidationError):
         profiles.create_profile(
             name="Bad Gateway", kind="api", credential="sk-ant-12345678",
             base_url="http://insecure.example",
         )
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost:11434",
+    "http://127.0.0.1:1234/v1",
+    "http://[::1]:8080",
+    "http://192.168.1.50:5566",
+    "http://10.1.2.3:8000",
+])
+def test_http_is_accepted_for_a_local_model_server(fake_store, url):
+    # LM Studio, Ollama, llama.cpp and friends serve plain http on the machine
+    # or the LAN; requiring TLS there would mean a self-signed certificate for
+    # no gain in who can read the traffic.
+    p = profiles.create_profile(name=f"Local {url}", kind="api",
+                                credential="sk-ant-12345678", base_url=url)
+    assert p.base_url == url
+
+
+@pytest.mark.parametrize("url", [
+    "http://api.example.com",          # a name, not a local address
+    "http://8.8.8.8:1234",             # public IP
+    "ftp://192.168.1.5",               # not http at all
+    "http://",                         # no host
+])
+def test_a_non_local_or_malformed_base_url_is_still_refused(fake_store, url):
+    with pytest.raises(profiles.ValidationError):
+        profiles.create_profile(name="Nope", kind="api",
+                                credential="sk-ant-12345678", base_url=url)
+
+
+def test_a_hostname_is_never_treated_as_local(fake_store):
+    # Resolved at config-write time a name could point anywhere later, so only
+    # literal addresses and localhost count as local.
+    with pytest.raises(profiles.ValidationError):
+        profiles.create_profile(name="Name", kind="api", credential="sk-ant-12345678",
+                                base_url="http://my-nas.lan:8080")
 
 
 def test_create_api_profile_accepts_https_base_url(fake_store):

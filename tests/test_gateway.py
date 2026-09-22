@@ -1856,3 +1856,52 @@ def test_draining_is_one_shot(pool_env):
     gw._request_usage_recheck("a")
     assert gw.take_usage_recheck_requests() == {"a"}
     assert gw.take_usage_recheck_requests() == set()
+
+
+def test_a_rejected_model_is_only_looked_up_once(pool_env):
+    """A single-model endpoint (a local model server, a one-deployment
+    gateway) answers 404 for a Claude model name. The first request learns it
+    and retries; every later one sends the default model straight away instead
+    of paying the same 404 + retry forever."""
+    save_pool(Pool(profiles=[Profile(id="a", name="Local", kind="api", priority=1, automatic=True,
+                                     enabled=True, base_url="http://127.0.0.1:5566",
+                                     default_model="local-model-1")]))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        if sent[-1] != "local-model-1":
+            return fake_response(404, body=b'{"error":{"message":"Model not found"}}')
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    body = json.dumps({"model": "claude-haiku-4-5", "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    first = gw.handle("POST", "/v1/messages", {}, body)
+    assert first.status == 200
+    assert sent == ["claude-haiku-4-5", "local-model-1"]   # asked, refused, retried
+
+    second = gw.handle("POST", "/v1/messages", {}, body)
+    assert second.status == 200
+    assert sent[2:] == ["local-model-1"]                    # no wasted round trip
+
+
+def test_a_multi_model_endpoint_is_not_second_guessed(pool_env):
+    """Only a model this endpoint actually refused is rewritten. A gateway
+    that serves several models keeps getting exactly what was asked for."""
+    save_pool(Pool(profiles=[Profile(id="a", name="Gateway", kind="api", priority=1, automatic=True,
+                                     enabled=True, base_url="https://gw.example",
+                                     default_model="fallback-model")]))
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    for model in ("claude-opus-5", "claude-sonnet-5"):
+        body = json.dumps({"model": model, "max_tokens": 1,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        assert gw.handle("POST", "/v1/messages", {}, body).status == 200
+    assert sent == ["claude-opus-5", "claude-sonnet-5"]

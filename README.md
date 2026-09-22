@@ -853,6 +853,10 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
 - The number under each account names its window with a small subscript (`5h` or `w`). An
   account that needs re-authentication shows **Reauth** in red instead.
 - The logo in the middle takes the colour you gave the account on the Profiles page.
+- An **API-key** account has no plan windows, so its tile shows the **estimated total cost** so
+  far instead (at list rates). If you set a token cap, the ring shows how much of it is used.
+- A first launch starts it **always on top**, **Large**, with **Liquid Glass** where macOS has it
+  (Dark otherwise). Anything you change in the cog menu is kept.
 - It refreshes every 5 seconds (every 2 while the pointer is over it).
 - Hover a profile for its detail card: plan, usage windows, reset times, today's spend, and a
   session line — while it is serving, how many agents are on it and for how long; otherwise when

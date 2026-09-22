@@ -2259,7 +2259,7 @@
         <div class="section-sub" data-i18n="help.widget.sub">macOS only, English only</div>
       </div>
       <div class="section-body">
-        <div class="field-sub" data-i18n="help.widget.body">A floating dock showing every account as a circle with two usage rings: the 5-hour window outside, the weekly one inside (blue, red from 90%). The number under it names its window (5h or w); an account that needs re-auth says Reauth in red. The logo takes the account's colour from the Profiles page. On macOS it installs with Claude Unlimited and starts with you — there is nothing to build. It also adds a menu bar item showing the account currently serving. Drag it anywhere — near a screen edge it pulls onto the edge and docks there when you let go, turning to run along it — and hover a profile for its details. Right-click (or Control-click) a profile to take it over, to enable or disable it, or to choose whether its percentage shows the 5-hour or the weekly window — remembered per profile. The cog sets size, orientation, background and transparency. If you close it, reopen it with the button directly above the language selector, or with `cu hud install`; `cu hud remove` takes it away for good. It only ever talks to 127.0.0.1, and the only two things it changes are Take over and enabling or disabling a profile: the same actions as the Dashboard's, sent with the daemon's per-run security token.</div>
+        <div class="field-sub" data-i18n="help.widget.body">A floating dock showing every account as a circle with two usage rings: the 5-hour window outside, the weekly one inside (blue, red from 90%). The number under it names its window (5h or w); an account that needs re-auth says Reauth in red. The logo takes the account's colour from the Profiles page. An API-key account shows its estimated total cost instead, with its token cap as the ring when it has one. On macOS it installs with Claude Unlimited and starts with you — there is nothing to build. It also adds a menu bar item showing the account currently serving. Drag it anywhere — near a screen edge it pulls onto the edge and docks there when you let go, turning to run along it — and hover a profile for its details. Right-click (or Control-click) a profile to take it over, to enable or disable it, or to choose whether its percentage shows the 5-hour or the weekly window — remembered per profile. The cog sets size, orientation, background and transparency. If you close it, reopen it with the button directly above the language selector, or with `cu hud install`; `cu hud remove` takes it away for good. It only ever talks to 127.0.0.1, and the only two things it changes are Take over and enabling or disabling a profile: the same actions as the Dashboard's, sent with the daemon's per-run security token.</div>
       </div>
     </div>
 </div>
@@ -2375,12 +2375,12 @@
         </div>
 
         <div class="field-group" id="f_base_url_wrap" style="display:none;">
-          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com)</div>
+          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com; http:// only for localhost or a LAN address)</div>
           <input class="text-input mono" id="f_base_url" data-i18n-placeholder="modal.add_profile.base_url_placeholder" placeholder="https://api.anthropic.com">
         </div>
 
         <div class="field-group" id="f_codex_base_url_wrap" style="display:none;">
-          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com)</div>
+          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com; http:// only for localhost or a LAN address)</div>
           <input class="text-input mono" id="f_codex_base_url" data-i18n-placeholder="modal.add_profile.codex_base_url_placeholder" placeholder="https://api.openai.com/v1">
         </div>
 
@@ -2701,7 +2701,7 @@
       </div>
       <div id="pd_api_fields" style="display:none">
         <div class="field-group">
-          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com)</div>
+          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com; http:// only for localhost or a LAN address)</div>
           <input class="text-input" id="pd_base_url_input" type="text" data-i18n-placeholder="modal.add_profile.base_url_placeholder" placeholder="https://api.anthropic.com">
         </div>
         <div class="field-group">
@@ -2715,7 +2715,7 @@
       </div>
       <div id="pd_codex_fields" style="display:none">
         <div class="field-group" id="pd_codex_base_url_wrap">
-          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com)</div>
+          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com; http:// only for localhost or a LAN address)</div>
           <input class="text-input" id="pd_codex_base_url_input" type="text" data-i18n-placeholder="modal.add_profile.codex_base_url_placeholder" placeholder="https://api.openai.com/v1">
         </div>
         <div class="field-group" id="pd_codex_credential_wrap">

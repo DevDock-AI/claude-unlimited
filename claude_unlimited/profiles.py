@@ -8,13 +8,12 @@ pure local state management and runs without the proxy.
 
 from __future__ import annotations
 
-import re
 import secrets
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import activity, connectors, oauth_credential, secret_store
+from . import activity, connectors, net_scope, oauth_credential, secret_store
 from . import config as config_module
 from .config import CONFIG_LOCK, Profile, load_pool, save_pool
 
@@ -51,14 +50,19 @@ def _validate(name: str, kind: str, base_url: Optional[str], auth_mode: str, tag
     if kind in ("api", "codex") and auth_mode not in _VALID_AUTH_MODES:
         raise ValidationError(f"Unknown auth_mode {auth_mode!r}; must be one of {_VALID_AUTH_MODES}.")
     if base_url:
-        if not re.match(r"^https://[^\s]+$", base_url):
-            raise ValidationError(
-                "base_url must start with https:// (loopback http:// is not accepted here; "
-                "this validates the UPSTREAM target, a different trust boundary than the "
-                "daemon's own local listener)."
-            )
+        _validate_base_url(base_url)
     if tag_color is not None and tag_color not in _TAG_COLORS:
         raise ValidationError(f"Unknown tag_color; must be one of {_TAG_COLORS}.")
+
+
+def _validate_base_url(base_url: str) -> None:
+    """Delegates to net_scope, which upstream.py reads too — the rule that
+    decides what is saved and the rule that decides what is sent must be the
+    same one, or a Profile is accepted and then refused at send time."""
+    try:
+        net_scope.validate(base_url)
+    except net_scope.InvalidUpstreamURL as exc:
+        raise ValidationError(str(exc)) from exc
 
 
 # Directories a Profile is allowed to name. Both are created by cli.py under

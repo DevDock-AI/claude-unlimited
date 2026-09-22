@@ -753,6 +753,12 @@ class Gateway:
         # worth re-reading now instead of at the next 5-10 minute tick.
         # profile_id -> monotonic time the re-read was asked for; the entry
         # stays after draining so the cap below can see it.
+        # Models an api Profile's endpoint answered "not found" for, and the
+        # default_model that worked instead. Without this every request to a
+        # single-model endpoint (a local model server, a one-deployment
+        # gateway) pays the same 404 and retry again — the answer is already
+        # known after the first one. profile_id -> set of rejected model names.
+        self._models_rejected_by: dict[str, set] = {}
         self._usage_recheck_requested: dict[str, float] = {}
         self._usage_recheck_pending: set = set()
         # Set when a re-read should not wait for the next probe tick; the
@@ -1213,7 +1219,13 @@ class Gateway:
             # the requested model actually accepts (None otherwise), so a bad
             # row can never 400 a real request. Only oauth/api /v1/messages
             # bodies are touched, inside build_upstream_request.
-            claude_effort = openai_models.claude_effort_for(request_model(body), pool.settings.model_parity)
+            # This endpoint already refused the requested model once: send the
+            # Profile's default straight away rather than paying the same 404
+            # and retry on every request.
+            known_bad = self._default_model_body(profile, eco_body)
+            if known_bad is not None:
+                eco_body = known_bad
+            claude_effort = openai_models.claude_effort_for(request_model(eco_body), pool.settings.model_parity)
             try:
                 upstream_req = build_upstream_request(profile, credential, method, path, headers, eco_body,
                                                       claude_effort=claude_effort)
@@ -1288,6 +1300,7 @@ class Gateway:
 
             if (profile.kind == "api" and profile.default_model
                     and isinstance(observation, Unknown) and observation.status_code in _MODEL_FALLBACK_STATUS_CODES):
+                self._remember_rejected_model(profile.id, request_model(body))
                 retried = self._maybe_retry_with_default_model(
                     profile, credential, method, path, headers, body, now,
                     parity=pool.settings.model_parity)
@@ -1962,6 +1975,35 @@ class Gateway:
         activity.record("rotation", f"{profile.name} manually taken over",
                          meta="overrides rotation/threshold")
         return True
+
+    _MAX_REJECTED_MODELS = 64
+
+    def _remember_rejected_model(self, profile_id: str, model: Optional[str]) -> None:
+        """This endpoint does not serve `model`. Bounded, and in memory only:
+        a restart re-learns it with one 404, and an endpoint that gains the
+        model back is not held to an answer it gave last week."""
+        if not model:
+            return
+        with self._lock:
+            known = self._models_rejected_by.setdefault(profile_id, set())
+            if len(known) < self._MAX_REJECTED_MODELS:
+                known.add(model)
+
+    def _default_model_body(self, profile: Profile, body: bytes) -> Optional[bytes]:
+        """The body rewritten to the Profile's default_model, when this
+        endpoint has already refused the model the client asked for. None
+        when there is nothing known to act on — a multi-model gateway keeps
+        serving whatever it is asked for."""
+        if profile.kind != "api" or not profile.default_model:
+            return None
+        requested = request_model(body)
+        if requested is None or requested == profile.default_model:
+            return None
+        with self._lock:
+            known = self._models_rejected_by.get(profile.id)
+        if not known or requested not in known:
+            return None
+        return rewrite_model(body, profile.default_model)
 
     def _maybe_retry_with_default_model(self, profile: Profile, credential: str, method: str, path: str,
                                           headers: dict, body: bytes, now: datetime, *, parity=None):

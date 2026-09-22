@@ -168,3 +168,54 @@ private extension Profile {
                   spendingOnCredits: spendingOnCredits ?? other.spendingOnCredits)
     }
 }
+
+final class DockDefaultsTests: XCTestCase {
+    private func store() -> UserDefaults {
+        let name = "hud.tests.\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: name)!
+        addTeardownBlock { d.removePersistentDomain(forName: name) }
+        return d
+    }
+
+    func testAFirstLaunchIsOnTopGlassAndLarge() {
+        let d = store()
+        XCTAssertTrue(DockDefaults.pinned(d))
+        XCTAssertEqual(DockDefaults.theme(d, glassAvailable: true), .glass)
+        XCTAssertEqual(DockDefaults.theme(d, glassAvailable: false), .dark)
+        XCTAssertNil(DockDefaults.savedTileSize(d))
+    }
+
+    func testASavedChoiceAlwaysWins() {
+        let d = store()
+        d.set(false, forKey: "alwaysOnTop"); d.set(1.0, forKey: "theme"); d.set(28.0, forKey: "tileSize")
+        XCTAssertFalse(DockDefaults.pinned(d))
+        XCTAssertEqual(DockDefaults.theme(d, glassAvailable: true), .light)
+        XCTAssertEqual(DockDefaults.savedTileSize(d), 28)
+    }
+
+    func testSavedGlassWithoutGlassFallsBackToDark() {
+        let d = store(); d.set(2.0, forKey: "theme")
+        XCTAssertEqual(DockDefaults.theme(d, glassAvailable: false), .dark)
+    }
+}
+
+final class APIProfileTests: XCTestCase {
+    private func api(_ json: String) -> Profile {
+        let base = #"{"id":"k","name":"k","kind":"api","enabled":true,"state":"eligible","#
+        return try! JSONDecoder().decode(Profile.self, from: Data((base + json + "}").utf8))
+    }
+
+    func testCostFitsUnderATile() {
+        XCTAssertEqual(Fmt.shortMoney(0.4095), "$0.41")
+        XCTAssertEqual(Fmt.shortMoney(96.49), "$96")
+        XCTAssertEqual(Fmt.shortMoney(1234), "$1.2k")
+    }
+
+    func testTheTokenCapDrivesTheRingOnlyWhenSet() {
+        let capped = api(#""cost_usd_total":0.41,"tokens_total":450,"token_threshold":500"#)
+        XCTAssertTrue(capped.isAPIKey)
+        XCTAssertEqual(capped.tokenCapPercent!, 90, accuracy: 1e-9)
+        XCTAssertNil(api(#""cost_usd_total":3.2,"tokens_total":900"#).tokenCapPercent)
+        XCTAssertNil(api(#""token_threshold":0"#).tokenCapPercent)
+    }
+}

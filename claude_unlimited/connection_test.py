@@ -85,8 +85,14 @@ def test_connection(profile_id: str, credential: Optional[str] = None) -> dict:
         # dead account, and enough to condemn a perfectly healthy Profile.
         credential = oauth_credential.decode(stored).access_token if profile.kind == "oauth" else stored
 
+    # An api Profile that pins a default_model is usually an endpoint that
+    # serves that model and nothing else — a local model server, or a gateway
+    # with one deployment. Probing it with a Claude model name answers "model
+    # not found" and reports a healthy endpoint as broken, which is what a
+    # local MLX server did: reachable, authenticated, and marked failing.
+    test_model = profile.default_model if (profile.kind == "api" and profile.default_model) else TEST_MODEL
     body: dict = {
-        "model": TEST_MODEL,
+        "model": test_model,
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "ping"}],
     }
