@@ -107,6 +107,9 @@ class OpenAIModelTarget:
 # Ordered most-capable-first — used only for the substring-match fallback below.
 _MODEL_MAP: dict[str, OpenAIModelTarget] = {
     "claude-fable-5": OpenAIModelTarget("gpt-5.6-sol", "medium"),
+    "claude-opus-5-5": OpenAIModelTarget("gpt-5.6-terra", "high"),
+    # Kept beside 5.5, not replaced by it: a saved parity row naming Opus 5
+    # with no effort of its own takes its effort from here.
     "claude-opus-5": OpenAIModelTarget("gpt-5.6-terra", "high"),
     "claude-sonnet-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
     "claude-haiku-4-5-20251001": OpenAIModelTarget("gpt-5.6-luna", "low"),
@@ -234,10 +237,10 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
     """The parity list a fresh install (or a Reset) starts from: one row per
     family in _DEFAULT_FAMILIES, each the highest-ranked model of that family
     with its curated Codex target. With the vendored catalogue this is exactly
-    claude-fable-5-1 / claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5 —
+    claude-fable-5-1 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5 —
     the same ids cli.py's _MODEL_TIER_IDS use, so the /model picker relabels
-    the native tiers instead of duplicating them. No catalogue -> the 4
-    _MODEL_MAP literals."""
+    the native tiers instead of duplicating them. No catalogue -> one
+    _MODEL_MAP literal per family (the newest listed)."""
     cat = _catalogue_or_current(catalogue)
     rows: list[dict] = []
     if cat is not None and cat.anthropic:
@@ -255,7 +258,15 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
             rows.append({"claude_model": head, "model": target.model,
                          "effort": target.reasoning_effort, "claude_effort": None})
     if not rows:
+        # One row per family here too: _MODEL_MAP can hold several ids of one
+        # family (Opus 5.5 beside Opus 5), newest first, and a fresh install
+        # must not start with two Opus rows.
+        seen: set[str] = set()
         for claude_id, target in _MODEL_MAP.items():
+            family = next((f for f in _DEFAULT_FAMILIES if claude_id.startswith(f)), claude_id)
+            if family in seen:
+                continue
+            seen.add(family)
             rows.append({"claude_model": claude_id, "model": target.model,
                          "effort": target.reasoning_effort, "claude_effort": None})
     return rows
@@ -421,6 +432,7 @@ def fallback_models(model: str, catalogue: Optional[Catalogue] = None) -> list[s
 
 _CLAUDE_DISPLAY_NAMES: dict[str, str] = {
     "claude-fable-5": "Claude Fable 5",
+    "claude-opus-5-5": "Claude Opus 5.5",
     "claude-opus-5": "Claude Opus 5",
     "claude-sonnet-5": "Claude Sonnet 5",
     "claude-haiku-4-5-20251001": "Claude Haiku 4.5",

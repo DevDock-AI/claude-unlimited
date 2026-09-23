@@ -9,10 +9,12 @@ elapsed time and the real response.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import uuid
 from typing import Optional
+from urllib.parse import urlsplit
 
 from . import oauth_credential, proxy, secret_store, upstream
 from .config import load_pool
@@ -90,7 +92,11 @@ def test_connection(profile_id: str, credential: Optional[str] = None) -> dict:
     # with one deployment. Probing it with a Claude model name answers "model
     # not found" and reports a healthy endpoint as broken, which is what a
     # local MLX server did: reachable, authenticated, and marked failing.
-    test_model = profile.default_model if (profile.kind == "api" and profile.default_model) else TEST_MODEL
+    test_model = TEST_MODEL
+    if profile.kind == "api":
+        # What real traffic sends: the forced model if there is one, else the
+        # fallback the Profile pins.
+        test_model = profile.force_model or profile.default_model or TEST_MODEL
     body: dict = {
         "model": test_model,
         "max_tokens": 1,
@@ -114,8 +120,9 @@ def test_connection(profile_id: str, credential: Optional[str] = None) -> dict:
         resp = upstream.send(req, timeout=TEST_TIMEOUT_SECONDS)
         raw = b"".join(resp.body_chunks)
         resp.connection.close()
-    except OSError as exc:
-        raise ConnectionTestError("Could not reach Anthropic — network error.", str(exc)) from exc
+    except (OSError, http.client.HTTPException) as exc:
+        where = urlsplit(profile.base_url).hostname if profile.base_url else "Anthropic"
+        raise ConnectionTestError(f"Could not reach {where} — network error.", str(exc)) from exc
     elapsed_ms = round((time.monotonic() - started) * 1000)
 
     if resp.status == 200:
@@ -126,7 +133,7 @@ def test_connection(profile_id: str, credential: Optional[str] = None) -> dict:
             pass
         return {
             "ok": True, "status": resp.status, "elapsed_ms": elapsed_ms,
-            "model": parsed_ok.get("model", TEST_MODEL),
+            "model": parsed_ok.get("model", test_model),
             "headers": dict(resp.headers),
         }
 

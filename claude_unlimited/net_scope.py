@@ -46,14 +46,22 @@ class InvalidUpstreamURL(ValueError):
     """The URL is malformed, or plain http to somewhere off this network."""
 
 
-def validate(url: str) -> None:
-    """Raises InvalidUpstreamURL unless `url` is a usable upstream."""
+def validate(url: str, *, allow_local_http: bool = True) -> None:
+    """Raises InvalidUpstreamURL unless `url` is a usable upstream.
+
+    `allow_local_http` is False for a codex-kind Profile: the Codex bridge
+    only speaks HTTPS, so a plain-http Base URL there is refused when saved
+    rather than failing on the first request."""
     parsed = urlsplit(url)
     if parsed.scheme not in ("https", "http") or not parsed.hostname or " " in url:
         raise InvalidUpstreamURL(
             "base_url must be an http:// or https:// URL, e.g. https://api.anthropic.com.")
     if parsed.scheme == "https":
         return
+    if not allow_local_http:
+        raise InvalidUpstreamURL(
+            "base_url must start with https:// for a Codex profile. Plain http:// is accepted "
+            "only for an API profile pointing at a local model server.")
     if not is_local_host(parsed.hostname):
         raise InvalidUpstreamURL(
             f"base_url must start with https:// for {parsed.hostname} — plain http would send "

@@ -185,6 +185,23 @@ def test_export_then_apply_import_roundtrips_token_threshold(env):
     assert imported.token_threshold == 250000
 
 
+def test_export_then_apply_import_roundtrips_both_model_fields(env):
+    # force_model and default_model together, through export, import's ADD
+    # path, and its "use imported" UPDATE path.
+    profile_repo.create_profile(name="Local", kind="api", credential="tok-long-enough-key",
+                                base_url="http://127.0.0.1:5566",
+                                force_model="local-coder-model", default_model="local-fallback-model")
+    bundle = ei.build_export_bundle(include_profiles=True, include_settings=False, include_activity=False,
+                                     passphrase="correct horse battery staple")
+    parsed = ei.import_bundle(bundle, passphrase="correct horse battery staple")
+    assert parsed.profiles[0]["force_model"] == "local-coder-model"
+    assert parsed.profiles[0]["default_model"] == "local-fallback-model"
+
+    ei.apply_import(parsed, import_profiles=True, import_settings=False)
+    imported = [p for p in load_pool().profiles if p.name == "Local"][-1]
+    assert (imported.force_model, imported.default_model) == ("local-coder-model", "local-fallback-model")
+
+
 def test_apply_import_settings(env):
     parsed = ei.ParsedBundle(profiles=[], settings={"update_mode": "manual"}, activity=None)
     result = ei.apply_import(parsed, import_profiles=False, import_settings=True)

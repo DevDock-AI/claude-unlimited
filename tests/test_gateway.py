@@ -1905,3 +1905,147 @@ def test_a_multi_model_endpoint_is_not_second_guessed(pool_env):
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         assert gw.handle("POST", "/v1/messages", {}, body).status == 200
     assert sent == ["claude-opus-5", "claude-sonnet-5"]
+
+
+# ---- force_model: "always this model, exactly" ------------------------------
+
+def _api_pool(**fields):
+    save_pool(Pool(profiles=[Profile(id="a", name="Local", kind="api", priority=1, automatic=True,
+                                     enabled=True, base_url="http://127.0.0.1:5566", **fields)]))
+
+
+def _msg(model="claude-sonnet-5"):
+    return json.dumps({"model": model, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+
+def test_force_model_is_sent_whatever_the_client_asked_for(pool_env):
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+    gw = Gateway(transport=lambda req: (sent.append(json.loads(req.body)["model"]), fake_response(200))[1])
+    for asked in ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5-5"):
+        assert gw.handle("POST", "/v1/messages", {}, _msg(asked)).status == 200
+    assert sent == ["qwen3-coder"] * 3   # never the default, never the Claude name
+
+
+def test_the_default_model_is_only_the_fallback_for_a_refused_forced_model(pool_env):
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        if sent[-1] == "qwen3-coder":
+            return fake_response(404, body=b'{"error":{"message":"Model qwen3-coder not found"}}')
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 200
+    assert sent == ["qwen3-coder", "qwen-fallback"]
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 200
+    assert sent[2:] == ["qwen-fallback"]   # the refusal is remembered: no repeat 404
+
+
+def test_prompt_too_long_is_not_mistaken_for_a_refused_model(pool_env):
+    # A real failure: a 64K local model answered 400 "Prompt too long".
+    # That used to trigger the default-model retry and remember the model as
+    # refused, which with a forced model would abandon it for good.
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+    too_long = b'{"error":{"message":"Prompt too long: 100812 tokens exceeds max context window of 65536 tokens"}}'
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        return fake_response(400, body=too_long)
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, _msg())
+    assert result.status == 400
+    assert sent == ["qwen3-coder"]                           # no pointless retry
+    assert b"".join(result.body_chunks) == too_long          # the real error reaches the client intact
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 400
+    assert sent == ["qwen3-coder", "qwen3-coder"]            # still the forced model, not "learned" away
+
+
+def test_a_400_that_names_the_model_still_falls_back(pool_env):
+    _api_pool(default_model="qwen-fallback")
+    sent = []
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        if sent[-1] != "qwen-fallback":
+            return fake_response(400, body=b'{"error":{"message":"invalid model: claude-sonnet-5"}}')
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 200
+    assert sent == ["claude-sonnet-5", "qwen-fallback"]
+
+
+def test_a_400_that_only_mentions_the_word_model_is_not_a_refusal(pool_env):
+    # "max_tokens is too large for this model" is a malformed request; taking
+    # it for a refusal would move every later request off a working model.
+    _api_pool(force_model="qwen3-coder", default_model="qwen-fallback")
+    sent = []
+    bad = b'{"error":{"message":"max_tokens: 99999 > 8192, the maximum allowed for this model"}}'
+
+    def transport(req):
+        sent.append(json.loads(req.body)["model"])
+        return fake_response(400, body=bad)
+
+    gw = Gateway(transport=transport)
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 400
+    assert gw.handle("POST", "/v1/messages", {}, _msg()).status == 400
+    assert sent == ["qwen3-coder", "qwen3-coder"]
+
+
+def test_a_large_error_body_is_forwarded_whole_past_the_peek_cap():
+    head = b"x" * gateway_module._MAX_ERROR_BODY_PEEK
+    tail = b"tail"
+
+    def chunks():
+        yield head
+        yield tail
+
+    resp = UpstreamResponse(status=400, headers={}, body_chunks=chunks(), connection=None)
+    peeked, forwarded = gateway_module._peek_error_body(resp)
+    assert peeked == head
+    assert b"".join(forwarded.body_chunks) == head + tail
+
+
+def test_a_connection_dropped_while_reading_the_error_body_rotates_like_a_network_error(pool_env):
+    save_pool(Pool(profiles=[
+        Profile(id="a", name="Local", kind="api", priority=1, automatic=True, enabled=True,
+                base_url="http://127.0.0.1:5566", default_model="qwen-fallback"),
+        Profile(id="b", name="B", kind="api", priority=2, automatic=True, enabled=True,
+                base_url="https://gw.example"),
+    ]))
+
+    class Closable:
+        closed = False
+
+        def close(self):
+            Closable.closed = True
+
+    def broken():
+        raise ConnectionResetError("reset mid-body")
+        yield b""  # pragma: no cover
+
+    def transport(req):
+        if req.url.startswith("http://127.0.0.1"):
+            return UpstreamResponse(status=404, headers={}, body_chunks=broken(), connection=Closable())
+        return fake_response(200)
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, _msg())
+    assert result.status == 200 and result.profile_id == "b"
+    assert Closable.closed
+    assert gw.handle("POST", "/v1/messages", {}, _msg(), forced_profile_id="a").error == "upstream_unreachable"
+
+
+def test_is_model_refusal_wording():
+    refusal = gateway_module._is_model_refusal
+    assert refusal(404, b"")
+    assert refusal(403, b'{"error":{"message":"not allowed"}}')
+    assert refusal(400, b'{"error":{"message":"model claude-x does not exist"}}')
+    assert not refusal(400, b'{"error":{"message":"model: field required"}}')
+    assert not refusal(404, b'{"error":{"message":"prompt is too long"}}')

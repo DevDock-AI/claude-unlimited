@@ -85,9 +85,21 @@ def test_every_model_in_the_map_can_reach_every_other_one():
         assert reachable == set(_MODEL_LADDER)
 
 
+def _one_per_family(ids):
+    # The default list starts with one row per family — the newest the map
+    # lists — even when the map holds two of a family (Opus 5.5 and Opus 5).
+    seen, out = set(), []
+    for claude_id in ids:
+        family = "-".join(claude_id.split("-")[:2])
+        if family not in seen:
+            seen.add(family)
+            out.append(claude_id)
+    return out
+
+
 def test_automatic_mapping_matches_the_real_map():
     rows = automatic_mapping()
-    assert [r["claude_model"] for r in rows] == list(_MODEL_MAP)
+    assert [r["claude_model"] for r in rows] == _one_per_family(_MODEL_MAP)
     for row in rows:
         target = _MODEL_MAP[row["claude_model"]]
         assert row["openai_model"] == target.model
@@ -130,7 +142,7 @@ def test_a_profile_override_still_beats_the_parity_map():
 
 
 def test_parity_reaches_a_dated_model_id_through_the_family_fallback():
-    parity = {"claude-opus-5": {"effort": "none"}}
+    parity = {"claude-opus-5-5": {"effort": "none"}}   # the family's default row
     assert map_model("claude-opus-4-1-20260101", parity=parity).reasoning_effort == "none"
 
 

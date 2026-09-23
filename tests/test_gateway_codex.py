@@ -654,7 +654,7 @@ def test_an_unavailable_non_fable_target_does_not_count_as_fable_spent(pool_env)
     save_pool(Pool(profiles=[_codex_profile(leave_on_fable_limit=True)]))
     gw = Gateway(transport=lambda req: None)
     gw.runtime_snapshot()
-    opus_target = openai_models.map_model("claude-opus-5").model
+    opus_target = openai_models.map_model("claude-opus-5-5").model
     fable_target = openai_models.map_model("claude-fable-5").model
     assert opus_target != fable_target, "the default parity must keep them apart for this test"
     later = datetime.now(timezone.utc) + timedelta(hours=3)
@@ -663,7 +663,7 @@ def test_an_unavailable_non_fable_target_does_not_count_as_fable_spent(pool_env)
     gw.runtime_snapshot()
 
     from claude_unlimited.router import fable_spent
-    assert "claude-opus-5" in gw._runtime["c"].blocked_models
+    assert "claude-opus-5-5" in gw._runtime["c"].blocked_models   # the default Opus row
     assert fable_spent(gw._runtime["c"], datetime.now(timezone.utc)) is False
 
 
@@ -711,7 +711,7 @@ def test_a_per_profile_codex_model_override_is_respected(pool_env):
     gw.runtime_snapshot()
 
     blocked = gw._runtime["c"].blocked_models
-    assert "claude-fable-5" in blocked and "claude-opus-5" in blocked
+    assert "claude-fable-5" in blocked and "claude-opus-5-5" in blocked
     # ...and the model the parity list would otherwise have mapped is NOT the
     # thing being consulted.
     assert "gpt-5.6-sol" not in blocked

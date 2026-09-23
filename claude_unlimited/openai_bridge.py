@@ -386,6 +386,12 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         base = (profile.base_url or "https://api.openai.com/v1").rstrip("/")
         url = f"{base}{fmt.endpoint_path}"
     parts = urlsplit(url)
+    if parts.scheme != "https":
+        # Codex profiles are https-only (plain http is an API-profile feature
+        # for local servers); profiles.py refuses this on save, and this
+        # catches a config edited by hand.
+        raise OpenAIBridgeError(f"Refusing to send a Codex request over {parts.scheme or 'no scheme'}: "
+                                "the Base URL must start with https://.")
 
     # Start from whatever this backend last accepted in place of the mapped
     # model, then walk the ladder if that is rejected too. A Profile override

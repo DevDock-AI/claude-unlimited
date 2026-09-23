@@ -114,3 +114,38 @@ def test_network_failure_raises_connection_test_error(pool_env, monkeypatch):
 
     with pytest.raises(connection_test.ConnectionTestError):
         connection_test.test_connection("a")
+
+
+@pytest.mark.parametrize("force,default,expected", [
+    ("forced-m", "default-m", "forced-m"),     # real traffic sends the forced model
+    (None, "default-m", "default-m"),
+    (None, None, connection_test.TEST_MODEL),
+])
+def test_an_api_profile_is_probed_with_the_model_it_is_configured_for(pool_env, monkeypatch, force, default, expected):
+    save_pool(Pool(profiles=[Profile(id="c", name="C", kind="api", automatic=True, enabled=True,
+                                     base_url="http://127.0.0.1:8000", force_model=force,
+                                     default_model=default)]))
+    monkeypatch.setattr(connection_test, "secret_store", FakeSecretStore({"c": "sk-c"}))
+    sent = {}
+
+    def fake_send(req, timeout=None):
+        sent["model"] = json.loads(req.body)["model"]
+        return UpstreamResponse(status=200, headers={}, body_chunks=iter([b"{}"]), connection=FakeConnection())
+
+    monkeypatch.setattr(connection_test.upstream, "send", fake_send)
+    result = connection_test.test_connection("c")
+    assert sent["model"] == expected
+    assert result["model"] == expected
+
+
+def test_a_network_failure_names_the_profiles_own_host(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[Profile(id="c", name="C", kind="api", automatic=True, enabled=True,
+                                     base_url="http://127.0.0.1:8000")]))
+    monkeypatch.setattr(connection_test, "secret_store", FakeSecretStore({"c": "sk-c"}))
+
+    def fake_send(req, timeout=None):
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(connection_test.upstream, "send", fake_send)
+    with pytest.raises(connection_test.ConnectionTestError, match="127.0.0.1"):
+        connection_test.test_connection("c")

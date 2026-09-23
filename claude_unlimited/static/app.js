@@ -2116,6 +2116,8 @@ function openProfileDetailModal(profileId) {
   const codexIsApiKey = isCodex && p.auth_mode === 'api_key';
   document.getElementById('pd_api_fields').style.display = isApi ? '' : 'none';
   document.getElementById('pd_base_url_input').value = p.base_url || '';
+  document.getElementById('pd_force_model_input').value = p.force_model || '';
+  document.getElementById('pd_default_model_input').value = p.default_model || '';
   document.getElementById('pd_credential_input').value = ''; // never pre-filled — the daemon never sends the real secret back
   document.getElementById('pd_budget_input').value = p.monthly_budget_cap != null ? p.monthly_budget_cap.toFixed(2) : '';
 
@@ -2220,6 +2222,8 @@ async function saveProfileDetail() {
     const rawThreshold = document.getElementById('pd_token_threshold_input').value.trim();
     payload.token_threshold = rawThreshold === '' ? null : Number(rawThreshold);
     payload.base_url = document.getElementById('pd_base_url_input').value.trim() || null;
+    payload.force_model = document.getElementById('pd_force_model_input').value.trim() || null;
+    payload.default_model = document.getElementById('pd_default_model_input').value.trim() || null;
     const rawBudget = document.getElementById('pd_budget_input').value.replace(/[^0-9.]/g, '');
     payload.monthly_budget_cap = rawBudget === '' ? null : Number(rawBudget);
   } else {
@@ -3066,7 +3070,7 @@ async function loadSettings() {
     setToggleState(document.getElementById('fableLimitAllToggle'), settings.fable_limit_all_profiles);
     refreshCodexCreditsVisibility();
     renderNotifList(settings);
-    const context1m = settings.context_1m || 'auto';
+    const context1m = settings.context_1m || 'force_1m';
     document.querySelectorAll('#context1mRow .seg-btn').forEach((b) => {
       b.classList.toggle('on', b.dataset.context1m === context1m);
     });
@@ -3511,6 +3515,7 @@ function selectType(type) {
   document.getElementById('f_credential_wrap').style.display = type === 'api' ? '' : 'none';
   document.getElementById('f_codex_credential_wrap').style.display = codexApiKey ? '' : 'none';
   document.getElementById('f_default_model_wrap').style.display = type === 'api' ? '' : 'none';
+  document.getElementById('f_force_model_wrap').style.display = type === 'api' ? '' : 'none';
   document.getElementById('f_budget_wrap').style.display = type === 'api' ? '' : 'none';
   // Shown for both codex sub-choices, since the model mapping is relevant
   // either way, but codexChatgpt's parent (manualPane) stays hidden — that
@@ -3576,6 +3581,7 @@ function openModal() {
   document.getElementById('f_codex_base_url').value = '';
   document.getElementById('f_codex_credential').value = '';
   document.getElementById('f_default_model').value = '';
+  document.getElementById('f_force_model').value = '';
   document.getElementById('f_budget').value = '';
   document.getElementById('f_token_threshold').value = '';
   document.getElementById('f_threshold_val').textContent = '98';
@@ -3631,8 +3637,10 @@ async function submitProfile() {
     const bu = document.getElementById('f_base_url').value;
     if (bu) payload.base_url = bu;
     payload.auth_mode = _selectedAuthMode;
-    const model = document.getElementById('f_default_model').value;
+    const model = document.getElementById('f_default_model').value.trim();
     if (model) payload.default_model = model;
+    const forced = document.getElementById('f_force_model').value.trim();
+    if (forced) payload.force_model = forced;
     const budgetRaw = document.getElementById('f_budget').value.replace(/[^0-9.]/g, '');
     if (budgetRaw) payload.monthly_budget_cap = Number(budgetRaw);
     const tokenThresholdRaw = document.getElementById('f_token_threshold').value.trim();

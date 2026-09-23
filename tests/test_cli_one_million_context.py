@@ -14,6 +14,8 @@ and nothing here launches anything.
 
 import os
 
+import json
+
 import pytest
 
 from claude_unlimited.context_window import (
@@ -263,7 +265,7 @@ def test_the_settings_endpoint_publishes_the_decision_reason(monkeypatch, tmp_pa
     mixed = Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True),
                             Profile(id="c", name="C", kind="codex", automatic=True,
                                     auth_mode="chatgpt_subscription")],
-                  settings=Settings())
+                  settings=Settings(context_1m="auto"))
     preview = daemon._context_1m_preview(mixed)
     assert (preview["enabled"], preview["reason"]) == (True, "enabled_1m_guarded")
     # The guard block names the codex account and the window it is held to.
@@ -274,7 +276,7 @@ def test_the_settings_endpoint_publishes_the_decision_reason(monkeypatch, tmp_pa
     assert "gpt-5.6-terra" in entry["models"]
 
     claude_only = Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True)],
-                        settings=Settings())
+                        settings=Settings(context_1m="auto"))
     assert daemon._context_1m_preview(claude_only) == {"enabled": True,
                                                         "reason": "enabled_1m_verified"}
 
@@ -290,7 +292,7 @@ def test_the_preview_flags_an_assumed_window_and_a_codex_only_pool(monkeypatch):
     monkeypatch.setattr(daemon, "_cached_client_version", lambda: VERIFIED)
     codex_only = Pool(profiles=[Profile(id="c", name="C", kind="codex", automatic=True,
                                         auth_mode="chatgpt_subscription", codex_model="gpt-99-nova")],
-                      settings=Settings())
+                      settings=Settings(context_1m="auto"))
     preview = daemon._context_1m_preview(codex_only)
     assert (preview["enabled"], preview["reason"]) == (False, "codex_only_route")
     [entry] = preview["guard"]["profiles"]
@@ -418,3 +420,19 @@ def test_no_client_anywhere_reads_as_unverified(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_CLAUDE_FALLBACK_PATHS", (tmp_path / "nope",))
     assert cli._claude_executable() is None
     assert cli._installed_client_version() is None
+
+
+def test_force_1m_is_the_default_and_the_fallback(tmp_path, monkeypatch):
+    """A fresh install, a config that never chose, and a config holding a
+    value this build does not know all mean Force 1M."""
+    from claude_unlimited import config
+    from claude_unlimited.config import Settings
+
+    assert Settings().context_1m == "force_1m"
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    for saved in ({}, {"context_1m": "something-new"}):
+        (tmp_path / "config.json").write_text(json.dumps({"profiles": [], "settings": saved}), encoding="utf-8")
+        assert config.load_pool().settings.context_1m == "force_1m"
+    (tmp_path / "config.json").write_text(json.dumps({"profiles": [], "settings": {"context_1m": "auto"}}),
+                                          encoding="utf-8")
+    assert config.load_pool().settings.context_1m == "auto"   # a saved choice always wins

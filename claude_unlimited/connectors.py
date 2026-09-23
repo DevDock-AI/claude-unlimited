@@ -56,7 +56,7 @@ CONNECTORS: dict[str, ConnectorSpec] = {
         kind="api",
         display_name="API endpoint",
         auth_modes=("api_key", "bearer"),
-        profile_fields=("base_url", "auth_mode", "default_model", "monthly_budget_cap", "token_threshold"),
+        profile_fields=("base_url", "auth_mode", "default_model", "force_model", "monthly_budget_cap", "token_threshold"),
         quota_style="token_budget",
     ),
     "codex": ConnectorSpec(

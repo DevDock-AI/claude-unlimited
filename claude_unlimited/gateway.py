@@ -20,6 +20,7 @@ underneath it.
 from __future__ import annotations
 
 import http.client
+import itertools
 import json
 import threading
 import time
@@ -119,6 +120,63 @@ APPROACHING_THRESHOLD_BAND = 5.0  # percentage points below switch_threshold tha
 # OAuth Profiles or any other status: this is specifically the
 # default_model fallback (see Gateway._maybe_retry_with_default_model).
 _MODEL_FALLBACK_STATUS_CODES = (400, 403, 404)
+# An error body is a few hundred bytes; the cap only stops a misbehaving
+# upstream streaming megabytes into memory before the answer goes back.
+_MAX_ERROR_BODY_PEEK = 64 * 1024
+# Wording that marks a 400 as "the input is too big", not "unknown model".
+# Anthropic says "prompt is too long"; local servers (MLX, llama.cpp, vLLM)
+# say "exceeds max context window" / "maximum context length".
+_CONTEXT_OVERFLOW_MARKERS = (b"too long", b"context window", b"context length",
+                             b"maximum context", b"exceeds max", b"exceeds the context")
+# Wording that marks a 400 as "no such model". The word "model" alone is not
+# enough: "model: field required" or "max_tokens too large for this model"
+# are malformed requests, and remembering them would move later requests
+# off a model the endpoint serves fine.
+_MODEL_REFUSAL_MARKERS = (b"not found", b"unknown model", b"invalid model", b"does not exist",
+                          b"not supported", b"no such model", b"unsupported model",
+                          b"not available", b"model_not_found")
+
+
+def _peek_error_body(resp: "UpstreamResponse") -> tuple[bytes, "UpstreamResponse"]:
+    """Reads an error response's body and hands back an equivalent response
+    that will still yield those same bytes, so the caller can inspect it and
+    still forward it unchanged."""
+    raw = bytearray()
+    chunks = iter(resp.body_chunks)
+    for chunk in chunks:
+        raw.extend(chunk)
+        if len(raw) >= _MAX_ERROR_BODY_PEEK:
+            break
+    data = bytes(raw)
+    # Past the cap the rest is still forwarded, just not inspected.
+    rest = itertools.chain([data] if data else [], chunks)
+    return data, replace(resp, body_chunks=rest)
+
+
+def _is_model_refusal(status: int, error_body: bytes) -> bool:
+    """Whether this error means "this endpoint does not serve that model"."""
+    text = error_body.lower()
+    if any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS):
+        return False
+    if status in (403, 404):
+        # 404 "no such model", 403 "this key may not use that model". Neither
+        # ever means the input was too big.
+        return True
+    # A 400 is also every malformed-request error; only one that names the
+    # model AND says it is missing is about the model.
+    return b"model" in text and any(marker in text for marker in _MODEL_REFUSAL_MARKERS)
+
+
+def _force_model_body(profile: "Profile", body: bytes) -> Optional[bytes]:
+    """An api Profile with force_model sends that model on every request,
+    whatever the client asked for. None when nothing is forced, or the body
+    has no model to replace (token counting, other side calls)."""
+    if profile.kind != "api" or not getattr(profile, "force_model", None):
+        return None
+    requested = request_model(body)
+    if requested is None or requested == profile.force_model:
+        return None
+    return rewrite_model(body, profile.force_model)
 
 
 def _restorable_usage_fields(persisted: Optional[dict], now: datetime) -> dict:
@@ -758,7 +816,7 @@ class Gateway:
         # single-model endpoint (a local model server, a one-deployment
         # gateway) pays the same 404 and retry again — the answer is already
         # known after the first one. profile_id -> set of rejected model names.
-        self._models_rejected_by: dict[str, set] = {}
+        self._models_rejected_by: dict[tuple, set] = {}
         self._usage_recheck_requested: dict[str, float] = {}
         self._usage_recheck_pending: set = set()
         # Set when a re-read should not wait for the next probe tick; the
@@ -1077,6 +1135,9 @@ class Gateway:
         eco_stats = eco.CompactionStats()
 
         for _ in range(MAX_ROTATION_ATTEMPTS):
+            # The Profile a pinned request is held to: the pin itself, or —
+            # for a subagent — the "Forced in subagents" Profile.
+            held_to = forced_profile_id
             with self._lock:
                 pool = load_pool()
                 snapshot = self._sync_snapshot(pool)
@@ -1087,7 +1148,18 @@ class Gateway:
                 if forced_profile_id is not None:
                     # An explicit --profile pin outranks everything: it must
                     # never be silently substituted, not even by a branch pin.
-                    decision = self._forced_decision(pool, forced_profile_id, now, fit)
+                    # One deliberate exception: a subagent goes to the Profile
+                    # marked "Forced in subagents", when there is one. That flag
+                    # is the more specific choice — "orchestrate on this
+                    # account, run the workers on that one" — and it is taken
+                    # just as strictly as the pin: if that Profile cannot
+                    # serve, the subagent fails; it is never rerouted. A
+                    # DISABLED holder counts as no holder: subagents then
+                    # follow the pin, as they do when nothing is flagged.
+                    subagent_target = self._forced_subagent_profile(pool) if is_subagent else None
+                    if subagent_target is not None:
+                        held_to = subagent_target.id
+                    decision = self._forced_decision(pool, held_to, now, fit)
                 else:
                     decision = self._branch_decision(
                         pool, snapshot, now, branch, is_subagent, parent_agent_id,
@@ -1117,12 +1189,12 @@ class Gateway:
                 # compacts and re-sends — to the same pinned account, or to
                 # whichever one the smaller conversation then fits.
                 return self._prompt_too_long_result(pool, snapshot, guard, headers, branch,
-                                                    forced_profile_id)
+                                                    held_to)
 
             if decision.profile_id is None or decision.profile_id in attempted:
                 if forced_profile_id is not None:
                     activity.record("error", "Pinned Profile unavailable — request rejected",
-                                     meta=f"{forced_profile_id}: {decision.reason}, "
+                                     meta=f"{held_to}: {decision.reason}, "
                                           f"client={_client_label(headers)}")
                     return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
                                           error=decision.reason)
@@ -1222,6 +1294,9 @@ class Gateway:
             # This endpoint already refused the requested model once: send the
             # Profile's default straight away rather than paying the same 404
             # and retry on every request.
+            forced = _force_model_body(profile, eco_body)
+            if forced is not None:
+                eco_body = forced
             known_bad = self._default_model_body(profile, eco_body)
             if known_bad is not None:
                 eco_body = known_bad
@@ -1300,13 +1375,39 @@ class Gateway:
 
             if (profile.kind == "api" and profile.default_model
                     and isinstance(observation, Unknown) and observation.status_code in _MODEL_FALLBACK_STATUS_CODES):
-                self._remember_rejected_model(profile.id, request_model(body))
-                retried = self._maybe_retry_with_default_model(
-                    profile, credential, method, path, headers, body, now,
-                    parity=pool.settings.model_parity)
-                if retried is not None:
-                    resp.connection.close()  # the first attempt's response is being discarded, unread
-                    resp, observation = retried
+                # Read the (small) error body to tell "model not found" from
+                # everything else a 400 can mean. A "prompt is too long" 400
+                # used to be taken for a model refusal: it retried with the
+                # default model, logged "<model> unavailable", and remembered
+                # the model as refused — which, with a forced model, would move
+                # every later request off it for good after one large prompt.
+                try:
+                    error_body, resp = _peek_error_body(resp)
+                except (OSError, http.client.HTTPException):
+                    # The connection dropped while the error body was read —
+                    # the same failure as one before the headers: release
+                    # the slot, cool the Profile down, rotate (or fail, when
+                    # pinned) exactly as the network-error branch above does.
+                    resp.connection.close()
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                        self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                    if forced_profile_id is not None:
+                        activity.record("error", f"{profile.name} — could not reach upstream",
+                                         meta="pinned profile, not rotating")
+                        return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                                              error="upstream_unreachable")
+                    activity.record("error", f"{profile.name} — could not reach upstream",
+                                     meta="network error, rotating to next eligible profile")
+                    continue
+                if _is_model_refusal(observation.status_code, error_body):
+                    self._remember_rejected_model(profile, request_model(eco_body))
+                    retried = self._maybe_retry_with_default_model(
+                        profile, credential, method, path, headers, eco_body, now,
+                        parity=pool.settings.model_parity)
+                    if retried is not None:
+                        resp.connection.close()  # the first attempt's response is being discarded
+                        resp, observation = retried
 
             old_rt = self._runtime.get(profile.id)
             old_state = old_rt.state if old_rt is not None else None
@@ -1978,14 +2079,20 @@ class Gateway:
 
     _MAX_REJECTED_MODELS = 64
 
-    def _remember_rejected_model(self, profile_id: str, model: Optional[str]) -> None:
+    @staticmethod
+    def _rejection_key(profile: Profile) -> tuple:
+        # Keyed by the endpoint too: pointing the Profile at another server
+        # must not carry over what the old one refused.
+        return (profile.id, profile.base_url or "")
+
+    def _remember_rejected_model(self, profile: Profile, model: Optional[str]) -> None:
         """This endpoint does not serve `model`. Bounded, and in memory only:
         a restart re-learns it with one 404, and an endpoint that gains the
         model back is not held to an answer it gave last week."""
         if not model:
             return
         with self._lock:
-            known = self._models_rejected_by.setdefault(profile_id, set())
+            known = self._models_rejected_by.setdefault(self._rejection_key(profile), set())
             if len(known) < self._MAX_REJECTED_MODELS:
                 known.add(model)
 
@@ -2000,7 +2107,7 @@ class Gateway:
         if requested is None or requested == profile.default_model:
             return None
         with self._lock:
-            known = self._models_rejected_by.get(profile.id)
+            known = self._models_rejected_by.get(self._rejection_key(profile))
         if not known or requested not in known:
             return None
         return rewrite_model(body, profile.default_model)
@@ -2039,7 +2146,7 @@ class Gateway:
             return None
         try:
             retry_resp = self._transport(retry_req)
-        except OSError:
+        except (OSError, http.client.HTTPException):
             return None
         retry_observation = classify(retry_resp.status, filter_response_headers(retry_resp.headers), now)
         activity.record("config", f"{profile.name} — retried with its default model",

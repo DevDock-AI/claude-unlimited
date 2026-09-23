@@ -50,17 +50,19 @@ def _validate(name: str, kind: str, base_url: Optional[str], auth_mode: str, tag
     if kind in ("api", "codex") and auth_mode not in _VALID_AUTH_MODES:
         raise ValidationError(f"Unknown auth_mode {auth_mode!r}; must be one of {_VALID_AUTH_MODES}.")
     if base_url:
-        _validate_base_url(base_url)
+        _validate_base_url(base_url, kind)
     if tag_color is not None and tag_color not in _TAG_COLORS:
         raise ValidationError(f"Unknown tag_color; must be one of {_TAG_COLORS}.")
 
 
-def _validate_base_url(base_url: str) -> None:
+def _validate_base_url(base_url: str, kind: str = "api") -> None:
     """Delegates to net_scope, which upstream.py reads too — the rule that
     decides what is saved and the rule that decides what is sent must be the
-    same one, or a Profile is accepted and then refused at send time."""
+    same one, or a Profile is accepted and then refused at send time. Plain
+    http to a local server is for API profiles only; the Codex bridge is
+    https-only."""
     try:
-        net_scope.validate(base_url)
+        net_scope.validate(base_url, allow_local_http=(kind != "codex"))
     except net_scope.InvalidUpstreamURL as exc:
         raise ValidationError(str(exc)) from exc
 
@@ -131,7 +133,7 @@ def _validate_field_types(**changes) -> None:
         if key in changes and not isinstance(changes[key], str):
             raise ValidationError(f"{key} must be a string.")
 
-    for key in ("base_url", "default_model", "tag_color", "plan", "codex_model"):
+    for key in ("base_url", "default_model", "force_model", "tag_color", "plan", "codex_model"):
         if key in changes and changes[key] is not None and not isinstance(changes[key], str):
             raise ValidationError(f"{key} must be a string, or null.")
 
@@ -224,6 +226,7 @@ def create_profile(
     # to Rotation. Pass False only for a deliberate manual-pin-only account.
     automatic: bool = True,
     default_model: Optional[str] = None,
+    force_model: Optional[str] = None,
     monthly_budget_cap: Optional[float] = None,
     token_threshold: Optional[int] = None,
     tag_color: Optional[str] = None,
@@ -246,7 +249,7 @@ def create_profile(
     _validate_field_types(
         switch_threshold=switch_threshold, token_threshold=token_threshold,
         monthly_budget_cap=monthly_budget_cap, automatic=automatic,
-        default_model=default_model, tag_color=tag_color, plan=plan,
+        default_model=default_model, force_model=force_model, tag_color=tag_color, plan=plan,
         codex_model=codex_model, codex_reasoning_effort=codex_reasoning_effort,
         claude_config_dir=claude_config_dir, codex_home=codex_home,
         forced_for_subagents=forced_for_subagents, leave_on_fable_limit=leave_on_fable_limit,
@@ -279,6 +282,7 @@ def create_profile(
         switch_threshold=switch_threshold,
         automatic=automatic,
         default_model=default_model,
+        force_model=force_model,
         monthly_budget_cap=monthly_budget_cap,
         token_threshold=token_threshold,
         tag_color=tag_color,
@@ -411,7 +415,7 @@ def _record_released_forced_subagents(released: list[Profile], claimant: Profile
 def update_profile(profile_id: str, **changes) -> Profile:
     allowed = {
         "name", "priority", "switch_threshold", "enabled", "automatic",
-        "default_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
+        "default_model", "force_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
         "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
         "forced_for_subagents", "leave_on_fable_limit",
     }

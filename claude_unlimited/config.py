@@ -66,7 +66,12 @@ class Profile:
     switch_threshold: float = DEFAULT_SWITCH_THRESHOLD
     enabled: bool = True
     automatic: bool = False  # eligible for automatic Rotation, not just manual pin
-    default_model: Optional[str] = None  # api kind only, optional
+    default_model: Optional[str] = None  # api kind only, optional: the FALLBACK model, used when the endpoint refuses the one a request asked for (or the forced one)
+    # api kind only, optional: send this model on EVERY request, whatever the
+    # client asked for. default_model then becomes its fallback — used only
+    # when the endpoint refuses the forced model. For a single-model endpoint
+    # (a local model server) this is how "always this model, exactly" is said.
+    force_model: Optional[str] = None
     monthly_budget_cap: Optional[float] = None  # api kind only, optional
     token_threshold: Optional[int] = None  # api kind only, optional: lifetime cumulative tokens at which Rotation stops picking this Profile. The api-kind analogue of switch_threshold, since an API key has no session-percentage window to measure against.
     tag_color: Optional[str] = None  # cosmetic only
@@ -82,7 +87,11 @@ class Profile:
     # untouched — that asymmetry is the feature: a Claude orchestrator driving
     # GPT subagents, say. At most one Profile may hold this (validated on save).
     # If it becomes unavailable, subagents fall back to the balanced branch
-    # selector rather than failing. See gateway.py's branch pinning.
+    # selector rather than failing — except inside a `cu code --profile`
+    # session, where it is held as strictly as the pin itself: the main agent
+    # stays on the pinned account, subagents stay here, nothing is rerouted.
+    # A disabled holder counts as none: subagents then follow the pin.
+    # See gateway.py's branch pinning and handle().
     forced_for_subagents: bool = False
     # "When this account's Fable weekly limit runs out, switch to another
     # profile." OFF by default. While the account's Fable bucket is spent the
@@ -177,7 +186,7 @@ class Settings:
     # explicit `--profile` pin or a standing Take over.
     fable_limit_all_profiles: bool = False
     # 1M context for `cu code` sessions. Claude Code budgets a native-1M model
-    # (Sonnet 5, Opus 4.7/4.8/5, Fable 5/5.1, Mythos 5/5.1) at 200K whenever
+    # (Sonnet 5, Opus 4.7/4.8/5/5.5, Fable 5/5.1, Mythos 5/5.1) at 200K whenever
     # ANTHROPIC_BASE_URL is not api.anthropic.com, because it cannot verify that
     # whatever sits on that URL really serves 1M. For an oauth or Anthropic-API
     # route through this daemon it does — see cli.py's ASSUME_FIRST_PARTY_ENV
@@ -191,8 +200,11 @@ class Settings:
     #   client_default leave Claude Code to decide (200K through a gateway);
     #   prefer_200k    never ask for 1M;
     #   force_1m       ask for 1M on EVERY route, whatever it is (the guard
-    #                  stays active; the user's own env still wins).
-    context_1m: str = "auto"
+    #                  stays active; the user's own env still wins). The
+    #                  default: a pooled session is overwhelmingly on Claude
+    #                  accounts, and 200K there means compacting several
+    #                  times as often for no reason.
+    context_1m: str = "force_1m"
 
 
 @dataclass
@@ -248,6 +260,7 @@ def load_pool() -> Pool:
             enabled=bool(p.get("enabled", True)),
             automatic=bool(p.get("automatic", False)),
             default_model=p.get("default_model"),
+            force_model=p.get("force_model"),
             monthly_budget_cap=p.get("monthly_budget_cap"),
             token_threshold=p.get("token_threshold"),
             tag_color=p.get("tag_color"),
@@ -295,7 +308,7 @@ def load_pool() -> Pool:
         # not a "changes what the model sees" switch, and a typo should not
         # quietly cost the user 800K of context.
         context_1m=(settings_data.get("context_1m")
-                    if settings_data.get("context_1m") in CONTEXT_1M_MODES else "auto"),
+                    if settings_data.get("context_1m") in CONTEXT_1M_MODES else "force_1m"),
     )
 
     return Pool(

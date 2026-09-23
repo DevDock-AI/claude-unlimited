@@ -55,6 +55,7 @@ class ExportedProfile:
     enabled: bool
     automatic: bool
     default_model: Optional[str]
+    force_model: Optional[str]
     monthly_budget_cap: Optional[float]
     token_threshold: Optional[int]
     tag_color: Optional[str]
@@ -101,7 +102,8 @@ def build_export_bundle(
             exported.append(asdict(ExportedProfile(
                 name=p.name, kind=p.kind, base_url=p.base_url, auth_mode=p.auth_mode,
                 priority=p.priority, switch_threshold=p.switch_threshold, enabled=p.enabled,
-                automatic=p.automatic, default_model=p.default_model, monthly_budget_cap=p.monthly_budget_cap,
+                automatic=p.automatic, default_model=p.default_model, force_model=p.force_model,
+                monthly_budget_cap=p.monthly_budget_cap,
                 token_threshold=p.token_threshold,
                 tag_color=p.tag_color, account_uuid=p.account_uuid, credential=cred,
                 plan=p.plan, codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
@@ -217,6 +219,7 @@ def apply_import(
                         auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
                         switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
                         automatic=item.get("automatic", True), default_model=item.get("default_model"),
+                        force_model=item.get("force_model"),
                         monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                         tag_color=item.get("tag_color"), plan=item.get("plan"),
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
@@ -234,6 +237,7 @@ def apply_import(
                     auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
                     switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
                     automatic=item.get("automatic", True), default_model=item.get("default_model"),
+                        force_model=item.get("force_model"),
                     monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
                     tag_color=item.get("tag_color"),
                     account_uuid=item.get("account_uuid"), plan=item.get("plan"),

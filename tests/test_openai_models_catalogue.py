@@ -92,8 +92,14 @@ def test_without_a_catalogue_everything_falls_back_to_the_literals():
     # derived surface must equal the shipped literals exactly.
     assert effective_model_map(None) == _MODEL_MAP
     assert selectable_models() == (list(_MODEL_LADDER) + list(_LEGACY_SELECTABLE))
-    assert [r["claude_model"] for r in automatic_mapping()] == list(_MODEL_MAP)
-    assert dict(advertised_models()).keys() == _MODEL_MAP.keys()
+    heads, seen = [], set()
+    for claude_id in _MODEL_MAP:          # one default row per family, newest first
+        family = "-".join(claude_id.split("-")[:2])
+        if family not in seen:
+            seen.add(family)
+            heads.append(claude_id)
+    assert [r["claude_model"] for r in automatic_mapping()] == heads
+    assert list(dict(advertised_models()).keys()) == heads   # the picker gets no duplicate Opus
     assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"]
 
 

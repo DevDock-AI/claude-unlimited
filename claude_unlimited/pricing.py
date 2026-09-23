@@ -28,7 +28,7 @@ from typing import Optional
 from . import model_catalogue
 
 PRICING_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
-PRICING_FETCHED = "2026-08-20"
+PRICING_FETCHED = "2026-09-23"
 OPENAI_PRICING_SOURCE = "https://platform.openai.com/docs/pricing"
 OPENAI_PRICING_FETCHED = "2026-09-17"
 
@@ -70,8 +70,15 @@ class ModelPrice:
 # Standard (non-batch) Claude API pricing, per model family. Retired models
 # are included since a long-lived local history may still reference them.
 MODEL_PRICES: tuple[ModelPrice, ...] = (
+    # 5.1 point releases have their own cache-read rate (0.025x input) and
+    # must out-match the 5 prefix, or every cache hit is billed at 4x.
+    ModelPrice("claude-fable-5-1", 10, 12.50, 20, 0.25, 50),
+    ModelPrice("claude-mythos-5-1", 10, 12.50, 20, 0.25, 50),
     ModelPrice("claude-fable-5", 10, 12.50, 20, 1, 50),
     ModelPrice("claude-mythos-5", 10, 12.50, 20, 1, 50),
+    # Opus 5.5 is cheaper than Opus 5 and its cache hits are 0.05x input. It
+    # must out-match the "claude-opus-5" prefix, which it otherwise extends.
+    ModelPrice("claude-opus-5-5", 4, 5, 8, 0.20, 20),
     ModelPrice("claude-opus-5", 5, 6.25, 10, 0.50, 25),
     ModelPrice("claude-opus-4-8", 5, 6.25, 10, 0.50, 25),
     ModelPrice("claude-opus-4-7", 5, 6.25, 10, 0.50, 25),

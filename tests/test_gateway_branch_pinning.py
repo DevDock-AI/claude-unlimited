@@ -127,11 +127,40 @@ def test_subagents_fall_back_to_spreading_when_the_forced_profile_is_unavailable
     assert landed <= {"a", "b"} and landed  # spread across what's left
 
 
-def test_an_explicit_profile_pin_still_beats_forced_subagents(pool_env):
-    save_pool(Pool(profiles=[prof("a"), prof("subs", forced_for_subagents=True)]))
+def test_a_pinned_session_keeps_its_main_agent_and_sends_subagents_to_the_forced_profile(pool_env):
+    # `cu code --profile a` with "Forced in subagents" on `subs`: orchestrate
+    # on one account, run the workers on another. Both held exactly.
+    save_pool(Pool(profiles=[prof("a"), prof("b"), prof("subs", forced_for_subagents=True)]))
     gw = healthy_gateway()
+    assert serve(gw, hdrs(), forced_profile_id="a").profile_id == "a"
+    assert serve(gw, hdrs(agent="ag1"), forced_profile_id="a").profile_id == "subs"
+    assert serve(gw, hdrs(agent="ag2", parent="ag1"), forced_profile_id="a").profile_id == "subs"
+    assert serve(gw, hdrs(), forced_profile_id="a").profile_id == "a"
+
+
+def test_in_a_pinned_session_an_unavailable_forced_profile_fails_the_subagent_instead_of_rerouting(pool_env):
+    # Strict like the pin itself: nothing is rerouted, not even to the
+    # session's own account.
+    save_pool(Pool(profiles=[prof("a"), prof("b"), prof("subs", forced_for_subagents=True)]))
+    gw = healthy_gateway()
+    serve(gw, hdrs(), forced_profile_id="a")  # prime runtime
+    with gw._lock:
+        gw._runtime["subs"].state = ProfileState.AUTH_INVALID
     result = serve(gw, hdrs(agent="ag1"), forced_profile_id="a")
-    assert result.profile_id == "a"
+    assert result.profile_id is None and result.status >= 400
+    assert serve(gw, hdrs(), forced_profile_id="a").profile_id == "a"   # main unaffected
+
+
+def test_without_a_forced_profile_a_pinned_sessions_subagents_follow_the_pin(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b")]))
+    gw = healthy_gateway()
+    assert serve(gw, hdrs(agent="ag1"), forced_profile_id="a").profile_id == "a"
+
+
+def test_in_a_pinned_session_a_disabled_forced_profile_is_ignored_and_subagents_follow_the_pin(pool_env):
+    save_pool(Pool(profiles=[prof("a"), prof("b"), prof("subs", enabled=False, forced_for_subagents=True)]))
+    gw = healthy_gateway()
+    assert serve(gw, hdrs(agent="ag1"), forced_profile_id="a").profile_id == "a"
 
 
 def test_a_disabled_forced_profile_is_ignored(pool_env):

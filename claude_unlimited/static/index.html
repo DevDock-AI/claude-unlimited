@@ -1507,7 +1507,7 @@
             <div class="routing-example-title" data-i18n="settings.routing.example_on_title">Setting ON — agents spread across accounts</div>
             <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. The agent you type at starts on Personal Max, the first subagent on Work Max, the second on Codex — all three at the same time, each on the account that was least busy when it started. Each stays on its own account until it finishes. If Work Max reaches its threshold mid-task, only the subagent on Work Max moves; the other two stay where they are.</div>
           </div>
-          <div class="routing-note" data-i18n="settings.routing.note">Still available per session either way: cu code --distribute turns balancing on for one session while this is off. cu code --profile &lt;name&gt; always wins over both and pins everything to one account. A profile marked "Forced in subagents" still takes every subagent, whatever this is set to.</div>
+          <div class="routing-note" data-i18n="settings.routing.note">Still available per session either way: cu code --distribute turns balancing on for one session while this is off. cu code --profile &lt;name&gt; always wins over both and pins the main agent to one account; its subagents go to a profile marked "Forced in subagents" if there is one, held just as strictly — never rerouted (if that profile is disabled, they follow the pin).</div>
         </div>
       </div>
     </div>
@@ -1521,13 +1521,13 @@
         <div class="field-row">
           <div class="field-text">
             <div class="field-title" data-i18n="settings.context1m.mode">Context window for cu code</div>
-            <div class="field-sub" data-i18n="settings.context1m.mode_desc">Auto asks for the full 1M window when a Claude account can take the session; a ChatGPT/Codex account beside it is guarded turn by turn. Off by default it would be 200K.</div>
+            <div class="field-sub" data-i18n="settings.context1m.mode_desc">Force 1M (the default) asks for the full 1M window on every session. Auto asks for it only when a Claude account can take the session, guarding a ChatGPT/Codex account turn by turn. Claude Code on its own would stay at 200K.</div>
           </div>
           <div class="seg-row" id="context1mRow">
-            <div class="seg-btn on" data-context1m="auto" data-i18n="settings.context1m.auto">Auto</div>
+            <div class="seg-btn" data-context1m="auto" data-i18n="settings.context1m.auto">Auto</div>
             <div class="seg-btn" data-context1m="client_default" data-i18n="settings.context1m.client_default">Claude Code default</div>
             <div class="seg-btn" data-context1m="prefer_200k" data-i18n="settings.context1m.prefer_200k">Prefer 200K</div>
-            <div class="seg-btn" data-context1m="force_1m" data-i18n="settings.context1m.force_1m">Force 1M</div>
+            <div class="seg-btn on" data-context1m="force_1m" data-i18n="settings.context1m.force_1m">Force 1M</div>
           </div>
         </div>
         <div class="context1m-verdict" id="context1mVerdict"></div>
@@ -2024,7 +2024,7 @@
           </tr>
           <tr>
             <td data-i18n="help.routing.r_forced_how">Profile menu → "Force in subagents"</td>
-            <td data-i18n="help.routing.r_forced">Every subagent, in every session, goes to that profile; the main agent keeps rotating normally. One profile at a time. If it runs out, subagents spread across the rest.</td>
+            <td data-i18n="help.routing.r_forced">Every subagent, in every session, goes to that profile; the main agent keeps rotating normally. One profile at a time. If it runs out, subagents spread across the rest — except in a cu code --profile session, where they are held to it and never rerouted.</td>
           </tr>
           <tr>
             <td class="mono">cu code --distribute</td>
@@ -2380,7 +2380,7 @@
         </div>
 
         <div class="field-group" id="f_codex_base_url_wrap" style="display:none;">
-          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com; http:// only for localhost or a LAN address)</div>
+          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com; https:// only)</div>
           <input class="text-input mono" id="f_codex_base_url" data-i18n-placeholder="modal.add_profile.codex_base_url_placeholder" placeholder="https://api.openai.com/v1">
         </div>
 
@@ -2407,7 +2407,13 @@
         <div class="field-group" id="f_default_model_wrap" style="display:none;">
           <div class="field-label" data-i18n="modal.add_profile.default_model_label">Default model (optional)</div>
           <input class="text-input mono" id="f_default_model" data-i18n-placeholder="modal.add_profile.default_model_placeholder" placeholder="claude-sonnet-4-5">
-          <div class="field-help" data-i18n="modal.add_profile.default_model_help">Pin a model only if this endpoint needs an explicit mapping</div>
+          <div class="field-help" data-i18n="modal.add_profile.default_model_help">Used when the endpoint refuses the model a request asks for. With Force model set, this is the fallback if the forced model is refused.</div>
+        </div>
+
+        <div class="field-group" id="f_force_model_wrap" style="display:none;">
+          <div class="field-label" data-i18n="modal.add_profile.force_model_label">Force model (optional)</div>
+          <input class="text-input mono" id="f_force_model" data-i18n-placeholder="modal.add_profile.force_model_placeholder" placeholder="Qwen3-Coder-30B-A3B-Instruct-MLX-4bit">
+          <div class="field-help" data-i18n="modal.add_profile.force_model_help">Every request to this profile uses exactly this model, whatever Claude Code asks for. If both are filled, the forced model is always sent first and the default model is used only when the endpoint refuses the forced one.</div>
         </div>
 
         <div class="input-row" id="f_codex_model_wrap" style="display:none;">
@@ -2709,13 +2715,23 @@
           <input class="text-input" id="pd_credential_input" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="modal.detail.api_key_placeholder" placeholder="Leave blank to keep the current key">
         </div>
         <div class="field-group">
+          <div class="field-label" data-i18n="modal.add_profile.force_model_label">Force model (optional)</div>
+          <input class="text-input mono" id="pd_force_model_input" type="text" spellcheck="false" data-i18n-placeholder="modal.add_profile.force_model_placeholder" placeholder="Qwen3-Coder-30B-A3B-Instruct-MLX-4bit">
+          <div class="field-help" data-i18n="modal.add_profile.force_model_help">Every request to this profile uses exactly this model, whatever Claude Code asks for. If both are filled, the forced model is always sent first and the default model is used only when the endpoint refuses the forced one.</div>
+        </div>
+        <div class="field-group">
+          <div class="field-label" data-i18n="modal.add_profile.default_model_label">Default model (optional)</div>
+          <input class="text-input mono" id="pd_default_model_input" type="text" spellcheck="false" data-i18n-placeholder="modal.add_profile.default_model_placeholder" placeholder="claude-sonnet-4-5">
+          <div class="field-help" data-i18n="modal.add_profile.default_model_help">Used when the endpoint refuses the model a request asks for. With Force model set, this is the fallback if the forced model is refused.</div>
+        </div>
+        <div class="field-group">
           <div class="field-label" data-i18n="modal.add_profile.budget_label">Monthly budget cap</div>
           <input class="text-input mono" id="pd_budget_input" placeholder="$50.00">
         </div>
       </div>
       <div id="pd_codex_fields" style="display:none">
         <div class="field-group" id="pd_codex_base_url_wrap">
-          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com; http:// only for localhost or a LAN address)</div>
+          <div class="field-label" data-i18n="modal.add_profile.codex_base_url_label">Base URL (blank = api.openai.com; https:// only)</div>
           <input class="text-input" id="pd_codex_base_url_input" type="text" data-i18n-placeholder="modal.add_profile.codex_base_url_placeholder" placeholder="https://api.openai.com/v1">
         </div>
         <div class="field-group" id="pd_codex_credential_wrap">

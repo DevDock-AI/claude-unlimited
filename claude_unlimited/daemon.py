@@ -253,7 +253,7 @@ def _context_1m_preview(pool) -> dict:
     0009) budgets it at, so the dashboard can say "up to ~226K on this one;
     longer turns go to a Claude account" — and flag any GPT id whose window
     is ASSUMED rather than known."""
-    mode = getattr(pool.settings, "context_1m", "auto")
+    mode = getattr(pool.settings, "context_1m", "force_1m")
     version = _cached_client_version() if mode == "auto" else None
     profiles = pool.enabled_profiles()
     enabled, reason = context_window._one_million_decision(mode, profiles, None, {}, version)
@@ -298,6 +298,7 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "enabled": p.enabled,
         "automatic": p.automatic,
         "default_model": p.default_model,
+        "force_model": p.force_model,
         "monthly_budget_cap": p.monthly_budget_cap,
         "token_threshold": p.token_threshold,
         "tag_color": p.tag_color,
@@ -419,6 +420,89 @@ def _widget_state() -> dict:
     except (OSError, subprocess.SubprocessError):
         running = False
     return {"supported": True, "installed": bundle.is_dir(), "running": running}
+
+
+# ---- proxy responses -------------------------------------------------------
+# A streaming request whose upstream has not answered after this long gets
+# headers and SSE pings straight away (see _DashboardHandler._serve_with_keepalive).
+# Claude Code's own first-byte window is 3 minutes; 10 seconds keeps every
+# ordinary request on the untouched fast path.
+_KEEPALIVE_AFTER_SECONDS = 10.0
+_KEEPALIVE_INTERVAL_SECONDS = 10.0
+_SSE_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
+
+_FORCED_PROFILE_ERROR_MESSAGES = {
+    "forced_profile_missing": "[claude-unlimited] The Profile this session is pinned to no longer exists.",
+    "forced_profile_disabled": "[claude-unlimited] The Profile this session is pinned to is disabled.",
+    "forced_profile_needs_reauth": "[claude-unlimited] The Profile this session is pinned to needs re-authentication.",
+    "upstream_unreachable": "[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to.",
+}
+
+
+def _wants_event_stream(method: str, path: str, body: bytes) -> bool:
+    """A /v1/messages call that asked for SSE — the only kind a keep-alive
+    can be written into. Parsed, not pattern-matched: '"stream": true' can
+    just as well be text inside a message."""
+    if method != "POST" or not path.split("?", 1)[0].rstrip("/").endswith("/v1/messages") or not body:
+        return False
+    try:
+        return json.loads(body).get("stream") is True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _proxy_error_payload(result) -> tuple:
+    """(status, Anthropic error envelope) for a request the gateway refused."""
+    message = (
+        # What the gateway worked out (which accounts, when the first one
+        # comes back), when it knows more than the code alone.
+        result.error_detail
+        or ("[claude-unlimited] The request body is too large to forward."
+            if result.error == "bad_request"
+            else _FORCED_PROFILE_ERROR_MESSAGES.get(
+                result.error, "[claude-unlimited] No eligible Profile is available right now."))
+    )
+    if result.error == "request_exceeds_every_window":
+        # The capacity guard's "prompt is too long" (docs/adr/0009): Claude
+        # Code's reactive compaction keys on the exact Anthropic envelope and
+        # wording, so it is relayed RAW — invalid_request_error, no
+        # [claude-unlimited] prefix.
+        error_type = "invalid_request_error"
+    else:
+        error_type = "overloaded_error" if result.status == 503 else "api_error"
+    return result.status, {"type": "error", "error": {"type": error_type, "message": message}}
+
+
+def _upstream_error_payload(result) -> dict:
+    """An upstream's own non-200 answer, as an SSE `error` event body. The
+    provider's envelope is kept when it is one (a 529 stays overloaded_error,
+    a context overflow stays invalid_request_error), so the client reacts to
+    it exactly as it would on a direct connection."""
+    raw = b""
+    try:
+        raw = b"".join(result.body_chunks or [])
+    except (OSError, ValueError):
+        pass
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            return {"type": "error", "error": parsed["error"]}
+    except ValueError:
+        pass
+    error_type = "overloaded_error" if result.status in (503, 529) else "api_error"
+    text = raw.decode("utf-8", "replace").strip()[:500] or f"HTTP {result.status}"
+    return {"type": "error", "error": {"type": error_type, "message": text}}
+
+
+def _discard_result(result) -> None:
+    """Close a gateway result nobody will read. Its body generator's cleanup
+    is what releases the Profile's in-flight slot and upstream connection."""
+    close = getattr(getattr(result, "body_chunks", None), "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - cleanup must not raise
+            pass
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
@@ -1335,38 +1419,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length > 0 else b""
         inbound_headers = {k: v for k, v in self.headers.items()}
 
-        result = _gateway.handle(method, path, inbound_headers, body,
-                                  forced_profile_id=grant.forced_profile_id,
-                                  distribute=grant.distribute)
+        def serve():
+            return _gateway.handle(method, path, inbound_headers, body,
+                                   forced_profile_id=grant.forced_profile_id,
+                                   distribute=grant.distribute)
 
+        if _wants_event_stream(method, path, body):
+            self._serve_with_keepalive(serve)
+            return
+        self._write_proxy_result(serve())
+
+    def _write_proxy_result(self, result) -> None:
+        """The ordinary response: whatever the gateway decided, as-is."""
         if result.error is not None:
-            _FORCED_PROFILE_ERROR_MESSAGES = {
-                "forced_profile_missing": "[claude-unlimited] The Profile this session is pinned to no longer exists.",
-                "forced_profile_disabled": "[claude-unlimited] The Profile this session is pinned to is disabled.",
-                "forced_profile_needs_reauth": "[claude-unlimited] The Profile this session is pinned to needs re-authentication.",
-                "upstream_unreachable": "[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to.",
-            }
-            message = (
-                # What the gateway worked out (which accounts, when the first
-                # one comes back), when it knows more than the code alone.
-                result.error_detail
-                or ("[claude-unlimited] The request body is too large to forward."
-                    if result.error == "bad_request"
-                    else _FORCED_PROFILE_ERROR_MESSAGES.get(
-                        result.error, "[claude-unlimited] No eligible Profile is available right now."))
-            )
-            if result.error == "request_exceeds_every_window":
-                # The capacity guard's "prompt is too long" (docs/adr/0009):
-                # Claude Code's reactive compaction keys on the exact
-                # Anthropic envelope and wording, so it is relayed RAW —
-                # invalid_request_error, no [claude-unlimited] prefix.
-                error_type = "invalid_request_error"
-            else:
-                error_type = "overloaded_error" if result.status == 503 else "api_error"
-            self._send_json(result.status, {
-                "type": "error",
-                "error": {"type": error_type, "message": message},
-            }, extra_headers=result.headers)
+            status, payload = _proxy_error_payload(result)
+            self._send_json(status, payload, extra_headers=result.headers)
             return
 
         self.send_response(result.status)
@@ -1381,6 +1448,86 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass  # client disconnected mid-stream
+
+    def _serve_with_keepalive(self, serve) -> None:
+        """A streaming request whose upstream is slow to answer.
+
+        Claude Code gives up on a request that has sent no response headers
+        after its first-byte window (3 minutes here), shows "Waiting for API
+        response · will retry … check your network", and sends it again —
+        while the first one is still being worked on upstream. A long Opus
+        turn behind a busy API, or a local model's slow prefill, crosses that.
+
+        So the gateway runs in the background. If it answers within
+        _KEEPALIVE_AFTER_SECONDS nothing changes: the normal response goes
+        out. If not, 200 headers and an SSE `ping` go out straight away and
+        every _KEEPALIVE_INTERVAL_SECONDS after — the same keep-alive the
+        Anthropic API sends while a model thinks — until the real stream
+        starts. A failure that arrives after that goes out as an SSE `error`
+        event carrying the provider's own error, which the client handles
+        exactly like one received mid-stream."""
+        box: dict = {}
+        done = threading.Event()
+
+        def run():
+            try:
+                box["result"] = serve()
+            except BaseException as exc:  # noqa: BLE001 - re-raised or reported below
+                box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=run, daemon=True, name="proxy-keepalive").start()
+        if done.wait(_KEEPALIVE_AFTER_SECONDS):
+            if "error" in box:
+                raise box["error"]
+            self._write_proxy_result(box["result"])
+            return
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(_SSE_PING)
+            self.wfile.flush()
+            while not done.wait(_KEEPALIVE_INTERVAL_SECONDS):
+                self.wfile.write(_SSE_PING)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # The client left. Let the upstream call finish, then release it:
+            # an unread body must still be closed, or its in-flight slot and
+            # connection are never freed.
+            done.wait()
+            _discard_result(box.get("result"))
+            return
+
+        if "error" in box:
+            self._write_sse_error("api_error", "[claude-unlimited] The request failed inside the proxy.")
+            raise box["error"]
+        result = box["result"]
+        try:
+            if result.error is not None:
+                _status, payload = _proxy_error_payload(result)
+                self._write_sse(b"error", payload)
+                return
+            if result.status != 200:
+                self._write_sse(b"error", _upstream_error_payload(result))
+                return
+            for chunk in result.body_chunks:
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            _discard_result(result)
+
+    def _write_sse(self, event: bytes, payload: dict) -> None:
+        self.wfile.write(b"event: " + event + b"\ndata: " + json.dumps(payload).encode("utf-8") + b"\n\n")
+        self.wfile.flush()
+
+    def _write_sse_error(self, error_type: str, message: str) -> None:
+        try:
+            self._write_sse(b"error", {"type": "error", "error": {"type": error_type, "message": message}})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_PATCH(self) -> None:  # noqa: N802
         if self._reject_bad_host() or not self._check_csrf():

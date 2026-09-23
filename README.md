@@ -304,7 +304,7 @@ has to decide which GPT model actually answers — and how hard it thinks. That'
 | Claude model | Claude effort | Runs as (Codex) | Codex effort |
 |---|---|---|---|
 | Claude Fable 5.1 | Automatic | `gpt-5.6-sol` | medium |
-| Claude Opus 5 | Automatic | `gpt-5.6-terra` | high |
+| Claude Opus 5.5 | Automatic | `gpt-5.6-terra` | high |
 | Claude Sonnet 5 | Automatic | `gpt-5.6-terra` | medium |
 | Claude Haiku 4.5 | Automatic | `gpt-5.6-luna` | low |
 
@@ -349,12 +349,28 @@ the rest follow the list.
 API keys are added **in the dashboard**, not the CLI — open
 **http://127.0.0.1:4317/** → **Add profile**.
 
-That's deliberate. Anything with a form (base URL, auth mode, default model, budget cap,
-token threshold) belongs somewhere you can see and edit it, not behind flags you have to
-remember. The same goes for everything else about an account: priority, thresholds,
+That's deliberate. Anything with a form (base URL, auth mode, default model, force model,
+budget cap, token threshold) belongs somewhere you can see and edit it, not behind flags you
+have to remember. The same goes for everything else about an account: priority, thresholds,
 enabling, disabling, and removal are all dashboard-managed.
 
-Works with Anthropic API keys and any Anthropic-compatible gateway.
+Works with Anthropic API keys and any Anthropic-compatible gateway — including a **local
+model server** that speaks the Anthropic Messages API (an MLX server, LM Studio, and others):
+the Base URL may be `http://` when it points at your own machine or LAN (`localhost`,
+`127.0.0.1`, `192.168.x.x`, `10.x.x.x`); anything else must be `https://`. This applies to
+API-key profiles only — a Codex profile's Base URL is always `https://`.
+
+Two optional model fields decide what the endpoint is asked for:
+
+- **Force model** — every request to this profile uses exactly this model, whatever Claude
+  Code asked for. This is how you say "always Qwen3-Coder" for a local server.
+- **Default model** — used when the endpoint refuses the model a request asked for. With
+  Force model also set, it is the fallback for when the **forced** model is refused.
+
+If both are filled, the forced model is always sent first; the default is used only if the
+endpoint refuses the forced one. A refusal is remembered for that profile, so later requests
+go straight to the model that works. A "prompt is too long" error is never mistaken for a
+refused model.
 
 ---
 
@@ -467,7 +483,7 @@ route exactly as they always have.
 
 ### The 1M context window
 
-Several Claude models hold a million tokens: **Sonnet 5**, **Opus 4.7 / 4.8 / 5**, **Fable 5
+Several Claude models hold a million tokens: **Sonnet 5**, **Opus 4.7 / 4.8 / 5 / 5.5**, **Fable 5
 and 5.1**, **Mythos 5 and 5.1**. Claude Code only uses that window when it is talking
 straight to `api.anthropic.com`. Pointed anywhere else — including this daemon on your own
 machine — it falls back to **200K**, because it has no way to tell what is on the other end
@@ -502,18 +518,20 @@ subagents" falls back to normal balancing for a subagent whose conversation it c
 GPT model this build has not met is assumed at 272K and said so, in the Activity log and in
 Settings — never excluded on a guess.
 
-**It still stays quiet when it cannot be sure**: when only ChatGPT/Codex accounts can take the
+**Auto is the cautious alternative** — it stays quiet when it cannot be sure: when only ChatGPT/Codex accounts can take the
 session (nothing there holds more than 272K, so 1M would only mean compacting sooner), when an
 API profile points somewhere other than Anthropic, or when your Claude Code version has not
 been checked for it. The launch prints why, and Settings shows the same verdict together with
 each ChatGPT account's window.
 
-**Settings → 1M context window** has four choices: **Auto** (the default),
-**Claude Code default**, **Prefer 200K**, and **Force 1M**. Force 1M sets the window on every
+**Settings → 1M context window** has four choices: **Force 1M** (the default), **Auto**,
+**Claude Code default** and **Prefer 200K**. Force 1M sets the window on every
 session whatever the route — a ChatGPT-only pool, a pinned ChatGPT account, an API profile
 pointing elsewhere, even an unverified Claude Code version. The capacity guard stays on under
 it, it cannot enlarge a model that is not natively 1M (Sonnet 4.6 and Haiku 4.5 stay at 200K),
-and a backend you pointed it at may reject what the client now sends. Your own
+and a backend you pointed it at may reject what the client now sends — a local model server
+with a small window, for instance, answers "prompt too long" once a conversation outgrows it.
+Pick **Auto** if your pool routes a lot of traffic to backends smaller than 1M. Your own
 `CLAUDE_CODE_DISABLE_1M_CONTEXT` always wins over all four.
 
 A bigger window is not a bigger quota. It does not buy you more usage — it means a long
@@ -548,9 +566,15 @@ overrides a `--profile` pin.
 **Forced in subagents** is a per-account switch — on the Profiles list, in each profile's
 ⋮ menu or its edit modal. Turn it on for one account and every subagent, in every session,
 goes to it — while the main agent keeps rotating normally. That's how you run, say, a
-Claude model as the orchestrator with all its subagents on a Codex/GPT account. Only one
-account can hold it at a time, and if that account is exhausted or disabled, subagents fall
-back to spreading across the pool rather than failing. If the account holding it is
+Claude model as the orchestrator with all its subagents on a Codex/GPT account, or on a
+local model. Only one account can hold it at a time, and if that account is exhausted or
+disabled, subagents fall back to spreading across the pool rather than failing.
+
+It also works **inside a pinned session**: `cu code --profile "Second account"` keeps the main
+agent on that account, and its subagents go to the account marked Forced in subagents. There,
+both are held strictly — nothing is rerouted; if the subagents' account cannot serve, their
+requests fail instead of moving. A *disabled* holder counts as none: the subagents then
+follow the pin, like the main agent. If the account holding it is
 disabled, turning it on elsewhere simply moves it; an enabled holder has to be switched off
 first.
 
@@ -558,8 +582,8 @@ Which one wins, in order:
 
 | How | What happens |
 |---|---|
-| `cu code --profile <name>` | That terminal's main agent **and** subagents all use that account. |
-| "Force in subagents" on a profile | Every subagent goes there; the main agent rotates normally. |
+| `cu code --profile <name>` | That terminal's main agent uses that account, never rotated. Its subagents do too — unless a profile is marked "Force in subagents", in which case they go there, just as strictly. |
+| "Force in subagents" on a profile | Every subagent goes there; the main agent rotates normally (or stays pinned, with `--profile`). |
 | `cu code --distribute` | Main agent and each subagent start on the least-busy account and stay there, that session. |
 | Settings → "Balance sessions and subagents across accounts" | Same as above, for every session, no flag needed. |
 | *nothing set (default)* | Normal rotation — everyone shares one account until it's spent. |
@@ -1033,6 +1057,21 @@ is currently in rotation. If it doesn't, run `claude-unlimited reauth`: it lists
 accounts actually need it, so there's no guessing.
 Once it is signed back in, its usage is read straight away, so the Dashboard and the HUD
 show real numbers for it within seconds instead of at the next scheduled read.
+</details>
+
+<details>
+<summary><b>"Waiting for API response · will retry … check your network"</b></summary>
+<br>
+
+Claude Code shows this when a request has had no answer for three minutes, then sends it
+again — while the first is still being worked on. Since 1.3.1 the proxy prevents it: when a
+streaming request's upstream has not answered after 10 seconds, the proxy starts the response
+itself and sends the same keep-alive pings the Anthropic API sends while a model thinks, until
+the real answer arrives. If that answer is an error, it reaches Claude Code as the provider's
+own error event, handled as it would be on a direct connection.
+
+Still seeing it? The upstream itself is unreachable — check Activity for *could not reach
+upstream*.
 </details>
 
 <details>

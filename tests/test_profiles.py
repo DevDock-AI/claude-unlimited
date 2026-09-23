@@ -115,6 +115,15 @@ def test_a_hostname_is_never_treated_as_local(fake_store):
                                 base_url="http://my-nas.lan:8080")
 
 
+@pytest.mark.parametrize("url", ["http://localhost:11434", "http://192.168.1.50:5566"])
+def test_a_codex_profile_never_accepts_plain_http(url):
+    # Local http is an API-profile feature; the Codex bridge speaks HTTPS only.
+    with pytest.raises(profiles.ValidationError, match="Codex"):
+        profiles._validate_base_url(url, "codex")
+    profiles._validate_base_url(url, "api")
+    profiles._validate_base_url("https://my-gateway.example.com/v1", "codex")
+
+
 def test_create_api_profile_accepts_https_base_url(fake_store):
     p = profiles.create_profile(
         name="Team Gateway", kind="api", credential="sk-ant-12345678",

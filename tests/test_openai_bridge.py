@@ -335,6 +335,16 @@ def test_run_uses_custom_base_url_override_for_api_key_mode(monkeypatch):
     assert conn.requests[0]["path"] == "/v1/responses"
 
 
+def test_run_refuses_a_plain_http_base_url(monkeypatch):
+    # A hand-edited config could carry one past profiles.py; it must not be
+    # silently dialled with TLS on the wrong port, nor sent in the clear.
+    _install_fake_connection(monkeypatch, FakeHTTPResponse(200, {}, b""))
+    profile = _subscription_profile(auth_mode="api_key", base_url="http://127.0.0.1:8000/v1")
+    cred = encode(StoredOpenAICredential(access_token="sk-a", refresh_token=None, account_id=None, id_token=None))
+    with pytest.raises(OpenAIBridgeError, match="https://"):
+        run(profile, cred, json.dumps({"messages": []}).encode())
+
+
 def test_run_translates_a_full_sse_stream_to_anthropic_shaped_chunks(monkeypatch):
     events = [
         {"type": "response.created", "response": {"model": "gpt-5.6-terra"}},

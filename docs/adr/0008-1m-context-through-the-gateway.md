@@ -79,6 +79,11 @@ the daemon relays to `api.anthropic.com` with the user's own credential, so the
 Code's caution is correct in general and wrong for this particular gateway.
 
 `Settings.context_1m` — `auto` (default) | `client_default` | `prefer_200k`.
+
+> **Amended 2026-09-23:** ADR 0009 added a fourth value, `force_1m`, and it is now the default.
+> A pooled session is overwhelmingly on Claude accounts, where 200K only means compacting
+> several times as often. `auto` remains available as the cautious choice for pools that route
+> much of their traffic to backends smaller than 1M.
 `auto` sets it only when **every** profile that could serve the session is
 Anthropic-backed:
 

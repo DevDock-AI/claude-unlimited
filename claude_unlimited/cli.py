@@ -368,13 +368,14 @@ def _prompt_profile_choice(profiles: list):
 # These MUST be the same ids Claude Code uses as each tier's native default,
 # or our override lands as an EXTRA picker entry beside the native one instead
 # of replacing it (v2.1.263 showed both a relabelled Fable and a native "Fable
-# 5.1"). Read out of the 2.1.263 binary's model table: fable->claude-fable-5-1,
-# opus->claude-opus-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5. This
+# 5.1"). Read out of the binary's model table (2.1.280, where the opus tier
+# moved from claude-opus-5 to claude-opus-5-5): fable->claude-fable-5-1,
+# opus->claude-opus-5-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5. This
 # is upstream-coupled — see the "Claude Code upstream watch" note; a Claude
 # Code release that moves a tier default can reintroduce the duplicate.
 _MODEL_TIER_IDS = {
     "FABLE": "claude-fable-5-1",
-    "OPUS": "claude-opus-5",
+    "OPUS": "claude-opus-5-5",
     "SONNET": "claude-sonnet-5",
     "HAIKU": "claude-haiku-4-5",
 }
@@ -417,7 +418,7 @@ def _tier_live_label(live: dict, tier_id: str, family: str):
 # OpenAI, so name the real backing model outright.
 _CODEX_MODEL_LABELS = {
     "FABLE": ("Fable 5.1 | GPT-6 Astra", "Served by Codex · reasoning: high"),
-    "OPUS": ("Opus 5 | GPT-5.6 Terra", "Served by Codex · reasoning: high"),
+    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "Served by Codex · reasoning: high"),
     "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Served by Codex · reasoning: medium"),
     "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Served by Codex · reasoning: low"),
 }
@@ -429,7 +430,7 @@ _CODEX_MODEL_LABELS = {
 # picked; a provider-neutral tier word would name no model at all.
 _MIXED_MODEL_LABELS = {
     "FABLE": ("Fable 5.1 | GPT-6 Astra", "Whichever account is active · Codex reasoning: high"),
-    "OPUS": ("Opus 5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: high"),
+    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: high"),
     "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: medium"),
     "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Whichever account is active · Codex reasoning: low"),
 }
@@ -956,7 +957,7 @@ def _apply_one_million_context(pool, enabled_profiles, forced_profile) -> None:
     """Decide and apply the 1M-context policy for this launch, and say what it
     decided. Only ever ADDS the variable: the user's own environment wins, and
     a refusal is explained rather than silent."""
-    mode = getattr(getattr(pool, "settings", None), "context_1m", "auto")
+    mode = getattr(getattr(pool, "settings", None), "context_1m", "force_1m")
     version = _installed_client_version() if mode == "auto" else None
     should_set, reason = _one_million_decision(
         mode, enabled_profiles, forced_profile, os.environ, version)
