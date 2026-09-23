@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import activity, connectors, net_scope, oauth_credential, secret_store
+from .openai_models import upgrade_reasoning_effort
 from . import config as config_module
 from .config import CONFIG_LOCK, Profile, load_pool, save_pool
 
@@ -243,6 +244,7 @@ def create_profile(
     credential_already_encoded: bool = False,
 ) -> Profile:
     _validate(name, kind, base_url, auth_mode, tag_color)
+    codex_reasoning_effort = upgrade_reasoning_effort(codex_reasoning_effort)
     # Same reachable-from-HTTP surface as update_profile: POST /api/profiles
     # hands this a decoded JSON body. `priority` is excluded because None is
     # legitimate here and means "compute the next free slot" just below.
@@ -422,6 +424,10 @@ def update_profile(profile_id: str, **changes) -> Profile:
     unknown = set(changes) - allowed
     if unknown:
         raise ValidationError(f"Cannot change fields: {sorted(unknown)}")
+    if "codex_reasoning_effort" in changes:
+        # A retired value from an older dashboard or export means its
+        # current equivalent (issue #8), not a validation error.
+        changes["codex_reasoning_effort"] = upgrade_reasoning_effort(changes["codex_reasoning_effort"])
     _validate_field_types(**changes)
 
     with CONFIG_LOCK:

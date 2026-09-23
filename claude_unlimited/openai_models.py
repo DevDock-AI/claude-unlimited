@@ -43,12 +43,23 @@ from .model_catalogue import Catalogue, base_id
 # current lineup rejects it outright — "Unsupported value: 'minimal' is not
 # supported with the 'gpt-5.6-sol' model. Supported values are: 'none', 'low',
 # 'medium', 'high', 'xhigh', and 'max'." — so offering it only ever produced a
-# failed request.
-VALID_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
+# failed request. "ultra" went the same way (issue #8): "Invalid value:
+# 'ultra'. Supported values are: 'none', 'minimal', 'low', 'medium', 'high',
+# 'xhigh', and 'max'."
+VALID_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+# Values a config saved by an older build may still hold, and what they mean
+# now. Mapped on load and on save, so an old config neither fails validation
+# nor sends a value the backend refuses.
+_RETIRED_REASONING_EFFORTS = {"ultra": "max", "minimal": "low"}
+
+
+def upgrade_reasoning_effort(effort):
+    """A retired effort's current equivalent; anything else unchanged."""
+    return _RETIRED_REASONING_EFFORTS.get(effort, effort)
 
 # Claude-side reasoning effort — the `output_config.effort` knob on the Messages
 # API (GA, no beta header). A DIFFERENT set from the Codex side above: Claude
-# has no "none"/"ultra". A parity row's claude_effort, when set, is injected
+# has no "none". A parity row's claude_effort, when set, is injected
 # onto oauth/api-served /v1/messages requests for that model (see proxy.py);
 # unset = passthrough (Claude Code's own choice), which is the zero-risk default.
 CLAUDE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")

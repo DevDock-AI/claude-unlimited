@@ -81,7 +81,7 @@ class Profile:
     claude_config_dir: Optional[str] = None  # oauth kind only: an isolated CLAUDE_CONFIG_DIR this Profile was authenticated under via `claude-unlimited add-account`, so it can be re-authenticated without touching another account's session. None for a Profile added by paste or "Import current login".
     codex_home: Optional[str] = None  # codex kind only: an isolated CODEX_HOME holding this Profile's auth.json, the counterpart of claude_config_dir. Every Codex invocation is scoped to it, so it never touches another Codex login on this machine.
     codex_model: Optional[str] = None  # codex kind only: overrides openai_models.py's mapping; None uses the automatic Claude-model -> Codex-model mapping.
-    codex_reasoning_effort: Optional[str] = None  # codex kind only: overrides the reasoning-effort tier the mapping would pick (low|medium|high|xhigh|max|ultra); None uses the mapping's per-model default.
+    codex_reasoning_effort: Optional[str] = None  # codex kind only: overrides the reasoning-effort tier the mapping would pick (none|low|medium|high|xhigh|max); None uses the mapping's per-model default.
     # Route EVERY subagent (any Claude Code branch carrying an agent-id header)
     # to this Profile, whatever rotation would otherwise pick. The main agent is
     # untouched — that asymmetry is the feature: a Claude orchestrator driving
@@ -270,7 +270,7 @@ def load_pool() -> Pool:
             claude_config_dir=p.get("claude_config_dir"),
             codex_home=p.get("codex_home"),
             codex_model=p.get("codex_model"),
-            codex_reasoning_effort=p.get("codex_reasoning_effort"),
+            codex_reasoning_effort=upgrade_reasoning_effort(p.get("codex_reasoning_effort")),
             forced_for_subagents=bool(p.get("forced_for_subagents", False)),
             leave_on_fable_limit=p.get("leave_on_fable_limit") is True,
         )
@@ -289,7 +289,7 @@ def load_pool() -> Pool:
         notify_needs_attention=bool(settings_data.get("notify_needs_attention", True)),
         distribute_sessions_default=bool(settings_data.get("distribute_sessions_default", False)),
         keep_usage_fresh=bool(settings_data.get("keep_usage_fresh", True)),
-        model_parity=settings_data.get("model_parity") or {},
+        model_parity=_upgrade_parity_efforts(settings_data.get("model_parity") or {}),
         # Unknown values fall back to off: a hand-edited or newer config must
         # never switch on something that changes what the model is sent.
         eco_tier=settings_data.get("eco_tier") if settings_data.get("eco_tier") in ECO_TIERS else "off",
@@ -379,10 +379,26 @@ _SETTINGS_FIELDS = {
 }
 
 
+def upgrade_reasoning_effort(effort):
+    from .openai_models import upgrade_reasoning_effort as upgrade
+    return upgrade(effort)
+
+
+def _upgrade_parity_efforts(raw):
+    """A parity row saved with a retired Codex effort ("ultra", issue #8) is
+    read as its current equivalent — never sent as-is, and never a reason
+    the Settings page can no longer save."""
+    rows = raw.values() if isinstance(raw, dict) else raw if isinstance(raw, list) else ()
+    for row in rows:
+        if isinstance(row, dict) and row.get("effort") is not None:
+            row["effort"] = upgrade_reasoning_effort(row["effort"])
+    return raw
+
+
 def _validated_model_row_fields(where, row, entry):
     """Validate the model/effort/claude_effort of one parity row into `entry`.
     Shared by the dict (legacy) and list (current) shapes."""
-    from .openai_models import VALID_REASONING_EFFORTS, CLAUDE_REASONING_EFFORTS
+    from .openai_models import VALID_REASONING_EFFORTS, CLAUDE_REASONING_EFFORTS, upgrade_reasoning_effort
 
     model = row.get("model")
     if model is not None:
@@ -392,7 +408,7 @@ def _validated_model_row_fields(where, row, entry):
         if not isinstance(model, str) or not model.strip() or len(model) > 128:
             raise ValueError(f"{where}.model must be a short non-empty string")
         entry["model"] = model.strip()
-    effort = row.get("effort")
+    effort = upgrade_reasoning_effort(row.get("effort"))
     if effort is not None:
         if effort not in VALID_REASONING_EFFORTS:
             raise ValueError(f"{where}.effort must be one of {list(VALID_REASONING_EFFORTS)}")

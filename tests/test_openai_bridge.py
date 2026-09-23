@@ -95,9 +95,11 @@ def _sse_body(events: list[dict]) -> bytes:
 def reset_backoff_state():
     bridge_module._refresh_not_before.clear()
     bridge_module._MODEL_SUBSTITUTIONS.clear()
+    bridge_module._EFFORT_SUBSTITUTIONS.clear()
     yield
     bridge_module._refresh_not_before.clear()
     bridge_module._MODEL_SUBSTITUTIONS.clear()
+    bridge_module._EFFORT_SUBSTITUTIONS.clear()
 
 
 def _install_fake_connections(monkeypatch, responses: list[FakeHTTPResponse]) -> list:
@@ -813,3 +815,50 @@ def test_a_successful_refresh_releases_the_slot(monkeypatch):
     # spent one.
     assert result.refresh_token == "rotated"
     assert "p-ok" not in bridge_module._refresh_in_progress
+
+
+
+# ---- a reasoning effort the model does not take (issue #8) -------------------
+
+_ASTRA_MINIMAL = ("Unsupported value: 'minimal' is not supported with the 'gpt-6-astra' model. "
+                  "Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.")
+
+
+def _sent(conn):
+    body = json.loads(conn.requests[0]["body"])
+    return body["model"], body["reasoning"]["effort"]
+
+
+def test_a_refused_effort_is_retried_on_the_same_model_with_the_nearest_supported_one(monkeypatch):
+    err = json.dumps({"error": {"message": _ASTRA_MINIMAL, "param": "reasoning.effort"}})
+    conns = _install_fake_connections(monkeypatch, [FakeHTTPResponse(400, {}, err.encode()), _ok(), _ok()])
+    profile = _subscription_profile(codex_model="gpt-6-astra", codex_reasoning_effort="minimal")
+    body = json.dumps({"model": "claude-sonnet-5", "messages": []}).encode()
+
+    list(run(profile, _cred(), body).body_chunks)
+    assert [_sent(c) for c in conns[:2]] == [("gpt-6-astra", "minimal"), ("gpt-6-astra", "low")]
+
+    list(run(profile, _cred(), body).body_chunks)       # learned: no second refusal
+    assert _sent(conns[2]) == ("gpt-6-astra", "low")
+
+
+def test_a_retired_effort_saved_by_an_old_build_is_sent_as_its_equivalent():
+    from claude_unlimited import openai_models
+    assert "ultra" not in openai_models.VALID_REASONING_EFFORTS
+    assert openai_models.upgrade_reasoning_effort("ultra") == "max"
+    assert openai_models.upgrade_reasoning_effort("high") == "high"
+
+
+@pytest.mark.parametrize("effort,supported,expected", [
+    ("ultra", "'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'", "max"),
+    ("minimal", "'low', 'medium', 'high', 'xhigh', and 'max'", "low"),
+    ("max", "'low', 'medium', and 'high'", "high"),
+])
+def test_effort_replacement_picks_the_nearest(effort, supported, expected):
+    text = f"Invalid value: '{effort}'. Supported values are: {supported}. param reasoning.effort"
+    assert bridge_module._effort_replacement(400, text, effort) == expected
+
+
+def test_other_errors_are_not_effort_refusals():
+    assert bridge_module._effort_replacement(400, "model gpt-x not found", "high") is None
+    assert bridge_module._effort_replacement(429, _ASTRA_MINIMAL + " reasoning.effort", "minimal") is None

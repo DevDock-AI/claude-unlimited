@@ -66,3 +66,18 @@ def test_save_pool_writes_atomically_no_leftover_tmp_file(tmp_path, monkeypatch)
     assert not (tmp_path / "config.json.tmp").exists()
     data = json.loads(cfg_file.read_text())
     assert data["profiles"][0]["id"] == "a"
+
+
+def test_a_retired_codex_effort_in_a_saved_config_loads_as_its_equivalent(tmp_path, monkeypatch):
+    # Issue #8: "ultra" was offered once and the backend now refuses it. A
+    # config saved back then must neither send it nor fail to save again.
+    monkeypatch.setattr("claude_unlimited.config.APP_DIR", tmp_path)
+    monkeypatch.setattr("claude_unlimited.config.CONFIG_FILE", tmp_path / "config.json")
+    (tmp_path / "config.json").write_text(json.dumps({
+        "profiles": [{"id": "c", "name": "C", "kind": "codex", "codex_reasoning_effort": "ultra"}],
+        "settings": {"model_parity": [{"claude_model": "claude-opus-5-5", "model": "gpt-5.6-terra",
+                                       "effort": "ultra"}]},
+    }))
+    pool = load_pool()
+    assert pool.profiles[0].codex_reasoning_effort == "max"
+    assert pool.settings.model_parity[0]["effort"] == "max"

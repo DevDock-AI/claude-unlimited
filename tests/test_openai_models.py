@@ -52,9 +52,9 @@ def test_per_profile_model_override_wins_outright():
 
 
 def test_per_profile_reasoning_effort_override_alone_keeps_the_mapped_model():
-    target = map_model("claude-fable-5", override_reasoning_effort="ultra")
+    target = map_model("claude-fable-5", override_reasoning_effort="xhigh")
     assert target.model == "gpt-5.6-sol"
-    assert target.reasoning_effort == "ultra"
+    assert target.reasoning_effort == "xhigh"
 
 
 def test_both_overrides_together():

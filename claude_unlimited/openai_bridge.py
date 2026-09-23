@@ -161,6 +161,37 @@ _MODEL_REJECTION_PATTERN = re.compile(
 )
 
 
+# Efforts from least to most reasoning, for picking the nearest one a model
+# does accept. Wider than VALID_REASONING_EFFORTS on purpose: it must place
+# whatever a backend lists as supported, not just what the dashboard offers.
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_SUPPORTED_EFFORTS_PATTERN = re.compile(r"supported values are:?([^.]*)", re.IGNORECASE)
+
+# (host, model, refused effort) -> the effort that model accepts instead.
+# Support differs per model (issue #8: gpt-6-astra refuses "minimal" that the
+# generic list allows), so it is learned from the refusal, not hardcoded.
+_EFFORT_SUBSTITUTIONS: dict[tuple, str] = {}
+
+
+def _effort_replacement(status: int, body_text: str, effort: Optional[str]) -> Optional[str]:
+    """The nearest effort the backend says it supports, when this error is a
+    refused reasoning.effort; None for any other error. Nearest means the
+    strongest one not above the refused value, else the weakest above it."""
+    if status != 400 or not effort or "reasoning.effort" not in body_text:
+        return None
+    found = _SUPPORTED_EFFORTS_PATTERN.search(body_text)
+    if not found:
+        return None
+    supported = [e for e in re.findall(r"'([a-z]+)'", found.group(1)) if e in _EFFORT_ORDER]
+    if not supported or effort in supported:
+        return None
+    rank = _EFFORT_ORDER.index(effort) if effort in _EFFORT_ORDER else len(_EFFORT_ORDER)
+    below = [e for e in supported if _EFFORT_ORDER.index(e) <= rank]
+    if below:
+        return max(below, key=_EFFORT_ORDER.index)
+    return min(supported, key=_EFFORT_ORDER.index)
+
+
 def _looks_like_model_rejection(status: int, body_text: str) -> bool:
     """Whether an error response means "not this model" rather than "not this
     request". Only these are worth retrying on a different model."""
@@ -191,6 +222,7 @@ def forget_model_substitutions() -> None:
     failure the setting exists to avoid."""
     with _MODEL_SUBSTITUTION_LOCK:
         _MODEL_SUBSTITUTIONS.clear()
+        _EFFORT_SUBSTITUTIONS.clear()
 
 
 def _substitute_model(model: str) -> str:
@@ -434,11 +466,15 @@ def run(profile: Profile, stored_credential: str, body: bytes,
     conn = None
     served_model = None
     attempts = [(m, replay_reasoning) for m in candidates]
+    effort_fixed: set = set()
     index = 0
     while index < len(attempts):
         model, replay_reasoning = attempts[index]
         index += 1
-        attempt_target = replace(target, model=model)
+        with _MODEL_SUBSTITUTION_LOCK:
+            effort = _EFFORT_SUBSTITUTIONS.get((parts.hostname, model, target.reasoning_effort),
+                                               target.reasoning_effort)
+        attempt_target = replace(target, model=model, reasoning_effort=effort)
         lookup = ((lambda anchors, m=model: codex_state.reasoning_for(profile.id, m, anchors))
                   if replay_reasoning else None)
         payload = json.dumps(fmt.to_provider(
@@ -467,6 +503,19 @@ def run(profile: Profile, stored_credential: str, body: bytes,
         status = resp.status
         conn.close()
         text = raw.decode("utf-8", errors="replace")
+
+        # A reasoning effort this model does not take (issue #8). Checked
+        # first: the wording ("… is not supported with the 'x' model") also
+        # reads as a model rejection, and walking to another model would
+        # change the model to fix the effort. Retried once on the same model
+        # with the nearest supported effort, and remembered for next time.
+        replacement = _effort_replacement(status, text, effort)
+        if replacement is not None and model not in effort_fixed:
+            effort_fixed.add(model)
+            with _MODEL_SUBSTITUTION_LOCK:
+                _EFFORT_SUBSTITUTIONS[(parts.hostname, model, target.reasoning_effort)] = replacement
+            attempts.insert(index, (model, replay_reasoning))
+            continue
 
         # Replayed reasoning the backend will not accept (expired, or from a
         # rotated key) must never cost the request: retry once without it.
