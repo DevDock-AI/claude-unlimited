@@ -23,6 +23,7 @@ from typing import Optional
 
 from .observation import (
     AuthInvalid,
+    BudgetUnavailable,
     Observation,
     ProviderUnavailable,
     QuotaExhausted,
@@ -92,6 +93,7 @@ class ProfileRuntime:
     # 0 by a successful UsageSnapshot, or by an observation that does carry a
     # retry_after_seconds.
     consecutive_unretryable_failures: int = 0
+    budget_unavailable: bool = False
 
 
 @dataclass
@@ -321,7 +323,7 @@ def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> Profil
                          last_usage_percent_7d=observation.percent_7d, resets_at_7d=observation.resets_at_7d,
                          window_label=observation.window_label, window_label_7d=observation.window_label_7d,
                          model_usage=model_usage,
-                         consecutive_unretryable_failures=0)  # a success: this Profile works again
+                         budget_unavailable=False, consecutive_unretryable_failures=0)  # a success: this Profile works again
 
     if isinstance(observation, QuotaExhausted):
         if _credits_can_serve(p):
@@ -340,6 +342,13 @@ def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> Profil
         cooldown_until = _cooldown_deadline(now, observation.retry_after_seconds, streak)
         return _replace(p, state=ProfileState.COOLDOWN, cooldown_until=cooldown_until,
                          consecutive_unretryable_failures=streak)
+
+    if isinstance(observation, BudgetUnavailable):
+        from datetime import timedelta
+        # Funding requires provider-side action. Do not retry on every client
+        # request; permit one new check after a bounded hour.
+        return _replace(p, state=ProfileState.COOLDOWN, budget_unavailable=True,
+                        cooldown_until=now + timedelta(hours=1))
 
     if isinstance(observation, ProviderUnavailable):
         # Availability failover is a separate policy, not quota Rotation.
@@ -407,7 +416,7 @@ def recover_expired_cooldowns(pool: PoolSnapshot, now: datetime) -> PoolSnapshot
     new_profiles = []
     for p in pool.profiles:
         if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None and now >= p.cooldown_until:
-            new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, cooldown_until=None))
+            new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, cooldown_until=None, budget_unavailable=False))
         elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING) and p.resets_at is not None and now >= p.resets_at:
             new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, resets_at=None, last_usage_percent=None))
         else:

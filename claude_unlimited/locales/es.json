@@ -484,6 +484,8 @@
   "status.healthy": "correcto",
   "status.almost_exhausted": "casi agotado",
   "status.exhausted": "agotado",
+  "status.payment_required": "Pago requerido",
+  "status.payment_required_note": "El proveedor devolvió HTTP 402; el reintento automático está pausado durante una hora.",
   "status.cooldown": "en espera",
   "status.needs_reauth": "requiere reautenticación",
   "status.disabled": "desactivado",

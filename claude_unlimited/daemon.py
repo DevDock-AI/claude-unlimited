@@ -358,6 +358,7 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         # folded in here: the card shows what this Profile has set.
         "leave_on_fable_limit": getattr(p, "leave_on_fable_limit", False),
         "state": state_value,
+        "budget_unavailable": bool(runtime is not None and runtime.budget_unavailable),
         "status_word": _STATUS_WORDS.get(state_value, state_value),
         "usage_5h_percent": runtime.last_usage_percent if runtime is not None else None,
         "usage_5h_resets_at": runtime.resets_at.isoformat() if runtime is not None and runtime.resets_at else None,

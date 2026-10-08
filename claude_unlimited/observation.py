@@ -66,6 +66,12 @@ class ProviderUnavailable:
 
 
 @dataclass(frozen=True)
+class BudgetUnavailable:
+    """HTTP 402: provider requires funding, not a quota reset or bad login."""
+    pass
+
+
+@dataclass(frozen=True)
 class AuthInvalid:
     pass
 
@@ -75,7 +81,7 @@ class Unknown:
     status_code: int
 
 
-Observation = UsageSnapshot | QuotaExhausted | ShortRateLimit | ProviderUnavailable | AuthInvalid | Unknown
+Observation = UsageSnapshot | QuotaExhausted | ShortRateLimit | ProviderUnavailable | BudgetUnavailable | AuthInvalid | Unknown
 
 
 # The unified rate-limit headers Anthropic returns, and their wire format:
@@ -104,6 +110,9 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
     """headers must already have lowercased keys and be restricted to
     ALLOWED_HEADERS by the caller (the Proxy module); this function does not
     filter them."""
+
+    if status_code == 402:
+        return BudgetUnavailable()
 
     if status_code == 401:
         return AuthInvalid()

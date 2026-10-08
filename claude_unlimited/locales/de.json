@@ -484,6 +484,8 @@
   "status.healthy": "in Ordnung",
   "status.almost_exhausted": "fast erschöpft",
   "status.exhausted": "erschöpft",
+  "status.payment_required": "Zahlung erforderlich",
+  "status.payment_required_note": "Der Anbieter hat HTTP 402 zurückgegeben; automatische Wiederholungen sind für eine Stunde pausiert.",
   "status.cooldown": "Abkühlphase",
   "status.needs_reauth": "Neuanmeldung nötig",
   "status.disabled": "deaktiviert",

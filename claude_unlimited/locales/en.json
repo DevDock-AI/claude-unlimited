@@ -484,6 +484,8 @@
   "status.healthy": "healthy",
   "status.almost_exhausted": "almost exhausted",
   "status.exhausted": "exhausted",
+  "status.payment_required": "Payment required",
+  "status.payment_required_note": "Provider returned HTTP 402; automatic retry is paused for one hour.",
   "status.cooldown": "cooldown",
   "status.needs_reauth": "needs re-auth",
   "status.disabled": "disabled",

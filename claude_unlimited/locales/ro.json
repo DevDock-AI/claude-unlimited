@@ -484,6 +484,8 @@
   "status.healthy": "în regulă",
   "status.almost_exhausted": "aproape epuizat",
   "status.exhausted": "epuizat",
+  "status.payment_required": "Plată necesară",
+  "status.payment_required_note": "Furnizorul a returnat HTTP 402; reîncercarea automată este suspendată pentru o oră.",
   "status.cooldown": "în așteptare",
   "status.needs_reauth": "necesită reautentificare",
   "status.disabled": "dezactivat",

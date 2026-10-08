@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 from . import activity, eco, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
-from .observation import AuthInvalid, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
+from .observation import AuthInvalid, BudgetUnavailable, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
 from .proxy import (REQUEST_TOO_LARGE_STATUS, RequestTooLarge, build_upstream_request, check_request_size,
                     filter_response_headers, request_model, rewrite_model)
 from .router import (
@@ -510,6 +510,7 @@ def _restorable_state_fields(persisted: Optional[dict], now: datetime) -> dict:
         if deadline is not None and deadline > now:
             fields["state"] = ProfileState.COOLDOWN
             fields["cooldown_until"] = deadline
+            fields["budget_unavailable"] = persisted.get("budget_unavailable") is True
     return fields
 
 
@@ -1075,6 +1076,7 @@ class Gateway:
                     # exists to catch, found here by inspection rather than by
                     # a second live incident.
                     consecutive_unretryable_failures=rt.consecutive_unretryable_failures,
+                    budget_unavailable=rt.budget_unavailable,
                     # Same rebuild trap as model_usage above: credits are
                     # observed, not configured, so leaving them out would
                     # blank the balance on the next Dashboard poll.
@@ -1243,8 +1245,21 @@ class Gateway:
                     activity.record("error", "Pinned Profile unavailable — request rejected",
                                      meta=f"{held_to}: {decision.reason}, "
                                           f"client={_client_label(headers)}")
+                    budget_blocked = self._runtime.get(held_to)
+                    if budget_blocked is not None and budget_blocked.budget_unavailable:
+                        return GatewayResult(status=402, headers={}, body_chunks=None, profile_id=held_to,
+                                             error="provider_budget_unavailable",
+                                             error_detail="Pinned provider requires funding (HTTP 402).")
                     return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
                                           error=decision.reason)
+                budget_blocked = [rt for rt in snapshot.profiles
+                                  if rt.budget_unavailable and rt.state == ProfileState.COOLDOWN
+                                  and (rt.automatic or rt.profile_id == snapshot.current_profile_id)
+                                  and fits(rt, fit)]
+                if budget_blocked:
+                    return GatewayResult(status=402, headers={}, body_chunks=None, profile_id=None,
+                                         error="provider_budget_unavailable",
+                                         error_detail="Configured fallback provider requires funding (HTTP 402); no eligible Profile is available.")
                 exhausted, resets_at = _capacity_exhaustion(snapshot, pool)
                 # Said ONCE per outage, not once per request: a client that
                 # retries in a loop used to write an Activity line and raise a
@@ -1499,6 +1514,15 @@ class Gateway:
                 elif not near_threshold:
                     self._warned_approaching.discard(profile.id)
 
+            if isinstance(observation, BudgetUnavailable):
+                activity.record("error", f"{profile.name} — provider requires funding (HTTP 402)",
+                                meta="billing cooldown for one hour")
+                if forced_profile_id is None:
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                    resp.connection.close()
+                    continue
+
             if isinstance(observation, QuotaExhausted):
                 if forced_profile_id is not None:
                     # No other Profile to fall back to when pinned — relay
@@ -1561,6 +1585,18 @@ class Gateway:
             return GatewayResult(status=resp.status, headers=resp.headers, body_chunks=body_chunks,
                                   profile_id=profile.id)
 
+        with self._lock:
+            budget_blocked = any(
+                rt.budget_unavailable and rt.state == ProfileState.COOLDOWN
+                and (rt.automatic or rt.profile_id == self._current_profile_id)
+                and fits(rt, fit)
+                for rt in self._runtime.values()
+                if pool.get(rt.profile_id) is not None and pool.get(rt.profile_id).enabled
+            )
+        if budget_blocked:
+            return GatewayResult(status=402, headers={}, body_chunks=None, profile_id=None,
+                                 error="provider_budget_unavailable",
+                                 error_detail="Configured fallback provider requires funding (HTTP 402); no eligible Profile is available.")
         activity.record("error", "Rotation attempts exhausted without a usable Profile")
         notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
                                           "Rotation attempts exhausted — no usable Profile was found.", pool.settings)
@@ -2275,6 +2311,8 @@ class Gateway:
         if not profile.enabled:
             return RoutingDecision(profile_id=None, reason="forced_profile_disabled")
         rt = self._runtime.get(forced_profile_id)
+        if rt is not None and rt.budget_unavailable:
+            return RoutingDecision(profile_id=None, reason="provider_budget_unavailable")
         if rt is not None and rt.state == ProfileState.AUTH_INVALID:
             return RoutingDecision(profile_id=None, reason="forced_profile_needs_reauth")
         if rt is not None and not fits(rt, fit):
@@ -2388,6 +2426,7 @@ class Gateway:
                     # for which states survive and which are re-derived.
                     "state": rt.state.value if hasattr(rt.state, "value") else str(rt.state),
                     "cooldown_until": rt.cooldown_until.isoformat() if rt.cooldown_until else None,
+                    "budget_unavailable": rt.budget_unavailable,
                     # See _restore_refresh_backoff: keeps a rate-limited account
                     # from re-poking the token endpoint the moment the daemon
                     # restarts.

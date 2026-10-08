@@ -1356,6 +1356,12 @@ function statusLabel(statusWord) {
   return key ? t(key) : statusWord;
 }
 
+// Provider funding failures have a different recovery path from quota resets.
+function paymentRequiredBadge(p) {
+  if (!p.enabled || !p.budget_unavailable) return '';
+  return `<span class="p-status-word" title="${esc(t('status.payment_required_note'))}" style="color:var(--bad);background:var(--bad-soft)">${esc(t('status.payment_required'))}</span>`;
+}
+
 // Percentage points below switch_threshold at which a still-healthy bar
 // starts warning, ahead of the rotation/exhaustion states that already have
 // their own colors via STATUS_COLORS.
@@ -1602,7 +1608,7 @@ function renderProfileCard(p) {
           <span class="mono-num">${p.priority}</span>
         </span>
         ${p.enabled
-          ? `<span class="p-status-word" style="color:${statusColors.color};background:${statusColors.bg}">${esc(statusLabel(p.status_word))}</span>`
+          ? paymentRequiredBadge(p) || `<span class="p-status-word" style="color:${statusColors.color};background:${statusColors.bg}">${esc(statusLabel(p.status_word))}</span>`
           : `<span class="p-disabled-badge">${esc(t('profile.disabled'))}</span>`}
       </div>
       <div class="p-bars">${usageBlock}</div>
@@ -1735,7 +1741,7 @@ function renderProfileTableRow(p) {
       <div class="row-name-cell">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
-          <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}</div>
+          <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}${paymentRequiredBadge(p)}</div>
           <div class="p-kind">${kindLabel}</div>${modelUsageChips(p)}
         </div>
       </div>
@@ -2105,8 +2111,9 @@ function openProfileDetailModal(profileId) {
   document.getElementById('pd_name').firstChild.textContent = p.name + ' ';
   document.getElementById('pd_name_input').value = p.name;
   const statusTag = document.getElementById('pd_status_tag');
-  if (p.enabled && p.status_word !== 'healthy') {
-    statusTag.textContent = statusLabel(p.status_word);
+  if (p.enabled && (p.budget_unavailable || p.status_word !== 'healthy')) {
+    statusTag.textContent = p.budget_unavailable ? t('status.payment_required') : statusLabel(p.status_word);
+    statusTag.title = p.budget_unavailable ? t('status.payment_required_note') : '';
     statusTag.style.display = '';
   } else {
     statusTag.style.display = 'none';
