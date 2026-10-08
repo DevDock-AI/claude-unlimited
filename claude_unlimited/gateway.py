@@ -34,7 +34,7 @@ from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, BudgetUnavailable, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
 from .proxy import (REQUEST_TOO_LARGE_STATUS, RequestTooLarge, build_upstream_request, check_request_size,
-                    filter_response_headers, request_model, rewrite_model)
+                    filter_response_headers, request_model, rewrite_model, retry_without_rejected_thinking)
 from .router import (
     PoolSnapshot,
     ProfileRuntime,
@@ -1143,6 +1143,7 @@ class Gateway:
         avoiding."""
         now = datetime.now(timezone.utc)
         attempted: set[str] = set()
+        thinking_repair_attempted = False
         previous_profile_id = self._current_profile_id
         is_subagent = project_attribution.is_subagent(headers)
         # Which conversation branch is this? None for anything that isn't
@@ -1453,6 +1454,55 @@ class Gateway:
                 raise
 
             observation = classify(resp.status, filter_response_headers(resp.headers), now)
+
+            signature_target = urlparse(upstream_req.url) if resp.status == 400 else None
+            if (resp.status == 400 and not thinking_repair_attempted
+                    and upstream_req.method == "POST" and signature_target.scheme == "https"
+                    and signature_target.hostname == "api.anthropic.com"
+                    and signature_target.path.rstrip("/") == "/v1/messages"):
+                # Only a provider-confirmed historical signature rejection can
+                # rewrite signed history. Success streams remain untouched and
+                # a repair never mutates the caller's stored conversation.
+                try:
+                    signature_error, resp = _peek_error_body(resp)
+                except (OSError, http.client.HTTPException):
+                    # A partial error body cannot be relayed as a complete400.
+                    # Release the slot and use the existing upstream-failure
+                    # policy before any response bytes reach the caller.
+                    resp.connection.close()
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                        self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                    if forced_profile_id is not None:
+                        activity.record("error", f"{profile.name} — could not reach upstream",
+                                        meta="pinned profile, error body disconnected")
+                        return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                                             error="upstream_unreachable")
+                    activity.record("error", f"{profile.name} — could not reach upstream",
+                                    meta="error body disconnected, rotating to next eligible profile")
+                    continue
+                repaired_req = retry_without_rejected_thinking(upstream_req, resp.status, signature_error)
+                if repaired_req is not None:
+                    thinking_repair_attempted = True
+                    try:
+                        repaired_resp = self._transport(repaired_req)
+                    except (OSError, http.client.HTTPException):
+                        # The peek completed and restored the original body.
+                        # Preserve that actual400 if the one repair send fails.
+                        pass
+                    else:
+                        resp.connection.close()
+                        resp = repaired_resp
+                        # Carry only repaired history, not the first profile's
+                        # injected account UUID/effort. Subsequent profiles
+                        # rebuild their own request metadata and auth headers.
+                        repaired_history = json.loads(repaired_req.body)["messages"]
+                        canonical_body = json.loads(eco_body)
+                        canonical_body["messages"] = repaired_history
+                        eco_body = json.dumps(canonical_body).encode("utf-8")
+                        observation = classify(resp.status, filter_response_headers(resp.headers), now)
+                        activity.record("session", "Retried rejected historical thinking signature",
+                                        meta="one request-only repair; active tool turn preserved")
 
             if (profile.kind == "api" and profile.default_model
                     and isinstance(observation, Unknown) and observation.status_code in _MODEL_FALLBACK_STATUS_CODES):

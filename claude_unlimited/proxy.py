@@ -21,8 +21,10 @@ fails to re-serialize raises.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 from . import observation
 from .config import Profile
@@ -272,3 +274,106 @@ def rewrite_model(body: bytes, model: str) -> bytes:
 def filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
     lower = {k.lower(): v for k, v in headers.items()}
     return {k: lower[k] for k in RESPONSE_HEADER_ALLOWLIST if k in lower}
+
+
+def retry_without_rejected_thinking(
+    req: UpstreamRequest, status: int, error_body: bytes,
+) -> Optional[UpstreamRequest]:
+    """Build a request-only recovery after an exact Anthropic signature rejection.
+
+    Signatures are opaque; their length or encoding cannot identify their
+    producer. Never preemptively rewrite them. After Anthropic explicitly
+    rejects a historical block, omit thinking from completed turns only
+    (the documented optional history boundary). Active thinking and redacted
+    blocks must round-trip unchanged, including during tool-use turns.
+    Nothing is converted into visible text, and no saved history is edited.
+    The caller may send this ONCE, before relaying any response to the client;
+    it must not recursively apply recovery to a second rejection.
+    """
+    parts = urlsplit(req.url)
+    if (status != 400 or req.method.upper() != "POST"
+            or parts.scheme != "https" or parts.hostname != "api.anthropic.com"
+            or parts.path.rstrip("/") != "/v1/messages"
+            or len(error_body) > 65536):
+        return None
+    try:
+        error = json.loads(error_body)
+        parsed = json.loads(req.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(error, dict) or not isinstance(parsed, dict):
+        return None
+    detail = error.get("error")
+    if (error.get("type") != "error" or not isinstance(detail, dict)
+            or detail.get("type") != "invalid_request_error"):
+        return None
+    message = detail.get("message")
+    if not isinstance(message, str):
+        return None
+    # Accept only the concrete field-addressed error, never an arbitrary 400
+    # mentioning thinking/signatures or a tool/schema error with similar text.
+    match = re.fullmatch(
+        r"messages\.(\d{1,9})\.content\.(\d{1,9}): Invalid [`']?signature[`']? in [`']?thinking[`']? block\.?",
+        message,
+    )
+    if match is None:
+        return None
+    model = parsed.get("model")
+    messages = parsed.get("messages")
+    if (not isinstance(model, str) or not model.startswith("claude-")
+            or not isinstance(messages, list)):
+        return None
+    message_index, block_index = map(int, match.groups())
+    if message_index >= len(messages):
+        return None
+    target = messages[message_index]
+    if not isinstance(target, dict) or target.get("role") != "assistant":
+        return None
+    content = target.get("content")
+    if not isinstance(content, list) or block_index >= len(content):
+        return None
+    block = content[block_index]
+    if (not isinstance(block, dict) or block.get("type") != "thinking"
+            or not isinstance(block.get("signature"), str) or not block["signature"]):
+        return None
+    # A later user message without tool results closes the old assistant turn.
+    # Tool-result messages continue the same turn and do not permit omission.
+    def begins_new_turn(item):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            return False
+        value = item.get("content")
+        if isinstance(value, str):
+            return bool(value.strip())
+        return (isinstance(value, list) and bool(value)
+                and all(isinstance(b, dict) and b.get("type") != "tool_result" for b in value))
+
+    boundaries = [i for i, item in enumerate(messages) if begins_new_turn(item)]
+    if not boundaries or message_index >= boundaries[-1]:
+        return None
+    boundary = boundaries[-1]
+    # Removing the prefix could invalidate preserved thinking in the active
+    # turn. Refuse rather than alter that turn or break a signed tool loop.
+    for item in messages[boundary:]:
+        if isinstance(item, dict) and isinstance(item.get("content"), list):
+            if any(isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
+                   for b in item["content"]):
+                return None
+    for item in messages[:boundary]:
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        blocks = item.get("content")
+        if not isinstance(blocks, list):
+            continue
+        remaining = [b for b in blocks if not (isinstance(b, dict)
+                     and b.get("type") in ("thinking", "redacted_thinking"))]
+        if len(remaining) == len(blocks):
+            continue
+        # Do not invent a replacement message or drop a whole turn when a
+        # historical message consists entirely of thinking.
+        if not remaining:
+            return None
+        item["content"] = remaining
+    body = json.dumps(parsed).encode("utf-8")
+    headers = {k: v for k, v in req.headers.items() if k.lower() != "content-length"}
+    headers["Content-Length"] = str(len(body))
+    return UpstreamRequest(url=req.url, method=req.method, headers=headers, body=body)
