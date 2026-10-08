@@ -53,7 +53,7 @@ from .router import (
 from .upstream import UpstreamResponse
 from .upstream import send as real_send
 
-MAX_ROTATION_ATTEMPTS = 4  # bounded — never loop the whole pool forever on a bad run
+MAX_ROTATION_ATTEMPTS = 4  # minimum bound; larger configured pools get one pass
 
 # How long an idle branch keeps its account pin. A pin is only a routing
 # preference, so outliving Anthropic's prompt cache costs nothing; expiring too
@@ -892,6 +892,7 @@ class Gateway:
         # _RATE_LIMIT_BACKOFF_SECONDS). See that method's own docstring for
         # what it's actually for.
         self._refresh_check_not_before: dict[str, float] = {}
+        self._credential_check_not_before: dict[str, float] = {}
         # Consecutive rate-limited refreshes per Profile, driving the
         # escalating backoff and the give-up threshold above.
         self._refresh_rate_limited_streak: dict[str, int] = {}
@@ -995,6 +996,7 @@ class Gateway:
                     # than waiting out a window earned by the old token.
                     self._refresh_rate_limited_streak.pop(p.id, None)
                     self._refresh_check_not_before.pop(p.id, None)
+                    self._credential_check_not_before.pop(p.id, None)
                 if not p.enabled:
                     new_state = ProfileState.DISABLED
                 elif rt.state == ProfileState.DISABLED and p.enabled:
@@ -1184,7 +1186,7 @@ class Gateway:
         eco_body: Optional[bytes] = None
         eco_stats = eco.CompactionStats()
 
-        for _ in range(MAX_ROTATION_ATTEMPTS):
+        for _ in range(max(MAX_ROTATION_ATTEMPTS, len(pool_now.profiles))):
             # The Profile a pinned request is held to: the pin itself, or —
             # for a subagent — the "Forced in subagents" Profile.
             held_to = forced_profile_id
@@ -1194,7 +1196,8 @@ class Gateway:
                 pre_recovery_states = {rt.profile_id: rt.state for rt in snapshot.profiles}
                 snapshot = recover_expired_cooldowns(snapshot, now)
                 self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
-                snapshot = self._maybe_return_to_preferred(pool, snapshot)
+                if forced_profile_id is None:
+                    snapshot = self._maybe_return_to_preferred(pool, snapshot, now, fit)
                 if forced_profile_id is not None:
                     # An explicit --profile pin outranks everything: it must
                     # never be silently substituted, not even by a branch pin.
@@ -1691,6 +1694,18 @@ class Gateway:
             # the network call but not the subprocess, which is exactly what
             # this field's own docstring says must not happen.
             return None
+        if rt.state != ProfileState.AUTH_INVALID:
+            # A rejected Profile is already paced by _refresh_attempt_due above
+            # (and its own re-auth recovery cooldown); it must be free to
+            # notice a repaired credential. Everything else — healthy,
+            # no refresh token, unreadable — is throttled here, claimed
+            # before reading so a failed read counts too, without consuming
+            # the refresh slot.
+            with self._refresh_lock:
+                check_now = time.monotonic()
+                if check_now < self._credential_check_not_before.get(p.id, 0):
+                    return None
+                self._credential_check_not_before[p.id] = check_now + self._REFRESH_CHECK_COOLDOWN_SECONDS
         try:
             stored = secret_store.get_token(p.id)
         except Exception:
@@ -2647,13 +2662,17 @@ class Gateway:
     # place, so the return must cost a session nothing.
     _RETURN_TO_PREFERRED_IDLE_SECONDS = 600.0  # 10 minutes
 
-    def _maybe_return_to_preferred(self, pool: Pool, snapshot: PoolSnapshot) -> PoolSnapshot:
+    def _maybe_return_to_preferred(self, pool: Pool, snapshot: PoolSnapshot,
+                                   now: Optional[datetime] = None,
+                                   fit: Optional[RequestFit] = None) -> PoolSnapshot:
         """Issue #4: after a failover the pool stays on the fallback for as
         long as it works, even once the preferred account's window has reset,
         because choose() is sticky while the current Profile is ELIGIBLE. That
         stickiness is deliberate — it protects the prompt cache and, with
         branch pinning, keeps live agents where they are — so the return is
-        opt-in, off by default, and only ever happens on an idle pool.
+        opt-in and off by default. Subscription-to-subscription moves wait
+        for an idle pool; a paid API fallback returns to an available
+        subscription at a new request boundary without disturbing streams.
 
         Caller holds self._lock. Returns the snapshot to route on; the only
         thing it ever changes is the rotation POINTER, which choose() then
@@ -2671,7 +2690,8 @@ class Gateway:
             return snapshot
         current = next((rt for rt in snapshot.profiles if rt.profile_id == current_id), None)
         candidates = [rt for rt in snapshot.profiles
-                      if rt.state == ProfileState.ELIGIBLE and rt.automatic]
+                      if rt.state == ProfileState.ELIGIBLE and rt.automatic
+                      and fits(rt, fit) and not must_leave(rt, now or datetime.now(timezone.utc))]
         if not candidates:
             return snapshot
         preferred = min(candidates, key=lambda rt: rt.priority)
@@ -2684,13 +2704,18 @@ class Gateway:
         # to.
         if current is not None and preferred.priority >= current.priority:
             return snapshot
+        current_profile = pool.get(current_id)
+        preferred_profile = pool.get(preferred.profile_id)
+        subscription_return = (current_profile is not None and current_profile.kind == "api"
+                               and preferred_profile is not None and preferred_profile.kind == "oauth")
         idle_for = self._seconds_since_last_activity_locked()
-        if idle_for is not None and idle_for < self._RETURN_TO_PREFERRED_IDLE_SECONDS:
+        if not subscription_return and idle_for is not None and idle_for < self._RETURN_TO_PREFERRED_IDLE_SECONDS:
             return snapshot
         self._current_profile_id = None
         name = self._profile_name(pool, preferred.profile_id)
         activity.record("rotation", f"returning to {name}",
-                         meta="higher-priority account is available again and the pool is idle")
+                         meta=("subscription available again — routing new requests" if subscription_return
+                               else "higher-priority account is available again and the pool is idle"))
         return PoolSnapshot(profiles=snapshot.profiles, current_profile_id=None)
 
     def _manual_choice(self, pool: Pool, snapshot: PoolSnapshot, now: datetime,
