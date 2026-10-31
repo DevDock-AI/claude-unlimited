@@ -1182,3 +1182,32 @@ def test_claude_code_subagent_headers_reach_the_codex_bridge(pool_env, monkeypat
 
     assert [(c.claude_session_id, c.agent_id, c.parent_agent_id) for c in seen] == [
         ("sess-1", "a-child", None), ("sess-1", "a-grand", "a-child")]
+def _padded_image_body(size: int) -> bytes:
+    """A real-shaped /v1/messages body of about `size` bytes whose bulk is one
+    base64 image, so the capacity guard (which discounts image bytes) lets it
+    through to the size check."""
+    import json as _json
+    head = _json.dumps({"model": "claude-opus-5", "max_tokens": 8, "messages": [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}},
+        {"type": "text", "text": "what is this"}]}]}).encode()
+    cut = head.index(b'"data": ""') + len(b'"data": "')
+    return head[:cut] + b"A" * (size - len(head)) + head[cut:]
+
+
+def test_codex_body_over_openais_limit_is_413_request_too_large(pool_env, monkeypatch):
+    from claude_unlimited.proxy import CODEX_MAX_REQUEST_BYTES
+    save_pool(Pool(profiles=[_codex_profile()]))
+    monkeypatch.setattr(gateway_module.openai_bridge, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not reach OpenAI")))
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no Anthropic transport")))
+    result = gw.handle("POST", "/v1/messages", {}, _padded_image_body(CODEX_MAX_REQUEST_BYTES + 1000))
+    assert (result.status, result.error) == (413, "request_too_large")
+
+
+def test_codex_body_between_32_and_50mb_is_forwarded(pool_env, monkeypatch):
+    save_pool(Pool(profiles=[_codex_profile()]))
+    served = _codex_recorder(monkeypatch)
+    gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no Anthropic transport")))
+    result = _drain(gw.handle("POST", "/v1/messages", {}, _padded_image_body(40_000_000)))
+    assert result.error is None and result.profile_id == "c"
+    assert served == ["c"]

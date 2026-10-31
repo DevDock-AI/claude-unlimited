@@ -10,6 +10,7 @@ import claude_unlimited.gateway as gateway_module
 from claude_unlimited.config import Pool, Profile, save_pool
 from claude_unlimited.gateway import Gateway
 from claude_unlimited.observation import AuthInvalid, UsageSnapshot
+from claude_unlimited.proxy import MESSAGES_MAX_REQUEST_BYTES
 from claude_unlimited.router import ProfileState
 from claude_unlimited.upstream import UpstreamResponse
 
@@ -255,21 +256,47 @@ def test_transport_network_error_on_every_profile_returns_503_not_unhandled_exce
 
 
 def test_oversized_body_fails_fast_instead_of_looping_every_profile(pool_env):
-    # build_upstream_request's 20MB cap raises ValueError for ANY profile, so
-    # retrying the next one just repeats the error. Fail with a 400 immediately
-    # rather than looping MAX_ROTATION_ATTEMPTS times and surfacing a
-    # misleading "no eligible profile" 503.
+    # No Profile can serve a body over the upstream limit, so retrying the
+    # next one just repeats the error. Answer immediately with the status and
+    # error type Anthropic itself uses (413 request_too_large), which is what
+    # lets Claude Code strip images / compact rather than end the session.
     save_pool(Pool(profiles=[
         Profile(id="a", name="A", kind="oauth", priority=1, automatic=True, enabled=True),
         Profile(id="b", name="B", kind="oauth", priority=2, automatic=True, enabled=True),
     ]))
     calls = []
     gw = Gateway(transport=lambda req: (calls.append(1), fake_response(200))[1])
-    oversized_body = b"x" * 20_000_001
+    oversized_body = b"x" * (MESSAGES_MAX_REQUEST_BYTES + 1)
     result = gw.handle("POST", "/v1/messages", {}, oversized_body)
-    assert result.status == 400
-    assert result.error == "bad_request"
+    assert result.status == 413
+    assert result.error == "request_too_large"
     assert calls == []  # failed before any network call
+    # ...and says nothing about the Profile: it is still eligible afterwards.
+    assert gw.handle("POST", "/v1/messages", {}, b"{}").status == 200
+
+
+def test_body_between_the_old_20mb_cap_and_the_upstream_limit_is_forwarded(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    seen = []
+    gw = Gateway(transport=lambda req: (seen.append(len(req.body)), fake_response(200))[1])
+    body = b"x" * (MESSAGES_MAX_REQUEST_BYTES - 1000)  # ~32 MB, well over the old 20 MB cap
+    result = gw.handle("POST", "/v1/messages", {}, body)
+    assert result.status == 200
+    assert seen and seen[0] >= len(body) - 100
+
+
+def test_body_exactly_at_the_limit_is_forwarded(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    gw = Gateway(transport=lambda req: fake_response(200))
+    assert gw.handle("POST", "/v1/messages", {}, b"x" * MESSAGES_MAX_REQUEST_BYTES).status == 200
+
+
+def test_oversized_body_for_a_pinned_profile_is_413_too(pool_env):
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    gw = Gateway(transport=lambda req: fake_response(200))
+    result = gw.handle("POST", "/v1/messages", {}, b"x" * (MESSAGES_MAX_REQUEST_BYTES + 1),
+                       forced_profile_id="a")
+    assert (result.status, result.error) == (413, "request_too_large")
 
 
 def test_reauthenticating_a_profile_clears_stuck_auth_invalid_state(pool_env):

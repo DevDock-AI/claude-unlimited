@@ -3,6 +3,11 @@ import json
 from claude_unlimited.config import Profile
 from claude_unlimited.proxy import (
     ANTHROPIC_DEFAULT_BASE_URL,
+    CODEX_MAX_REQUEST_BYTES,
+    MESSAGES_MAX_REQUEST_BYTES,
+    RequestTooLarge,
+    check_request_size,
+    max_request_bytes,
     build_upstream_request,
     filter_response_headers,
     request_model,
@@ -150,8 +155,39 @@ def test_user_id_json_without_account_uuid_key_passes_through_unchanged():
 def test_oversized_body_rejected():
     import pytest
     p = oauth_profile()
-    with pytest.raises(ValueError):
-        build_upstream_request(p, "tok", "POST", "/v1/messages", {}, b"x" * 21_000_000)
+    with pytest.raises(RequestTooLarge):
+        build_upstream_request(p, "tok", "POST", "/v1/messages", {}, b"x" * (MESSAGES_MAX_REQUEST_BYTES + 1))
+
+
+def test_request_too_large_is_still_a_value_error_for_older_callers():
+    assert issubclass(RequestTooLarge, ValueError)
+
+
+def test_messages_api_limit_is_32mb_not_the_old_20mb():
+    # Anthropic's documented Messages API limit. The old 20 MB cap rejected
+    # image-heavy sessions the provider would have taken.
+    assert MESSAGES_MAX_REQUEST_BYTES >= 32_000_000
+    assert max_request_bytes(oauth_profile()) == MESSAGES_MAX_REQUEST_BYTES
+    assert max_request_bytes(api_profile()) == MESSAGES_MAX_REQUEST_BYTES
+
+
+def test_codex_limit_is_openais_50mb_payload():
+    assert CODEX_MAX_REQUEST_BYTES >= 50_000_000
+    assert max_request_bytes(Profile(id="c", name="C", kind="codex")) == CODEX_MAX_REQUEST_BYTES
+
+
+def test_body_up_to_the_limit_builds_for_oauth_and_api():
+    body = b"x" * MESSAGES_MAX_REQUEST_BYTES
+    for p in (oauth_profile(), api_profile()):
+        assert build_upstream_request(p, "tok", "POST", "/v1/messages", {}, body).body == body
+
+
+def test_check_request_size_boundary():
+    import pytest
+    p = oauth_profile()
+    check_request_size(p, b"x" * MESSAGES_MAX_REQUEST_BYTES)
+    with pytest.raises(RequestTooLarge):
+        check_request_size(p, b"x" * (MESSAGES_MAX_REQUEST_BYTES + 1))
 
 
 def test_request_model_reads_the_top_level_model_field():

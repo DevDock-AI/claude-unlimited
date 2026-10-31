@@ -225,3 +225,54 @@ def test_a_slow_non_streaming_request_gets_no_pings(running_proxy_server, fast_k
 ])
 def test_only_streaming_message_calls_want_a_keepalive(method, path, body, expected):
     assert daemon._wants_event_stream(method, path, body) is expected
+
+
+def _post(base, body, token):
+    req = urllib.request.Request(f"{base}/v1/messages", data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _json_body(size, stream=False):
+    """A valid /v1/messages JSON body of about `size` bytes, padded with text
+    (as a base64 image would be)."""
+    head = json.dumps({"model": "claude-haiku-4-5", "max_tokens": 8, "stream": stream,
+                       "messages": [{"role": "user", "content": "x"}], "pad": ""}).encode()
+    return head[:-2] + b"a" * (size - len(head)) + b'"}'
+
+
+def test_body_over_the_old_20mb_cap_is_forwarded(running_proxy_server):
+    token = placeholder_token.get_or_create()
+    assert _post(running_proxy_server, _json_body(25_000_000), token)[0] == 200
+
+
+def test_streamed_body_over_the_old_20mb_cap_is_forwarded(running_proxy_server):
+    # Claude Code always sends stream:true, which takes the keep-alive path.
+    token = placeholder_token.get_or_create()
+    assert _post(running_proxy_server, _json_body(25_000_000, stream=True), token)[0] == 200
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_body_over_the_upstream_limit_gets_anthropics_413_request_too_large(running_proxy_server, stream):
+    from claude_unlimited.proxy import MESSAGES_MAX_REQUEST_BYTES
+    token = placeholder_token.get_or_create()
+    status, raw = _post(running_proxy_server, _json_body(MESSAGES_MAX_REQUEST_BYTES + 1000, stream=stream), token)
+    assert status == 413
+    payload = json.loads(raw)
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "request_too_large"
+    assert payload["error"]["message"]
+    assert "[claude-unlimited]" not in payload["error"]["message"]
+
+
+def test_body_over_every_providers_limit_is_drained_and_gets_413(running_proxy_server):
+    from claude_unlimited.proxy import MAX_REQUEST_BYTES
+    token = placeholder_token.get_or_create()
+    status, raw = _post(running_proxy_server, b"x" * (MAX_REQUEST_BYTES + 1), token)
+    assert status == 413
+    assert json.loads(raw)["error"]["type"] == "request_too_large"

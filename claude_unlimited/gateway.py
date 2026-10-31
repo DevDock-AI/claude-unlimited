@@ -33,7 +33,8 @@ from . import activity, eco, gpt_windows, speech, connectors, notifications, oau
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
-from .proxy import build_upstream_request, filter_response_headers, request_model, rewrite_model
+from .proxy import (REQUEST_TOO_LARGE_STATUS, RequestTooLarge, build_upstream_request, check_request_size,
+                    filter_response_headers, request_model, rewrite_model)
 from .router import (
     PoolSnapshot,
     ProfileRuntime,
@@ -1320,6 +1321,22 @@ class Gateway:
                                                         getattr(pool.settings, "speech_level", "off"))
                     # Last, so nothing above can reintroduce one.
                     eco_body = _drop_empty_text_blocks(eco_body)
+
+            # The body that would actually be sent (after ECO), against what
+            # this Profile's upstream accepts. Answered with the status and
+            # shape the provider itself uses for an oversized request, which
+            # Claude Code recovers from (it drops the images and compacts)
+            # rather than ending the session. It says nothing about the
+            # Profile, so: no observation, no cooldown, and no rotation (the
+            # next account has the same limit or a lower one).
+            try:
+                check_request_size(profile, eco_body)
+            except RequestTooLarge:
+                activity.record("error", "Request too large — rejected",
+                                 meta=f"{len(eco_body):,} bytes for {profile.name}, "
+                                      f"client={_client_label(headers)}")
+                return GatewayResult(status=REQUEST_TOO_LARGE_STATUS, headers={}, body_chunks=None,
+                                      profile_id=None, error="request_too_large")
 
             if profile.kind == "codex":
                 result = self._handle_codex(profile, credential, method, path, headers, eco_body, now,

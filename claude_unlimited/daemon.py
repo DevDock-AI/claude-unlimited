@@ -64,7 +64,8 @@ from . import session_tokens
 from . import updater
 from . import usage_history
 from .config import APP_DIR, DEFAULT_SWITCH_THRESHOLD, ensure_app_dir, load_pool, update_settings
-from .gateway import Gateway
+from .gateway import Gateway, GatewayResult
+from .proxy import MAX_REQUEST_BYTES, REQUEST_TOO_LARGE_BODY, REQUEST_TOO_LARGE_STATUS
 from .router import spending_on_credits
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -453,6 +454,11 @@ def _wants_event_stream(method: str, path: str, body: bytes) -> bool:
 
 def _proxy_error_payload(result) -> tuple:
     """(status, Anthropic error envelope) for a request the gateway refused."""
+    if result.error == "request_too_large":
+        # Anthropic's own 413 envelope, byte for byte and with no
+        # [claude-unlimited] prefix: Claude Code keys its image-stripping /
+        # compaction recovery on error.type == "request_too_large".
+        return REQUEST_TOO_LARGE_STATUS, REQUEST_TOO_LARGE_BODY
     message = (
         # What the gateway worked out (which accounts, when the first one
         # comes back), when it knows more than the code alone.
@@ -557,6 +563,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError("request body too large")
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
+
+    def _discard_body(self, length: int) -> None:
+        """Read and drop `length` bytes of the request body without keeping
+        them. Stops early if the client hangs up."""
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 1 << 20))
+            if not chunk:
+                break
+            remaining -= len(chunk)
 
     def _check_csrf(self) -> bool:
         token = self.headers.get("X-CSRF-Token", "")
@@ -1416,6 +1432,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         (grant,) = auth_result
 
         length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > MAX_REQUEST_BYTES:
+            # Bigger than anything any provider takes, so don't hold it in
+            # memory. The body is still read off the socket (and dropped): a
+            # client told no while it is mid-upload sees a reset connection,
+            # not the 413 it needs to recover from.
+            self._discard_body(length)
+            activity.record("error", "Request too large — rejected", meta=f"{length:,} bytes")
+            status, payload = _proxy_error_payload(GatewayResult(
+                status=REQUEST_TOO_LARGE_STATUS, headers={}, body_chunks=None, profile_id=None,
+                error="request_too_large"))
+            self._send_json(status, payload)
+            return
         body = self.rfile.read(length) if length > 0 else b""
         inbound_headers = {k: v for k, v in self.headers.items()}
 

@@ -47,7 +47,10 @@ kind is not verified on the others — this is the project's most repeated defec
 - `observation.py` / `openai_observation.py` — turn a provider response into one of a small
   set of facts: usage snapshot, quota exhausted, rate limit, auth invalid, unavailable.
 - `proxy.py` / `upstream.py` — build and send the real upstream request, substitute the
-  credential, strip hop-by-hop headers, rewrite `metadata.user_id`.
+  credential, strip hop-by-hop headers, rewrite `metadata.user_id`. Also owns the request
+  size limit per Profile kind (Anthropic Messages 32 MB, Codex/OpenAI 50 MB — the
+  provider's own numbers); over it the daemon answers HTTP 413 `request_too_large` in
+  Anthropic's envelope, which Claude Code recovers from by stripping images and compacting.
 - `openai_bridge.py` — the codex path: owns its own HTTPS call and response translation.
 - `openai_translate.py` — pure Anthropic ⇄ OpenAI shape mapping, both directions.
 - `wire_formats.py` — which endpoint shape a Profile speaks, and how to translate to it.

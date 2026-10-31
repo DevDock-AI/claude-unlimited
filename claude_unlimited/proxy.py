@@ -30,6 +30,61 @@ from .config import Profile
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_VERSION_HEADER = "anthropic-version"
 
+# Largest request body each kind of Profile's upstream accepts, so the daemon
+# rejects exactly what the provider would and nothing it would take.
+#   - Anthropic Messages API (oauth, and api Profiles, whose base_url is an
+#     Anthropic-compatible endpoint): 32 MB. Anthropic's "Request size
+#     limits" table; over it the API answers 413 request_too_large. A
+#     gateway's own limit, if lower, is enforced by that gateway and relayed
+#     back unchanged.
+#   - Codex / OpenAI Responses (codex): 50 MB total payload per request, per
+#     OpenAI's image-input requirements. The Anthropic body is translated
+#     roughly 1:1 (base64 stays base64), so the inbound size is the measure.
+# 1024-based on purpose: "32 MB" is not specified to the byte, and a body that
+# slips under this cap but over the real one is refused by the provider with
+# its own 413, which is relayed. The reverse (cap below the real limit) is
+# what kills sessions, so round up.
+MESSAGES_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+CODEX_MAX_REQUEST_BYTES = 50 * 1024 * 1024
+# Above this the daemon will not even buffer a body (Content-Length is
+# refused up front, before a Profile is chosen): 256 MB is Anthropic's largest
+# endpoint (the Batch API), so nothing a Profile could take is larger. It is
+# deliberately well above the per-Profile limits: ECO compaction can shrink a
+# text-heavy body, and the per-Profile check runs on what would actually be
+# sent.
+MAX_REQUEST_BYTES = 256 * 1024 * 1024
+
+# The status and body Anthropic itself returns for an oversized request:
+# HTTP 413, error.type "request_too_large". Claude Code recognises exactly
+# this shape and recovers (strips images/documents, compacts) instead of
+# ending the session, so it must not be paraphrased.
+REQUEST_TOO_LARGE_STATUS = 413
+REQUEST_TOO_LARGE_BODY = {
+    "type": "error",
+    "error": {"type": "request_too_large",
+              "message": "Request exceeds the maximum allowed number of bytes."},
+}
+
+
+class RequestTooLarge(ValueError):
+    """The inbound body exceeds what this Profile's upstream accepts. A
+    ValueError so older `except ValueError` callers still treat it as a
+    structurally invalid request; callers that can answer precisely catch
+    this first and return REQUEST_TOO_LARGE_STATUS."""
+
+
+def max_request_bytes(profile: Profile) -> int:
+    """The largest request body this Profile's upstream accepts."""
+    return CODEX_MAX_REQUEST_BYTES if profile.kind == "codex" else MESSAGES_MAX_REQUEST_BYTES
+
+
+def check_request_size(profile: Profile, body: bytes) -> None:
+    """Raises RequestTooLarge if `body` is over this Profile's upstream limit."""
+    limit = max_request_bytes(profile)
+    if len(body) > limit:
+        raise RequestTooLarge(f"request body is {len(body)} bytes; limit is {limit}")
+
+
 # Headers stripped from the inbound (client -> daemon) request before
 # forwarding upstream. Anything credential-shaped or hop-by-hop.
 _STRIPPED_INBOUND_HEADERS = {
@@ -98,8 +153,7 @@ def build_upstream_request(
     it against the request's model and the per-model support gate
     (openai_models.claude_effort_for), so this module never guesses and stays
     free of a model-catalogue dependency. None = leave the body untouched."""
-    if len(inbound_body) > 20_000_000:  # 20MB: generous, but not unbounded
-        raise ValueError("request body too large to proxy")
+    check_request_size(profile, inbound_body)
 
     headers = {k: v for k, v in inbound_headers.items() if k.lower() not in _STRIPPED_INBOUND_HEADERS}
 
