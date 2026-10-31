@@ -243,6 +243,9 @@ async function api(path, opts = {}) {
   if (opts.method && opts.method !== 'GET') headers['X-CSRF-Token'] = CSRF;
   const res = await fetch(path, Object.assign({}, opts, { headers }));
   const body = await res.json();
+  // A cancelled live poll may have finished reading before fetch noticed the
+  // abort. Do not let that obsolete response reach a renderer.
+  if (opts.signal && opts.signal.aborted) throw new DOMException('Aborted', 'AbortError');
   if (!res.ok) {
     if (body.error === 'csrf') {
       // The CSRF token is generated at daemon startup and embedded once into
@@ -1066,13 +1069,14 @@ const STATS_POLL_MS = 10000;
 let _summaryLastPoll = 0;
 const SUMMARY_POLL_MS = 5000;
 
-async function loadStats() {
+async function loadStats(opts = {}) {
   const el = document.getElementById('statsBody');
   if (!el) return;
   let data;
   try {
-    data = await api(`/api/usage/stats?range=${encodeURIComponent(_statsRange)}`);
+    data = await api(`/api/usage/stats?range=${encodeURIComponent(_statsRange)}`, opts);
   } catch (e) {
+    if (e.name === 'AbortError') return;
     return;
   }
   // pollLiveUpdate calls this every second. Rebuilding the chart that often
@@ -1164,9 +1168,9 @@ document.addEventListener('click', (e) => {
 
 let _lastStatus = null;
 
-async function loadStatus() {
+async function loadStatus(opts = {}) {
   try {
-    const s = await api('/api/status');
+    const s = await api('/api/status', opts);
     _lastStatus = s;
     const versionChip = document.getElementById('versionChip');
     if (versionChip) versionChip.textContent = 'v' + s.version;
@@ -1175,6 +1179,7 @@ async function loadStatus() {
     const hostChip = document.getElementById('hostChip');
     if (hostChip) hostChip.textContent = window.location.host || 'claude.unlimited:4317';
   } catch (e) {
+    if (e.name === 'AbortError') return;
     _lastStatus = null;
   }
 }
@@ -1637,12 +1642,12 @@ document.getElementById('profiles').addEventListener('click', async (e) => {
 
 let _lastProfiles = [];
 
-async function loadProfiles() {
+async function loadProfiles(opts = {}) {
   const el = document.getElementById('profiles');
   try {
-    const { profiles } = await api('/api/profiles');
+    const { profiles } = await api('/api/profiles', opts);
     _lastProfiles = profiles;
-    refreshCodexCreditsVisibility();
+    refreshCodexCreditsVisibility(opts);
     renderStatStrip(profiles);
     if (!profiles.length) {
       setLiveHtml(el, `<div class="empty">${esc(t('empty.no_profiles_hint'))}</div>`);
@@ -1654,6 +1659,7 @@ async function loadProfiles() {
     const ordered = profiles.slice().sort((a, b) => a.priority - b.priority);
     setLiveHtml(el, ordered.map((p) => renderProfileCard(p)).join(''));
   } catch (e) {
+    if (e.name === 'AbortError') return;
     setLiveHtml(el, `<div class="empty">${esc(t('empty.profiles_load_error_prefix'))} ${esc(e.message)}</div>`);
   }
 }
@@ -1766,12 +1772,12 @@ function filteredSortedProfiles(profiles) {
 
 let _profileDragActive = false;
 
-async function loadProfilesTable() {
+async function loadProfilesTable(opts = {}) {
   if (_profileDragActive) return; // never yank the table out from under an in-progress reorder
   const el = document.getElementById('profilesTableBody');
   const sub = document.getElementById('profilesSub');
   try {
-    const { profiles } = await api('/api/profiles');
+    const { profiles } = await api('/api/profiles', opts);
     _lastProfiles = profiles;
     if (sub) {
       const enabledCount = profiles.filter((p) => p.enabled).length;
@@ -1789,6 +1795,7 @@ async function loadProfilesTable() {
     }
     setLiveHtml(el, visible.map(renderProfileTableRow).join(''));
   } catch (e) {
+    if (e.name === 'AbortError') return;
     setLiveHtml(el, `<div class="empty" style="border:none;">${esc(t('empty.profiles_load_error_prefix'))} ${esc(e.message)}</div>`);
   }
 }
@@ -1853,6 +1860,7 @@ async function loadProfilesTable() {
     _dragRowId = row.dataset.id;
     row.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
+    cancelLivePoll();
     _profileDragActive = true; // live-poll must not re-render the table out from under an in-progress drag
   });
   profilesTableBody.addEventListener('dragend', (e) => {
@@ -2060,6 +2068,7 @@ function openConfirmModal({ title, body, confirmText, actionLabel, onConfirm, hi
   document.querySelector('.confirm-hint').textContent = hint || `${t('modal.confirm.hint_prefix')} "${confirmText}" ${t('modal.confirm.hint_suffix')}`;
   document.getElementById('confirmActionBtn').textContent = actionLabel;
   _confirmCallback = onConfirm;
+  cancelLivePoll();
   document.getElementById('confirmScrim').classList.add('open');
 }
 
@@ -2190,6 +2199,7 @@ function openProfileDetailModal(profileId) {
   _pdSelectedTagColor = p.tag_color || null;
   renderDetailTagRow();
 
+  cancelLivePoll();
   document.getElementById('profileDetailScrim').classList.add('open');
 }
 
@@ -2304,14 +2314,15 @@ function renderProjectUsageList(projects) {
   }).join(''));
 }
 
-async function loadProjectUsage() {
+async function loadProjectUsage(opts = {}) {
   const el = document.getElementById('projectUsageList');
   if (!el) return;
   try {
-    const { projects } = await api('/api/usage/projects');
+    const { projects } = await api('/api/usage/projects', opts);
     _lastProjects = projects;
     renderProjectUsageList(projects);
   } catch (e) {
+    if (e.name === 'AbortError') return;
     setLiveHtml(el, `<div class="empty">${esc(e.message)}</div>`);
   }
 }
@@ -2584,9 +2595,9 @@ const RANGE_CAPTION_KEYS = {
 
 let _usageRange = localStorage.getItem('cu-usage-range') || '1w';
 
-async function loadUsageSummary() {
+async function loadUsageSummary(opts = {}) {
   try {
-    const summary = await api(`/api/usage/summary?range=${encodeURIComponent(_usageRange)}`);
+    const summary = await api(`/api/usage/summary?range=${encodeURIComponent(_usageRange)}`, opts);
     applyMiniChartStyle('tokens', currentMiniChartStyle('tokens'));
     applyMiniChartStyle('model', currentMiniChartStyle('model'));
     applyMiniChartStyle('account', currentMiniChartStyle('account'));
@@ -2596,10 +2607,11 @@ async function loadUsageSummary() {
     renderAccountUsageChart(summary.daily_totals_by_profile, summary.profile_colors, summary.profile_names);
     renderModelSplit(summary.model_split);
     renderHeatmap(summary.hourly_histogram);
-    renderCostRow(_lastProfiles.length ? _lastProfiles : (await api('/api/profiles')).profiles, summary.cost_by_profile);
+    renderCostRow(_lastProfiles.length ? _lastProfiles : (await api('/api/profiles', opts)).profiles, summary.cost_by_profile);
     const caption = document.getElementById('tokensSubCaption');
     if (caption) caption.textContent = t(RANGE_CAPTION_KEYS[summary.range] || RANGE_CAPTION_KEYS['1w']);
   } catch (e) {
+    if (e.name === 'AbortError') return;
     // Overview stays usable even if usage data can't be loaded.
   }
 }
@@ -2686,12 +2698,13 @@ function renderActivityFeed(el, events, compact) {
   }
 }
 
-async function loadActivityPreview() {
+async function loadActivityPreview(opts = {}) {
   const el = document.getElementById('activityPreview');
   try {
-    const { events } = await api('/api/activity?limit=8');
+    const { events } = await api('/api/activity?limit=8', opts);
     renderActivityFeed(el, events, false);
   } catch (e) {
+    if (e.name === 'AbortError') return;
     setLiveHtml(el, `<div class="empty">${esc(t('empty.activity_load_error_prefix'))} ${esc(e.message)}</div>`);
   }
 }
@@ -2735,12 +2748,13 @@ function activityQueryParams() {
   return params;
 }
 
-async function loadActivity() {
+async function loadActivity(opts = {}) {
   const el = document.getElementById('activityList');
   try {
-    const { events } = await api(`/api/activity?${activityQueryParams()}`);
+    const { events } = await api(`/api/activity?${activityQueryParams()}`, opts);
     renderActivityFeed(el, events, false);
   } catch (e) {
+    if (e.name === 'AbortError') return;
     setLiveHtml(el, `<div class="empty">${esc(t('empty.activity_load_error_prefix'))} ${esc(e.message)}</div>`);
   }
 }
@@ -2920,6 +2934,7 @@ function _updateModalPhase(phase, { title, sub } = {}) {
 // says plainly whether there is anything to install. Installing stays a
 // separate, deliberate press — the check never installs anything by itself.
 async function runUpdateCheckModal() {
+  cancelLivePoll();
   document.getElementById('updateScrim').classList.add('open');
   document.getElementById('updateModalError').style.display = 'none';
   document.getElementById('updateModalInstallBtn').style.display = 'none';
@@ -2970,6 +2985,7 @@ async function runUpdateCheckModal() {
 }
 
 async function runUpdateInstall() {
+  cancelLivePoll();
   document.getElementById('updateScrim').classList.add('open');
   document.getElementById('updateModalError').style.display = 'none';
   document.getElementById('updateModalInstallBtn').style.display = 'none';
@@ -3196,7 +3212,7 @@ async function toggleNotificationsMaster() {
 // can assume the other ran first: opening /settings directly renders the page
 // before any profile has been fetched, and the section stayed hidden on an
 // account pool that has a Codex profile.
-async function refreshCodexCreditsVisibility() {
+async function refreshCodexCreditsVisibility(opts = {}) {
   const section = document.getElementById('codexCreditsSection');
   if (!section) return;
   let profiles = _lastProfiles;
@@ -3205,8 +3221,9 @@ async function refreshCodexCreditsVisibility() {
     // (or reloading on it) leaves this empty — ask for them rather than
     // hiding a setting the user does have accounts for.
     try {
-      profiles = (await api('/api/profiles')).profiles || [];
+      profiles = (await api('/api/profiles', opts)).profiles || [];
     } catch (e) {
+    if (e.name === 'AbortError') return;
       return;   // leave it as it is; the next poll or view change retries
     }
   }
@@ -3326,9 +3343,9 @@ async function toggleAutostart() {
   await loadDaemonServiceStatus();
 }
 
-async function loadProcessStats() {
+async function loadProcessStats(opts = {}) {
   try {
-    const p = await api('/api/process');
+    const p = await api('/api/process', opts);
     const pidEl = document.getElementById('processPidValue');
     const memEl = document.getElementById('processMemoryValue');
     const upEl = document.getElementById('processUptimeValue');
@@ -3345,6 +3362,7 @@ async function loadProcessStats() {
         : t('settings.process.restart_unavailable_sub');
     }
   } catch (e) {
+    if (e.name === 'AbortError') return;
     // leave the last-known values on a missed poll — same policy as pollLiveUpdate
   }
 }
@@ -3573,6 +3591,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function openModal() {
+  cancelLivePoll();
   document.getElementById('scrim').classList.add('open');
   selectType('oauth');
   document.getElementById('f_name').value = '';
@@ -3689,6 +3708,7 @@ async function importCurrentLogin() {
 // ---- Export ----
 
 function openExportModal() {
+  cancelLivePoll();
   document.getElementById('exportScrim').classList.add('open');
   const box = document.getElementById('exp_profiles_box');
   setCheckbox(box, false);
@@ -3759,6 +3779,7 @@ async function submitExport() {
 let _importBundleText = null;
 
 function openImportModal() {
+  cancelLivePoll();
   document.getElementById('importScrim').classList.add('open');
 }
 
@@ -3963,6 +3984,7 @@ registerViewState('settings', {
 function switchView(view, { history = 'push' } = {}) {
   closeKebabMenu();
   closeAllSelectPops();
+  cancelLivePoll();
   _currentView = view;
   document.querySelectorAll('.rail-item').forEach((el) => el.classList.toggle('active', el.dataset.view === view));
   document.querySelectorAll('[data-view-panel]').forEach((el) => {
@@ -4001,19 +4023,38 @@ window.addEventListener('popstate', () => {
 // freeze the Dashboard for good.
 const POLL_STUCK_MS = 30000;
 let _pollStartedAt = 0;
+// The tick in flight can be abandoned: opening a modal, dragging a row or
+// changing view makes whatever it is still waiting for obsolete, and a slow
+// Statistics scan must not hold the next view's first refresh off until it
+// finishes. Aborting also releases the one-at-a-time guard at once.
+let _livePollController = null;
+function cancelLivePoll() {
+  if (_livePollController) {
+    _livePollController.abort();
+    // What the abandoned tick was fetching was never drawn; let the next tick redo it.
+    _summaryLastPoll = 0;
+    _statsLastPoll = 0;
+  }
+  _livePollController = null;
+  _pollStartedAt = 0;
+}
 
 async function pollLiveUpdate() {
-  if (document.hidden) return;
+  if (document.hidden || _profileDragActive) return;
   if (document.querySelector('.modal-scrim.open')) return;
   if (_pollStartedAt && Date.now() - _pollStartedAt < POLL_STUCK_MS) return;
   const myTick = Date.now();
   _pollStartedAt = myTick;
+  const controller = new AbortController();
+  _livePollController = controller;
+  const opts = { signal: controller.signal };
   try {
-    // loadStatus() supplies "who's active" and must run on every tick
+    // loadStatus(opts) supplies "who's active" and must run on every tick
     // regardless of the open view — otherwise a rotation that happens while
     // another view is on screen leaves the wrong Profile marked active
     // indefinitely, since nothing else refreshes it.
-    await loadStatus();
+    await loadStatus(opts);
+    if (controller.signal.aborted) return;
     if (_currentView === 'overview') {
       // The usage card charts a week (or more) and is aggregated from every
       // event in that period. Which account is serving right now has to be a
@@ -4022,25 +4063,25 @@ async function pollLiveUpdate() {
       const summaryDue = !_summaryLastPoll || Date.now() - _summaryLastPoll >= SUMMARY_POLL_MS;
       if (summaryDue) _summaryLastPoll = Date.now();
       await Promise.all([
-        loadProfiles(),
-        loadProjectUsage(),
-        summaryDue ? loadUsageSummary() : Promise.resolve(),
-        loadActivityPreview(),
+        loadProfiles(opts),
+        loadProjectUsage(opts),
+        summaryDue ? loadUsageSummary(opts) : Promise.resolve(),
+        loadActivityPreview(opts),
       ]);
     } else if (_currentView === 'profiles') {
-      await loadProfilesTable();
+      await loadProfilesTable(opts);
     } else if (_currentView === 'stats') {
       // Statistics aggregates the whole usage table, and that table grows
       // forever. It is a reporting view, not a live one — polling it every
       // second buys nothing and gets steadily more expensive.
       if (!_statsLastPoll || Date.now() - _statsLastPoll >= STATS_POLL_MS) {
         _statsLastPoll = Date.now();
-        await loadStats();
+        await loadStats(opts);
       }
     } else if (_currentView === 'activity') {
-      await loadActivity();
+      await loadActivity(opts);
     } else if (_currentView === 'settings') {
-      await loadProcessStats();
+      await loadProcessStats(opts);
     }
   } catch (e) {
     // a single missed poll tick isn't worth surfacing — the connection
@@ -4048,6 +4089,7 @@ async function pollLiveUpdate() {
     // unreachable daemon.
   } finally {
     if (_pollStartedAt === myTick) _pollStartedAt = 0;
+    if (_livePollController === controller) _livePollController = null;
   }
 }
 
@@ -4055,7 +4097,8 @@ async function pollLiveUpdate() {
 // refresh immediately on return rather than showing stale active-profile and
 // usage data for up to a full poll interval.
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) pollLiveUpdate();
+  if (document.hidden) cancelLivePoll();
+  else pollLiveUpdate();
 });
 setInterval(pollLiveUpdate, 1000);
 
