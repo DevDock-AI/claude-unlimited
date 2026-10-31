@@ -178,58 +178,125 @@ def reset() -> None:
 # aggregation is SQL's job; the pure helpers above stay for callers that
 # genuinely need the events themselves.
 
-def totals_by_profile() -> dict[str, dict]:
-    """usage_by_profile() computed in SQL. Same shape, same rules: tokens
-    always counted, cost None unless at least one priced event exists."""
-    return {
-        r["profile_id"]: {
-            "tokens": int(r["tokens"] or 0),
-            "cost_usd": round(r["cost"], 4) if r["priced"] else None,
-        }
+class _Rollup:
+    """Lifetime totals per Profile and per project, and each Profile's latest
+    request, kept up to date by folding in only the rows added since the last
+    call.
+
+    These three figures are read by `GET /api/profiles` on every Dashboard poll
+    and by routing on every proxied request, and they are lifetime figures: the
+    table they come from only ever grows. Recomputing them in SQL was cheap on
+    day one and a full scan of every row (twice, one of them sorting the whole
+    table) on day thirty, on every call, queued behind the same lock as the
+    proxy's own writes. Folding the new rows is proportional to what happened
+    since the last poll, not to everything that ever did.
+
+    It is rebuilt from scratch, once, on first use and whenever rows may have
+    been changed or removed rather than appended (`db.usage_epoch()`), so it
+    can never drift from the table.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._key = None
+        self._last_id = 0
+        self._by_profile: dict[str, list] = {}   # id -> [tokens, cost, priced rows]
+        self._by_project: dict[str, list] = {}
+        self._latest: dict[str, tuple] = {}      # id -> ((datetime(ts), row id), row)
+
+    def snapshot(self) -> tuple[dict, dict, dict]:
+        with self._lock:
+            key = (db.path(), db.usage_epoch())
+            if key != self._key:
+                self._rebuild()
+                self._key = key
+            else:
+                self._fold(db.query(
+                    """SELECT id, profile_id, project_id, model, requested_model, ts,
+                              COALESCE(datetime(ts), '') AS dts,
+                              input_tokens + output_tokens AS tokens, cost_usd
+                         FROM usage_event WHERE id > ? ORDER BY id""", (self._last_id,)))
+            return (
+                {pid: {"tokens": int(t), "cost_usd": round(c, 4) if n else None}
+                 for pid, (t, c, n) in self._by_profile.items()},
+                {pid: {"tokens": int(t), "cost_usd": round(c, 4) if n else None}
+                 for pid, (t, c, n) in self._by_project.items()},
+                {pid: {"at": row["ts"], "model": row["model"],
+                       "requested_model": row["requested_model"], "project_id": row["project_id"]}
+                 for pid, (_order, row) in self._latest.items()},
+            )
+
+    def _rebuild(self) -> None:
+        self._by_profile, self._by_project, self._latest = {}, {}, {}
+        self._last_id = 0
+        top = db.query("SELECT MAX(id) AS top FROM usage_event")
+        top_id = (top[0]["top"] or 0) if top else 0
+        if not top_id:
+            return
+        # Bounded by id so a row written mid-rebuild is folded exactly once, by
+        # the next incremental call, not counted here and again there.
         for r in db.query(
-            """SELECT profile_id,
-                      SUM(input_tokens + output_tokens) AS tokens,
-                      COALESCE(SUM(cost_usd), 0.0)      AS cost,
-                      COUNT(cost_usd)                   AS priced
-                 FROM usage_event GROUP BY profile_id""")
-    }
+                """SELECT profile_id, SUM(input_tokens + output_tokens) AS tokens,
+                          COALESCE(SUM(cost_usd), 0.0) AS cost, COUNT(cost_usd) AS priced
+                     FROM usage_event WHERE id <= ? GROUP BY profile_id""", (top_id,)):
+            self._by_profile[r["profile_id"]] = [r["tokens"] or 0, r["cost"], r["priced"]]
+        for r in db.query(
+                """SELECT project_id, SUM(input_tokens + output_tokens) AS tokens,
+                          COALESCE(SUM(cost_usd), 0.0) AS cost, COUNT(cost_usd) AS priced
+                     FROM usage_event WHERE id <= ? AND project_id IS NOT NULL AND project_id != ''
+                    GROUP BY project_id""", (top_id,)):
+            self._by_project[r["project_id"]] = [r["tokens"] or 0, r["cost"], r["priced"]]
+        # Ordered by `datetime(ts)`, not by the raw string: SQLite normalizes an
+        # ISO-8601 timestamp's offset to UTC there, so a row imported from the
+        # old JSONL log with a local offset cannot sort ahead of a newer UTC one.
+        for r in db.query(
+                """SELECT id, profile_id, ts, model, requested_model, project_id,
+                          COALESCE(datetime(ts), '') AS dts FROM (
+                       SELECT id, profile_id, ts, model, requested_model, project_id,
+                              ROW_NUMBER() OVER (PARTITION BY profile_id
+                                                 ORDER BY datetime(ts) DESC, id DESC) AS rn
+                         FROM usage_event WHERE id <= ?
+                   ) WHERE rn = 1""", (top_id,)):
+            self._latest[r["profile_id"]] = ((r["dts"], r["id"]), r)
+        self._last_id = top_id
+
+    def _fold(self, rows) -> None:
+        for r in rows:
+            self._last_id = max(self._last_id, r["id"])
+            for table, key in ((self._by_profile, r["profile_id"]),
+                               (self._by_project, r["project_id"] if r["project_id"] else None)):
+                if key is None:
+                    continue
+                t = table.setdefault(key, [0, 0.0, 0])
+                t[0] += r["tokens"] or 0
+                if r["cost_usd"] is not None:
+                    t[1] += r["cost_usd"]
+                    t[2] += 1
+            order = (r["dts"], r["id"])
+            held = self._latest.get(r["profile_id"])
+            if held is None or order > held[0]:
+                self._latest[r["profile_id"]] = (order, r)
+
+
+_rollup = _Rollup()
+
+
+def totals_by_profile() -> dict[str, dict]:
+    """usage_by_profile() from the running rollup. Same shape, same rules:
+    tokens always counted, cost None unless at least one priced event exists."""
+    return _rollup.snapshot()[0]
 
 
 def totals_by_project() -> dict[str, dict]:
-    """tokens_by_project() computed in SQL, including its "skip events with no
-    resolved project" rule."""
-    return {
-        r["project_id"]: {
-            "tokens": int(r["tokens"] or 0),
-            "cost_usd": round(r["cost"], 4) if r["priced"] else None,
-        }
-        for r in db.query(
-            """SELECT project_id,
-                      SUM(input_tokens + output_tokens) AS tokens,
-                      COALESCE(SUM(cost_usd), 0.0)      AS cost,
-                      COUNT(cost_usd)                   AS priced
-                 FROM usage_event WHERE project_id IS NOT NULL AND project_id != ''
-                GROUP BY project_id""")
-    }
+    """tokens_by_project() from the running rollup, including its "skip events
+    with no resolved project" rule."""
+    return _rollup.snapshot()[1]
 
 
 def latest_by_profile() -> dict[str, dict]:
-    """last_use_by_profile() computed in SQL.
-
-    Ordered by `datetime(ts)`, not by the raw string: SQLite normalizes an
-    ISO-8601 timestamp's offset to UTC there, so a row imported from the old
-    JSONL log with a local offset cannot sort ahead of a newer UTC one."""
-    return {
-        r["profile_id"]: {"at": r["ts"], "model": r["model"],
-                          "requested_model": r["requested_model"], "project_id": r["project_id"]}
-        for r in db.query(
-            """SELECT profile_id, ts, model, requested_model, project_id FROM (
-                   SELECT profile_id, ts, model, requested_model, project_id,
-                          ROW_NUMBER() OVER (PARTITION BY profile_id
-                                             ORDER BY datetime(ts) DESC, id DESC) AS rn
-                     FROM usage_event
-               ) WHERE rn = 1""")
-    }
+    """last_use_by_profile() from the running rollup: each Profile's latest
+    request, newest by real time (see _Rollup._rebuild on offsets)."""
+    return _rollup.snapshot()[2]
 
 
 # How far before a range's cutoff the SQL prefilter reaches. The column stores

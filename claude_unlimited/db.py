@@ -34,6 +34,17 @@ show any Profile, worst when the machine was busy.
 
 A single connection cannot leak, keeps the WAL checkpointing normally, and
 costs a lock around statements that take tens of milliseconds at most.
+
+That last sentence stopped being true once the Statistics queries and a
+once-a-second Dashboard poll shared the lock with the proxy's own writes: a
+half-second report held every other Dashboard request, and every usage row and
+activity line the proxy wanted to write, behind it. A few open tabs queued
+faster than the lock drained, and the Profiles page sat on "Loading" for
+minutes. So the lock now guards only what has to be single: the one WRITE
+connection (and migrations). Reads go to a small, bounded pool of read-only
+handles. WAL lets them run beside the writer, so a slow report delays nothing
+but itself, and the bound keeps the handle count from ever growing the way the
+per-thread design's did.
 """
 
 from __future__ import annotations
@@ -57,8 +68,8 @@ _entry: Optional[tuple] = None
 # once, and on a brand-new database they would otherwise all run the first
 # migration concurrently — one wins, the rest hit "table already exists".
 _open_lock = threading.RLock()
-# Held around every statement, because the one connection is shared. Reentrant:
-# import_legacy_logs() calls query() and execute() while already inside it.
+# Held around every WRITE (and open), because the one write connection is
+# shared. Reads take a pooled read-only handle instead and never touch it.
 _use_lock = threading.RLock()
 # Degraded state is per database FILE, not per process. A poisoned file in one
 # APP_DIR must not disable a perfectly good store in another (the test suite
@@ -66,6 +77,16 @@ _use_lock = threading.RLock()
 # rest of the run).
 _degraded: dict = {}
 _degraded_lock = threading.Lock()
+
+# Bumped whenever rows of usage_event may have been changed or removed (as
+# opposed to appended), so anything that keeps a running total of the table
+# knows to start again. Appends are not counted: they are what an incremental
+# total is for. See usage_history._Rollup.
+_usage_epoch = 0
+
+# The read pool: at most this many read-only handles, shared by every thread.
+# A handle is only ever borrowed for the length of one statement.
+READ_POOL_SIZE = 6
 
 
 def path() -> Path:
@@ -188,7 +209,8 @@ def connect() -> Optional[sqlite3.Connection]:
     error to raise.
 
     Shared across threads (see the module docstring), so every caller must run
-    its statements under `_use_lock` — which `execute()` and `query()` do.
+    its statements under `_use_lock` — which `execute()` does. Reads do not
+    use this handle at all: see `query()` and `_ReadPool`.
     """
     global _entry
     target = path()
@@ -206,7 +228,7 @@ def connect() -> Optional[sqlite3.Connection]:
         try:
             config.ensure_app_dir()
             # check_same_thread=False: one connection, many threads, every
-            # statement serialized by _use_lock.
+            # write serialized by _use_lock.
             conn = sqlite3.connect(target, timeout=BUSY_TIMEOUT_MS / 1000, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode = WAL")
@@ -237,29 +259,135 @@ def execute(sql: str, params: Sequence[Any] = ()) -> Optional[int]:
     """One write, committed. Returns the new rowid, or None when the store is
     unusable — a lost row must never surface as an exception in the request
     path (see the module docstring)."""
+    global _usage_epoch
     with _use_lock:
         conn = connect()
         if conn is None:
             return None
         try:
             with conn:
-                return conn.execute(sql, params).lastrowid
+                rowid = conn.execute(sql, params).lastrowid
         except (sqlite3.Error, OSError):
             # One statement failing is not evidence the store is unusable — a
             # lost row is dropped quietly, exactly like an unwritable activity
             # line. Only open/migrate failures degrade the database.
             return None
+        if "usage_event" in sql and not sql.lstrip().upper().startswith("INSERT"):
+            _usage_epoch += 1
+        return rowid
+
+
+def usage_epoch() -> int:
+    """Changes whenever usage_event rows may have been altered or deleted."""
+    return _usage_epoch
+
+
+class _ReadPool:
+    """A bounded set of read-only handles on one database file.
+
+    Bounded so the daemon's thread-per-connection model can never leak handles
+    again (see the module docstring); read-only so none of them can contend for
+    the write lock. A handle is borrowed for one statement and the cursor is
+    drained before it goes back, so no read transaction is left open to pin
+    the write-ahead log."""
+
+    def __init__(self, target: Path) -> None:
+        self.target = target
+        self._cond = threading.Condition()
+        self._idle: list = []
+        self._open = 0
+        self._closed = False
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.target.as_uri() + "?mode=ro", uri=True,
+                               timeout=BUSY_TIMEOUT_MS / 1000,
+                               check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        return conn
+
+    def run(self, sql: str, params: Sequence[Any]) -> list[sqlite3.Row]:
+        with self._cond:
+            while True:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("read pool closed")
+                if self._idle:
+                    conn = self._idle.pop()
+                    break
+                if self._open < READ_POOL_SIZE:
+                    self._open += 1
+                    conn = None
+                    break
+                self._cond.wait()
+        try:
+            if conn is None:
+                conn = self._connect()
+            rows = list(conn.execute(sql, params))
+        except BaseException:
+            # A handle that errored is not trusted again; its slot is freed.
+            with self._cond:
+                self._open -= 1
+                self._cond.notify()
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            raise
+        with self._cond:
+            if self._closed:
+                self._open -= 1
+                stale = conn
+            else:
+                self._idle.append(conn)
+                stale = None
+            self._cond.notify()
+        if stale is not None:
+            stale.close()
+        return rows
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            idle, self._idle = self._idle, []
+            self._open -= len(idle)
+            self._cond.notify_all()
+        for conn in idle:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+_pool: Optional[_ReadPool] = None
+_pool_lock = threading.Lock()
+
+
+def _read_pool() -> Optional[_ReadPool]:
+    """The pool for the CURRENT database file, created once the store has been
+    opened and migrated (a read-only handle cannot create or upgrade it)."""
+    global _pool
+    if connect() is None:
+        return None
+    target = path()
+    with _pool_lock:
+        if _pool is None or _pool.target != target:
+            if _pool is not None:
+                _pool.close()
+            _pool = _ReadPool(target)
+        return _pool
 
 
 def query(sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-    with _use_lock:
-        conn = connect()
-        if conn is None:
-            return []
-        try:
-            return list(conn.execute(sql, params))
-        except (sqlite3.Error, OSError):
-            return []
+    """A read, on a pooled read-only handle: it does not wait for the writer,
+    for a slow report, or for any other reader beyond the pool bound."""
+    pool = _read_pool()
+    if pool is None:
+        return []
+    try:
+        return pool.run(sql, params)
+    except (sqlite3.Error, OSError):
+        return []
 
 
 def close_this_thread() -> None:
@@ -269,11 +397,16 @@ def close_this_thread() -> None:
     Named for the per-thread handles this module used to keep — kept as the
     name every caller already uses, and still exactly "drop the handle".
     """
-    global _entry
+    global _entry, _pool, _usage_epoch
+    with _pool_lock:
+        if _pool is not None:
+            _pool.close()
+            _pool = None
     with _open_lock:
         if _entry is not None:
             _close_entry(_entry[1])
             _entry = None
+        _usage_epoch += 1
     _clear_degraded()
 
 

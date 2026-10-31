@@ -73,6 +73,50 @@ DEFAULT_PORT = 4317
 ALLOWED_HOST_NAMES = {"127.0.0.1", "localhost", "claude.unlimited"}
 
 
+class _Flight:
+    __slots__ = ("done", "result", "error")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result = None
+        self.error: Optional[BaseException] = None
+
+
+_flights: dict = {}
+_flights_lock = threading.Lock()
+
+
+def _single_flight(key: str, compute):
+    """Run `compute()` once for however many callers ask for `key` at the same
+    time; the others wait for that run and share its result.
+
+    For the report endpoints only. Each takes a good fraction of a second of CPU
+    and is polled every few seconds by every open Dashboard tab, so several tabs
+    (or one tab whose requests had started to pile up) used to run the same
+    report side by side, each making the others slower. A caller that arrives
+    after the run has finished starts a fresh one: nothing is served stale."""
+    with _flights_lock:
+        flight = _flights.get(key)
+        leader = flight is None
+        if leader:
+            flight = _flights[key] = _Flight()
+    if not leader:
+        flight.done.wait()
+        if flight.error is not None:
+            raise flight.error
+        return flight.result
+    try:
+        flight.result = compute()
+        return flight.result
+    except BaseException as exc:
+        flight.error = exc
+        raise
+    finally:
+        with _flights_lock:
+            _flights.pop(key, None)
+        flight.done.set()
+
+
 def _qs_int(qs: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
     """A clamped integer from a query string, tolerating rubbish.
 
@@ -832,107 +876,111 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/usage/stats":
             qs = parse_qs(urlparse(self.path).query)
-            range_key = qs.get("range", [None])[0]
-            if range_key not in usage_history.RANGE_KEYS:
-                range_key = "1m"
-            ranged = usage_history.aggregated_since(range_key)
-            # The line chart carries more points than the bar-based summary.
-            granularity = usage_history.CHART_GRANULARITY[range_key]
-            if granularity == "hour":
-                buckets = usage_history.hourly_totals(ranged, bucket_hours=1)
-            elif granularity == "week":
-                # Enough weeks to span the whole range, or the chart silently
-                # covers less time than the total printed next to it.
-                days = usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30)
-                buckets = usage_history.weekly_totals(ranged, weeks=max(1, -(-days // 7)))
-            elif granularity == "month":
-                buckets = usage_history.monthly_totals(
-                    ranged, months=usage_history.months_to_cover(ranged, range_key))
-            else:
-                buckets = usage_history.daily_totals(ranged, days=usage_history.CHART_TO_DAYS.get(range_key, 30))
-            profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
-            by_profile = usage_history.split_by(ranged, "profile")
-            by_profile = _merge_deleted_profiles(by_profile, load_pool().profiles)
-            for row in by_profile:
-                profile = profiles_by_id.get(row["key"])
-                # An append-only log still holds rows for a deleted Profile;
-                # name it plainly rather than showing a bare internal id.
-                if row.get("deleted"):
-                    # Already named by _merge_deleted_profiles, which knows how
-                    # many ids it folded together; relabelling would discard
-                    # that count and print a bare "deleted profile".
-                    continue
-                row["label"] = profile.name if profile else ("Other" if row.get("other") else "deleted profile")
-                row["kind"] = profile.kind if profile else None
-            self._send_json(200, {
-                "range": range_key,
-                "granularity": granularity,
-                # One cost line per provider kind, sharing the bucket x-axis.
-                "series": usage_history.series_by_kind(
-                    ranged, buckets,
-                    {p.id: p.kind for p in load_pool().profiles}),
-                "totals": usage_history.totals(ranged),
-                "buckets": buckets,
-                "by_model": usage_history.split_by(ranged, "model"),
-                "by_project": _label_projects(usage_history.split_by(ranged, "project")),
-                "by_profile": by_profile,
-                "by_requested_model": usage_history.split_by(ranged, "requested_model"),
-                # What ECO saved in this range. Carries its own "never ran"
-                # signal so the UI never prints "$0.00 saved" for a feature
-                # that was simply switched off.
-                "eco": usage_history.eco_totals(ranged),
-                "speech": usage_history.speech_totals(ranged),
-                # Calls per day for the activity heatmap. Always a day grid,
-                # independent of the chart's granularity: a heatmap of weeks
-                # or months is not a heatmap.
-                "days": usage_history.daily_totals(
-                    ranged, days=min(usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30), 182)),
-                "history_begins": usage_history.history_begins_at(),
-            })
+            def compute():
+                range_key = qs.get("range", [None])[0]
+                if range_key not in usage_history.RANGE_KEYS:
+                    range_key = "1m"
+                ranged = usage_history.aggregated_since(range_key)
+                # The line chart carries more points than the bar-based summary.
+                granularity = usage_history.CHART_GRANULARITY[range_key]
+                if granularity == "hour":
+                    buckets = usage_history.hourly_totals(ranged, bucket_hours=1)
+                elif granularity == "week":
+                    # Enough weeks to span the whole range, or the chart silently
+                    # covers less time than the total printed next to it.
+                    days = usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30)
+                    buckets = usage_history.weekly_totals(ranged, weeks=max(1, -(-days // 7)))
+                elif granularity == "month":
+                    buckets = usage_history.monthly_totals(
+                        ranged, months=usage_history.months_to_cover(ranged, range_key))
+                else:
+                    buckets = usage_history.daily_totals(ranged, days=usage_history.CHART_TO_DAYS.get(range_key, 30))
+                profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
+                by_profile = usage_history.split_by(ranged, "profile")
+                by_profile = _merge_deleted_profiles(by_profile, load_pool().profiles)
+                for row in by_profile:
+                    profile = profiles_by_id.get(row["key"])
+                    # An append-only log still holds rows for a deleted Profile;
+                    # name it plainly rather than showing a bare internal id.
+                    if row.get("deleted"):
+                        # Already named by _merge_deleted_profiles, which knows how
+                        # many ids it folded together; relabelling would discard
+                        # that count and print a bare "deleted profile".
+                        continue
+                    row["label"] = profile.name if profile else ("Other" if row.get("other") else "deleted profile")
+                    row["kind"] = profile.kind if profile else None
+                return {
+                    "range": range_key,
+                    "granularity": granularity,
+                    # One cost line per provider kind, sharing the bucket x-axis.
+                    "series": usage_history.series_by_kind(
+                        ranged, buckets,
+                        {p.id: p.kind for p in load_pool().profiles}),
+                    "totals": usage_history.totals(ranged),
+                    "buckets": buckets,
+                    "by_model": usage_history.split_by(ranged, "model"),
+                    "by_project": _label_projects(usage_history.split_by(ranged, "project")),
+                    "by_profile": by_profile,
+                    "by_requested_model": usage_history.split_by(ranged, "requested_model"),
+                    # What ECO saved in this range. Carries its own "never ran"
+                    # signal so the UI never prints "$0.00 saved" for a feature
+                    # that was simply switched off.
+                    "eco": usage_history.eco_totals(ranged),
+                    "speech": usage_history.speech_totals(ranged),
+                    # Calls per day for the activity heatmap. Always a day grid,
+                    # independent of the chart's granularity: a heatmap of weeks
+                    # or months is not a heatmap.
+                    "days": usage_history.daily_totals(
+                        ranged, days=min(usage_history.RANGE_TO_SPAN_DAYS.get(range_key, 30), 182)),
+                    "history_begins": usage_history.history_begins_at(),
+                }
+            self._send_json(200, _single_flight(self.path, compute))
             return
 
         if path == "/api/usage/summary":
             qs = parse_qs(urlparse(self.path).query)
-            range_key = qs.get("range", [None])[0]
-            if range_key not in usage_history.RANGE_KEYS:
-                range_key = "1w"
-            granularity = usage_history.RANGE_GRANULARITY[range_key]
-            ranged_events = usage_history.aggregated_since(range_key)
-            bucket_hours = 6  # 4 bars over the last 24h; 24 one-hour bars is too dense for the card
-            if granularity == "hour":
-                chart_totals = usage_history.hourly_totals(ranged_events, bucket_hours=bucket_hours)
-            elif granularity == "week":
-                chart_totals = usage_history.weekly_totals(ranged_events)
-            elif granularity == "month":
-                chart_totals = usage_history.monthly_totals(ranged_events)
-            else:
-                default_days = usage_history.RANGE_TO_DAYS[range_key]
-                days = _qs_int(qs, "days", default_days, minimum=1, maximum=31)
-                chart_totals = usage_history.daily_totals(ranged_events, days=days)
-            profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
-            by_profile_days = _qs_int(qs, "days", 7, minimum=1, maximum=31)
-            by_profile_totals = usage_history.daily_totals_by_profile(
-                usage_history.aggregated_in_last_days(by_profile_days), days=by_profile_days)
-            # usage_history is append-only, so it still carries entries for
-            # a deleted Profile's id. Drop anything that isn't a current
-            # Profile so the chart never shows a bare internal id.
-            for bucket in by_profile_totals:
-                bucket["profiles"] = {pid: tok for pid, tok in bucket["profiles"].items() if pid in profiles_by_id}
-            self._send_json(200, {
-                "range": range_key,
-                "granularity": granularity,
-                "bucket_hours": bucket_hours if granularity == "hour" else None,
-                "daily_totals": chart_totals,
-                "daily_totals_by_profile": by_profile_totals,
-                "profile_colors": {pid: p.tag_color for pid, p in profiles_by_id.items() if p.tag_color},
-                "profile_names": {pid: p.name for pid, p in profiles_by_id.items()},
-                "model_split": usage_history.model_split(ranged_events),
-                "hourly_histogram": usage_history.hourly_histogram(ranged_events),
-                "cost_by_profile": usage_history.cost_by_profile(ranged_events),
-                "total_events": usage_history.event_count(),
-                "pricing_source": pricing.PRICING_SOURCE,
-                "pricing_fetched": pricing.PRICING_FETCHED,
-            })
+            def compute():
+                range_key = qs.get("range", [None])[0]
+                if range_key not in usage_history.RANGE_KEYS:
+                    range_key = "1w"
+                granularity = usage_history.RANGE_GRANULARITY[range_key]
+                ranged_events = usage_history.aggregated_since(range_key)
+                bucket_hours = 6  # 4 bars over the last 24h; 24 one-hour bars is too dense for the card
+                if granularity == "hour":
+                    chart_totals = usage_history.hourly_totals(ranged_events, bucket_hours=bucket_hours)
+                elif granularity == "week":
+                    chart_totals = usage_history.weekly_totals(ranged_events)
+                elif granularity == "month":
+                    chart_totals = usage_history.monthly_totals(ranged_events)
+                else:
+                    default_days = usage_history.RANGE_TO_DAYS[range_key]
+                    days = _qs_int(qs, "days", default_days, minimum=1, maximum=31)
+                    chart_totals = usage_history.daily_totals(ranged_events, days=days)
+                profiles_by_id = {p.id: p for p in profile_repo.list_profiles()}
+                by_profile_days = _qs_int(qs, "days", 7, minimum=1, maximum=31)
+                by_profile_totals = usage_history.daily_totals_by_profile(
+                    usage_history.aggregated_in_last_days(by_profile_days), days=by_profile_days)
+                # usage_history is append-only, so it still carries entries for
+                # a deleted Profile's id. Drop anything that isn't a current
+                # Profile so the chart never shows a bare internal id.
+                for bucket in by_profile_totals:
+                    bucket["profiles"] = {pid: tok for pid, tok in bucket["profiles"].items() if pid in profiles_by_id}
+                return {
+                    "range": range_key,
+                    "granularity": granularity,
+                    "bucket_hours": bucket_hours if granularity == "hour" else None,
+                    "daily_totals": chart_totals,
+                    "daily_totals_by_profile": by_profile_totals,
+                    "profile_colors": {pid: p.tag_color for pid, p in profiles_by_id.items() if p.tag_color},
+                    "profile_names": {pid: p.name for pid, p in profiles_by_id.items()},
+                    "model_split": usage_history.model_split(ranged_events),
+                    "hourly_histogram": usage_history.hourly_histogram(ranged_events),
+                    "cost_by_profile": usage_history.cost_by_profile(ranged_events),
+                    "total_events": usage_history.event_count(),
+                    "pricing_source": pricing.PRICING_SOURCE,
+                    "pricing_fetched": pricing.PRICING_FETCHED,
+                }
+            self._send_json(200, _single_flight(self.path, compute))
             return
 
         if path == "/api/activity":
@@ -2142,6 +2190,10 @@ def run_foreground(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> None:
     # and nothing about the dashboard should wait for that.
     threading.Thread(target=hud.keep_installed, args=(__version__,),
                      daemon=True, name="hud-install").start()
+    # Build the lifetime-totals rollup now, off the serving threads, so the first
+    # Dashboard load after a restart does not pay for the one full pass over the
+    # table (usage_history._Rollup).
+    threading.Thread(target=usage_history.totals_by_profile, daemon=True, name="usage-rollup-warm").start()
     threading.Thread(target=_oauth_refresh_loop, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
     threading.Thread(target=_usage_probe_loop, daemon=True, name="usage-probe").start()

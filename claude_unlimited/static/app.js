@@ -3993,9 +3993,21 @@ window.addEventListener('popstate', () => {
 // second; setLiveHtml (top of file) keeps unchanged content from flickering.
 // Skipped while the tab is hidden, a modal is open (don't pull content out
 // from under active input), or a Profiles-table drag is in progress.
+// One tick at a time. setInterval fires every second whether or not the last
+// tick has finished, so when the daemon was slow every tick added more requests
+// to a queue that was already too long, and a few seconds of slowness became
+// minutes of "Loading". A tick that is still running holds the next ones off;
+// the guard lets go after POLL_STUCK_MS so a request that never answers cannot
+// freeze the Dashboard for good.
+const POLL_STUCK_MS = 30000;
+let _pollStartedAt = 0;
+
 async function pollLiveUpdate() {
   if (document.hidden) return;
   if (document.querySelector('.modal-scrim.open')) return;
+  if (_pollStartedAt && Date.now() - _pollStartedAt < POLL_STUCK_MS) return;
+  const myTick = Date.now();
+  _pollStartedAt = myTick;
   try {
     // loadStatus() supplies "who's active" and must run on every tick
     // regardless of the open view — otherwise a rotation that happens while
@@ -4034,6 +4046,8 @@ async function pollLiveUpdate() {
     // a single missed poll tick isn't worth surfacing — the connection
     // banner (checkConnection, polling independently) reports a genuinely
     // unreachable daemon.
+  } finally {
+    if (_pollStartedAt === myTick) _pollStartedAt = 0;
   }
 }
 
