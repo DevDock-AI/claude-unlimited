@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
+from urllib.parse import urlparse
 
 from . import activity, eco, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
 from . import profiles as profile_repo
@@ -177,6 +178,51 @@ def _force_model_body(profile: "Profile", body: bytes) -> Optional[bytes]:
     if requested is None or requested == profile.force_model:
         return None
     return rewrite_model(body, profile.force_model)
+
+
+# Claude Code opens every system prompt with an attribution block,
+# "x-anthropic-billing-header: ... cch=<hash>; ...", whose hash changes on
+# every request. Anthropic strips it before inference. A third-party
+# Anthropic-compatible endpoint (OpenRouter, a local model server) feeds it to
+# the model as the first tokens of the prompt, so no two requests share a
+# prefix and prompt caching never hits: every turn is billed as fresh input.
+_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+
+
+def _strip_billing_header_body(profile: "Profile", body: bytes) -> Optional[bytes]:
+    """The body without Claude Code's per-request attribution block, for an
+    api Profile that does not point at Anthropic. None when there is nothing
+    to strip, so Anthropic-bound and oauth traffic are never touched."""
+    if profile.kind != "api" or not profile.base_url:
+        return None
+    host = (urlparse(profile.base_url).hostname or "").lower()
+    if host == "anthropic.com" or host.endswith(".anthropic.com"):
+        return None
+    if _BILLING_HEADER_PREFIX.encode() not in body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    system = parsed.get("system")
+    if isinstance(system, list):
+        kept = [block for block in system
+                if not (isinstance(block, dict) and block.get("type") == "text"
+                        and str(block.get("text", "")).startswith(_BILLING_HEADER_PREFIX))]
+        if len(kept) == len(system):
+            return None
+        parsed["system"] = kept
+    elif isinstance(system, str) and system.startswith(_BILLING_HEADER_PREFIX):
+        rest = system.split("\n", 1)[1] if "\n" in system else ""
+        if rest:
+            parsed["system"] = rest
+        else:
+            parsed.pop("system")
+    else:
+        return None
+    return json.dumps(parsed).encode("utf-8")
 
 
 def _restorable_usage_fields(persisted: Optional[dict], now: datetime) -> dict:
@@ -1297,6 +1343,9 @@ class Gateway:
             forced = _force_model_body(profile, eco_body)
             if forced is not None:
                 eco_body = forced
+            stripped = _strip_billing_header_body(profile, eco_body)
+            if stripped is not None:
+                eco_body = stripped
             known_bad = self._default_model_body(profile, eco_body)
             if known_bad is not None:
                 eco_body = known_bad

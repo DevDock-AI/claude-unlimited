@@ -1998,6 +1998,67 @@ def test_a_400_that_only_mentions_the_word_model_is_not_a_refusal(pool_env):
     assert sent == ["qwen3-coder", "qwen3-coder"]
 
 
+# ---- Claude Code's per-request billing header ------------------------------
+
+_BILLING = "x-anthropic-billing-header: cc_version=2.1.0.abc; cc_entrypoint=cli; cch=5f3a1;"
+
+
+def _profile(kind="api", base_url=None):
+    return Profile(id="p", name="P", kind=kind, priority=1, automatic=True, enabled=True, base_url=base_url)
+
+
+def _billing_body(system=None):
+    if system is None:
+        system = [{"type": "text", "text": _BILLING},
+                  {"type": "text", "text": "You are Claude Code."}]
+    return json.dumps({"model": "m", "system": system,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+
+def test_billing_header_is_stripped_for_an_openrouter_api_profile():
+    out = gateway_module._strip_billing_header_body(_profile(base_url="https://openrouter.ai/api"), _billing_body())
+    assert json.loads(out)["system"] == [{"type": "text", "text": "You are Claude Code."}]
+    assert _BILLING.encode() not in out
+
+
+@pytest.mark.parametrize("profile", [
+    _profile(base_url="https://api.anthropic.com"),
+    _profile(base_url="https://anthropic.com"),
+    _profile(kind="oauth"),
+    _profile(kind="oauth", base_url="https://openrouter.ai/api"),
+    _profile(base_url=None),
+    _profile(base_url=""),
+])
+def test_billing_header_is_left_alone_for_anthropic_oauth_and_default_profiles(profile):
+    assert gateway_module._strip_billing_header_body(profile, _billing_body()) is None
+
+
+def test_billing_header_in_a_string_system_prompt_is_stripped():
+    profile = _profile(base_url="http://127.0.0.1:5566")
+    out = gateway_module._strip_billing_header_body(profile, _billing_body(_BILLING + "\nYou are Claude Code."))
+    assert json.loads(out)["system"] == "You are Claude Code."
+    # A string that is only the header leaves no system prompt at all.
+    assert "system" not in json.loads(gateway_module._strip_billing_header_body(profile, _billing_body(_BILLING)))
+
+
+def test_a_body_without_the_billing_header_returns_none():
+    profile = _profile(base_url="https://openrouter.ai/api")
+    assert gateway_module._strip_billing_header_body(profile, _billing_body("You are Claude Code.")) is None
+    assert gateway_module._strip_billing_header_body(profile, _billing_body([{"type": "text", "text": "hi"}])) is None
+    assert gateway_module._strip_billing_header_body(profile, b"not json " + _BILLING.encode()) is None
+    # The prefix mentioned outside the system prompt is user content, not the header.
+    mentioned = json.dumps({"model": "m", "messages": [{"role": "user", "content": _BILLING}]}).encode()
+    assert gateway_module._strip_billing_header_body(profile, mentioned) is None
+
+
+def test_gateway_sends_the_stripped_body_to_a_non_anthropic_api_profile(pool_env):
+    _api_pool()
+    sent = []
+    gw = Gateway(transport=lambda req: (sent.append(json.loads(req.body)), fake_response(200))[1])
+    assert gw.handle("POST", "/v1/messages", {}, _billing_body()).status == 200
+    assert sent[0]["system"] == [{"type": "text", "text": "You are Claude Code."}]
+
+
 def test_a_large_error_body_is_forwarded_whole_past_the_peek_cap():
     head = b"x" * gateway_module._MAX_ERROR_BODY_PEEK
     tail = b"tail"
