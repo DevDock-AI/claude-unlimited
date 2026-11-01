@@ -4,7 +4,7 @@
 
 ### When one account hits its usage limit, your session doesn't.
 
-Claude Unlimited pools your Claude (Pro · Max), ChatGPT/Codex, and Anthropic API accounts
+Claude Unlimited pools your Claude (Pro · Max · Ultra), ChatGPT/Codex, and Anthropic API accounts
 into one continuous supply for Claude Code. When an account runs dry, the next one takes
 over on the very next request — same session, same context, same terminal. You keep typing.
 
@@ -12,7 +12,7 @@ over on the very next request — same session, same context, same terminal. You
 
 <table>
 <tr>
-<td align="center" width="150"><img src="docs/logos/claude.png" height="14" alt=""><br><b>Claude</b><br><sub>Pro · Max</sub></td>
+<td align="center" width="150"><img src="docs/logos/claude.png" height="14" alt=""><br><b>Claude</b><br><sub>Pro · Max · Ultra</sub></td>
 <td align="center" width="150"><img src="docs/logos/openai.png" height="14" alt=""><br><b>ChatGPT</b><br><sub>Codex · Plus · Pro</sub></td>
 <td align="center" width="150">🔑<br><b>API keys</b><br><sub>Anthropic · gateways</sub></td>
 <td align="center" width="60"><b>→</b></td>
@@ -57,6 +57,7 @@ dashboard's activity log is the only place you'll find out it happened.
 | **[Models parity](#which-gpt-model-runs-your-claude-model)** | Which GPT model runs each Claude model |
 | **[Usage](#usage)** | Daily driving |
 | **[The Claude desktop app](#using-the-claude-desktop-app)** | Route the app through your pool too |
+| **[The codex CLI](#using-the-codex-cli)** | OpenAI's own CLI, on your ChatGPT accounts |
 | **[Your own app](#calling-the-daemon-from-your-own-app)** | Anything that speaks the Messages API |
 | **[The dashboard](#the-dashboard)** | What you can see and control |
 | **[ECO](#eco--efficient-context-optimization)** | Fewer tokens for the same work |
@@ -82,7 +83,7 @@ the next one takes over on the very next request. Same session, same context, sa
 terminal. You don't get logged out, you don't get prompted, you don't restart anything.
 Often the first you'll know about it is a line in the activity log.
 
-It pools whatever you've got — Claude Pro/Max subscriptions, ChatGPT/Codex subscriptions,
+It pools whatever you've got — Claude Pro/Max/Ultra subscriptions, ChatGPT/Codex subscriptions,
 Anthropic API keys, your own gateway — and treats them as one continuous supply.
 
 > Other multi-account tools automate the swap too, but they're CLI-only. There's nowhere
@@ -101,6 +102,7 @@ Anthropic API keys, your own gateway — and treats them as one continuous suppl
 | 🧠 | **[The 1M context window, through the pool](#the-1m-context-window)** — Claude Code normally drops to 200K behind a proxy; `cu code` gets the million back, and a ChatGPT account in the pool is guarded turn by turn instead of costing you the window. |
 | ⚖️ | **[Balanced sessions](#balancing-sessions-and-subagents-across-accounts)** — `cu code --distribute` spreads the main agent and each subagent across accounts, each staying put so its prompt cache stays warm. |
 | ⏳ | **[Per-model limits](#when-fable-runs-out-but-the-account-hasnt)** — when a plan's Fable week runs out before the account does, the session can move on instead of failing every Fable request. |
+| <img src="docs/logos/openai.png" height="14" alt=""> | **[The codex CLI too](#using-the-codex-cli)** — `cu codex` runs OpenAI's own CLI on the pool's ChatGPT accounts, moving to the next one when one runs out. Off by default. |
 | 🖥️ | **[The Claude desktop app too](#using-the-claude-desktop-app)** — not just the terminal. One command points it at your pool, and `--revert` puts it back. |
 | 📊 | **A dashboard you'll actually open** — live usage bars, cost tracking, model split, per-project attribution, activity log. |
 | 📈 | **[Statistics](#the-dashboard)** — spend and tokens over time as line charts, broken down by model, project and account, plus what each request *asked for* versus what served it. |
@@ -171,12 +173,16 @@ This is the part worth being explicit about:
 - **`claude` never sees your real credentials either.** It authenticates to the daemon
   with a local placeholder token. The real credential is substituted server-side and never
   returned to the client.
-- **Almost the only outbound traffic is the API call you already intended to make** —
-  same destination as without this tool. No quota probing, no keep-warm pings, no
-  background chatter. The two exceptions are both ones you can name: a once-a-day
-  version check against GitHub's public API, and refreshing an account's own OAuth
-  token shortly before it expires, so an account you haven't used in a while doesn't
-  quietly need a re-login.
+- **Most outbound traffic is the API call you already intended to make** — same
+  destination as without this tool. Three other kinds of request go out on their own,
+  and they are all of them:
+  - a once-a-day version check against GitHub's public API;
+  - refreshing an account's own OAuth token shortly before it expires, so an account you
+    haven't used in a while doesn't quietly need a re-login (a refresh that keeps failing
+    backs off to hours, not minutes);
+  - while you're active, reading each subscription account's usage from the provider's
+    read-only usage endpoint every 5–10 minutes. It pauses after 30 minutes idle and sends
+    no messages ([details](#keeping-usage-numbers-fresh)).
 
 ---
 
@@ -251,7 +257,7 @@ Requires **Python 3.10+**, **git**, and the **`claude`** CLI on your `PATH`.
 
 ## Add a Claude subscription
 
-<img src="docs/logos/claude.png" height="14" alt=""> **Claude Pro or Max**
+<img src="docs/logos/claude.png" height="14" alt=""> **Claude Pro, Max or Ultra**
 
 ```bash
 claude-unlimited add-account
@@ -277,7 +283,8 @@ Same flow, for a ChatGPT/Codex account. Once added, it joins the same rotation �
 Code keeps speaking the Anthropic API, and requests routed to this account are translated
 to and from OpenAI's transparently, streaming included.
 
-Also isolated: your existing `codex` login is left alone.
+Also isolated: your existing `codex` login is left alone. The same accounts can also serve
+OpenAI's own `codex` CLI — see [Using the codex CLI](#using-the-codex-cli).
 
 ### Purchased credits
 
@@ -303,10 +310,10 @@ has to decide which GPT model actually answers — and how hard it thinks. That'
 
 | Claude model | Claude effort | Runs as (Codex) | Codex effort |
 |---|---|---|---|
-| Claude Fable 5.1 | Automatic | `gpt-5.6-sol` | medium |
-| Claude Opus 5.5 | Automatic | `gpt-5.6-terra` | high |
-| Claude Sonnet 5 | Automatic | `gpt-5.6-terra` | medium |
-| Claude Haiku 4.5 | Automatic | `gpt-5.6-luna` | low |
+| Claude Fable 5.1 | Automatic | `gpt-6.1-sol` | medium |
+| Claude Opus 5.5 | Automatic | `gpt-6.1-terra` | high |
+| Claude Sonnet 5.5 | Automatic | `gpt-6.1-terra` | medium |
+| Claude Haiku 5.5 | Automatic | `gpt-6-luna` | low |
 
 - **It's an editable list.** It starts with those four. Add a row with **+ Add model**,
   remove one with the red 🗑, and **Save**. **Reset to defaults** brings the four back.
@@ -356,9 +363,10 @@ enabling, disabling, and removal are all dashboard-managed.
 
 Works with Anthropic API keys and any Anthropic-compatible gateway — including a **local
 model server** that speaks the Anthropic Messages API (an MLX server, LM Studio, and others):
-the Base URL may be `http://` when it points at your own machine or LAN (`localhost`,
-`127.0.0.1`, `192.168.x.x`, `10.x.x.x`); anything else must be `https://`. This applies to
-API-key profiles only — a Codex profile's Base URL is always `https://`.
+the Base URL may be plain `http://` to any address — `localhost`, a LAN IP, a `.local` name
+or your own server. Plain http sends the key unencrypted, so use it where you trust the
+network. This applies to API-key profiles only — a Codex profile's Base URL is always
+`https://`.
 
 Two optional model fields decide what the endpoint is asked for:
 
@@ -483,8 +491,8 @@ route exactly as they always have.
 
 ### The 1M context window
 
-Several Claude models hold a million tokens: **Sonnet 5**, **Opus 4.7 / 4.8 / 5 / 5.5**, **Fable 5
-and 5.1**, **Mythos 5 and 5.1**. Claude Code only uses that window when it is talking
+Several Claude models hold a million tokens: **Sonnet 5 / 5.5**, **Haiku 5.5**, **Opus 4.7 / 4.8 /
+5 / 5.5**, **Fable 5 and 5.1**, **Mythos 5 and 5.1**. Claude Code only uses that window when it is talking
 straight to `api.anthropic.com`. Pointed anywhere else — including this daemon on your own
 machine — it falls back to **200K**, because it has no way to tell what is on the other end
 of that address.
@@ -497,6 +505,8 @@ so on your behalf, and you get the million back:
 |---|---|---|
 | Opus 5 | 200,000 | **1,000,000** |
 | Sonnet 5 | 200,000 | **1,000,000** |
+| Sonnet 5.5 | 200,000 | **1,000,000** |
+| Haiku 5.5 | 200,000 | **1,000,000** |
 
 **A ChatGPT/Codex account in the pool no longer costs you the window.** A ChatGPT account
 answers with a GPT model whose own window is about **272K** tokens, so the daemon sizes every
@@ -587,6 +597,38 @@ Which one wins, in order:
 | `cu code --distribute` | Main agent and each subagent start on the least-busy account and stay there, that session. |
 | Settings → "Balance sessions and subagents across accounts" | Same as above, for every session, no flag needed. |
 | *nothing set (default)* | Normal rotation — everyone shares one account until it's spent. |
+
+### Using the codex CLI
+
+ChatGPT-subscription accounts in the pool can also serve **OpenAI's own `codex` CLI**, not just
+Claude Code. It is **off by default**: turn it on in **Settings → Routing → Codex CLI** (the
+section appears once the pool has a ChatGPT-subscription account), then:
+
+```bash
+cu codex                       # interactive codex
+cu codex exec "fix the tests"  # anything codex accepts passes straight through
+cu codex --profile Work        # pin this codex session to one ChatGPT account
+```
+
+With more than one enabled ChatGPT account and no `--profile`, it asks — like `cu code` —
+whether to rotate across them or pin the session to one.
+
+What happens:
+
+- `cu codex` starts the real `codex` with a provider override for that one run, pointing it at
+  the daemon. **Your `~/.codex`, your own `codex` login and plain `codex` are untouched.**
+- Each request goes to one of the pool's ChatGPT-subscription accounts. When that account
+  reaches its limit, the daemon moves the request to the next one **before codex sees an
+  error**. A conversation stays on the account it started on while that account has room.
+- When a conversation does move, the reasoning that only the old account can decrypt is left
+  out; every message, tool call and output is kept, and the model re-reasons from them.
+- Only ChatGPT-subscription accounts serve codex — never a Claude account or an API key. If
+  every one is spent, codex shows its own "usage limit reached, try again at …" message.
+- Usage shows up under each account in the dashboard like any other request. Claude Code
+  sessions and codex sessions can share an account at the same time.
+
+Before turning it on, read [A note on Terms of Service](#a-note-on-terms-of-service) — OpenAI
+has not said whether this is allowed.
 
 ### Using the Claude desktop app
 
@@ -885,7 +927,7 @@ the old `CapacityWidget.app`, the name it had before, keeping your saved positio
 - Hover a profile for its detail card: plan, usage windows, reset times, today's spend, and a
   session line — while it is serving, how many agents are on it and for how long; otherwise when
   it was last used. Under that, the model and project of its latest request (a Codex account
-  shows the Claude model it translated, e.g. `opus-5 → gpt-5.6-terra`).
+  shows the Claude model it translated, e.g. `opus-5-5 → gpt-6.1-terra`).
 - Right-click (or Control-click) a profile to **Take over**, to **Enable** or **Disable** it, or
   to choose whether its percentage shows the **5-hour** or the **weekly** window (**Percentage
   shows**). The choice is remembered per profile; a window the provider does not report is greyed
@@ -959,7 +1001,8 @@ push access, is honest. That's a deliberate, documented limit.
 
 ## Command reference
 
-Every command is daemon lifecycle or account authentication. **Everything else — accounts,
+Commands cover daemon lifecycle, account sign-in, and launching a routed session
+(`code`, `codex`, `desktop`). **Everything else — accounts,
 thresholds, priority, budget caps, export/import — lives in the dashboard.** The same list
 is in the dashboard under **Help**.
 
@@ -989,6 +1032,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 | `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
 | `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. |
+| `claude-unlimited codex` | Launch OpenAI's `codex` CLI served from the pool's ChatGPT accounts. Turn it on in Settings first; `--profile <name>` pins one account, other arguments go to codex. |
 | `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |
 | `claude-unlimited start` | Run the daemon in this terminal (Ctrl-C to stop). |
@@ -1055,6 +1099,12 @@ message *No eligible Profile is available*, because that one is a configuration 
 Usually it fixes itself — tokens are refreshed in the background whether or not an account
 is currently in rotation. If it doesn't, run `claude-unlimited reauth`: it lists whichever
 accounts actually need it, so there's no guessing.
+A refresh that keeps failing is retried less and less often (up to every 6 hours if the
+provider refuses the sign-in, every 30 minutes for a network error), the first failure and
+then the 2nd, 4th, 8th… are written to the Activity log, and a refused sign-in raises a
+*needs attention* notification once, before the account's current token runs out — for a
+Claude account the fix is `claude-unlimited reauth`, for a ChatGPT account
+`claude-unlimited add-codex-account`.
 Once it is signed back in, its usage is read straight away, so the Dashboard and the HUD
 show real numbers for it within seconds instead of at the next scheduled read.
 </details>
@@ -1124,6 +1174,7 @@ was skipped.
 | Account configuration | `~/.claude-unlimited/config.json` |
 | Usage history, activity log, project attribution | `~/.claude-unlimited/claude_unlimited.db` — one local SQLite file, kept in full (older `*.jsonl` logs are imported once on first start and renamed `*.imported`) |
 | Logs | `~/.claude-unlimited/logs/` |
+| Isolated login directories | `~/.claude-unlimited/claude-accounts/<id>/` and `~/.claude-unlimited/codex-accounts/<id>/` — one per subscription account, where its browser login runs. The plaintext token file a login writes there is deleted once it is imported; the credentials live in the OS keystore |
 | Your Claude Code setup | `~/.claude` — untouched |
 
 ## Security
@@ -1142,18 +1193,54 @@ Full threat model and vulnerability reporting: [`SECURITY.md`](SECURITY.md).
   macOS and Linux in CI)
   ([details](docs/adr/0005-windows-linux-backends-unverified-first-cut.md)).
 - **Python 3.10+**, **git**, and the **`claude`** CLI.
+- The **`codex`** CLI, only for ChatGPT accounts and `cu codex`.
 - The HUD needs **macOS 13** or later; everything else runs without it.
 
 ## A note on Terms of Service
 
-Claude Unlimited automates something you could do by hand: switching to another of your
-own accounts when one runs low. It uses only credentials you configure, runs entirely on
-your machine, and is fully open source.
+Claude Unlimited uses only credentials you configure, runs entirely on your machine, and is
+fully open source. What that means for your accounts depends on which kind you add.
 
-Anthropic hasn't explicitly endorsed automated multi-account rotation. This project
-deliberately avoids what would make that worse — no quota probing, no keep-warm traffic,
-nothing that acts without a real request from you. Use your own judgment about your own
-accounts' terms.
+**Claude subscription accounts (Free, Pro, Max, Ultra) — read this before adding one.** Anthropic's
+[Claude Code legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+says subscription OAuth is "designed to support ordinary use of Claude Code and other native
+Anthropic applications", and that third-party developers "may not collect, store, or
+intermediate Claude.ai credentials or session tokens". This tool stores your subscription
+tokens and sends requests with them, so **using a subscription account through it may
+breach Anthropic's terms**. That page also says Anthropic "reserves the right to take
+measures to enforce these restrictions and may do so without prior notice", which can mean
+your account is restricted or suspended. The [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) apply to
+these plans too. The risk is to your account, not to this project.
+
+You should also know that some requests made with a subscription account identify themselves
+as the official clients:
+
+- **Token refreshes** send Claude Code's User-Agent (`axios`) and its scope list. Without
+  them, Anthropic's token endpoint rate-limited our refreshes until the account needed a
+  manual re-login.
+- **Usage reads** send Claude Code's User-Agent.
+- **Codex (ChatGPT subscription) requests and usage reads** send the Codex CLI's
+  `originator` and User-Agent. OpenAI has not said whether local multi-account use of
+  ChatGPT sign-in is permitted
+  ([openai/codex#41664](https://github.com/openai/codex/issues/41664)).
+
+Your Claude Code requests themselves pass through unchanged: they already come from the real
+`claude` binary.
+
+**Serving the `codex` CLI from several ChatGPT accounts (off by default).** OpenAI's
+[Terms of Use](https://openai.com/policies/row-terms-of-use/) say you may not "interfere with
+or disrupt our Services, including circumvent any rate limits or restrictions", and moving one
+person's work between several subscriptions to get past each one's limit can be read that way.
+OpenAI has not answered whether it is allowed
+([openai/codex#41664](https://github.com/openai/codex/issues/41664)).
+Requests sent this way carry the real `codex` client's own `originator` and User-Agent. Each
+account stays subject to its own plan's terms.
+
+**API keys and gateways** are the access Anthropic and OpenAI document for programmatic
+use. Pooling your own keys raises none of the issues above.
+
+Decide for yourself whether that risk is acceptable for your accounts. If it isn't, use only
+API-key profiles.
 
 ## Development
 

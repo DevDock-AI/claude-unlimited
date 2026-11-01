@@ -30,7 +30,7 @@ A Profile is one account. Three kinds share the same rotation, thresholds and Da
 
 | kind | What it is | How it talks upstream |
 |---|---|---|
-| `oauth` | A Claude Pro/Max subscription | Proxied byte-for-byte to Anthropic |
+| `oauth` | A Claude Pro/Max/Ultra subscription | Proxied byte-for-byte to Anthropic |
 | `api` | An Anthropic API key or compatible gateway | Proxied byte-for-byte |
 | `codex` | A ChatGPT/Codex subscription | Translated to and from OpenAI's Responses API |
 
@@ -52,6 +52,12 @@ kind is not verified on the others — this is the project's most repeated defec
   provider's own numbers); over it the daemon answers HTTP 413 `request_too_large` in
   Anthropic's envelope, which Claude Code recovers from by stripping images and compacting.
 - `openai_bridge.py` — the codex path: owns its own HTTPS call and response translation.
+- `codex_cli.py` — the other direction: OpenAI's own `codex` CLI served from the pool's
+  ChatGPT-subscription accounts (`cu codex`, `/codex/v1`). A passthrough, not a
+  translation; rotates only before the first byte and never answers codex with a 5xx.
+  See [ADR 0010](adr/0010-serving-the-codex-cli.md).
+- `refresh_backoff.py` — escalating backoff for OAuth token refreshes that keep failing,
+  for every account kind, so a dead or throttled grant is not retried in a loop.
 - `openai_translate.py` — pure Anthropic ⇄ OpenAI shape mapping, both directions.
 - `wire_formats.py` — which endpoint shape a Profile speaks, and how to translate to it.
 - `usage_tracking.py` — tees the response to count tokens without altering a byte of it.
@@ -96,6 +102,9 @@ kind is not verified on the others — this is the project's most repeated defec
 6. On quota exhaustion the next eligible Profile is tried, invisibly — the client sees one
    request and one answer.
 7. The body streams back untouched while a tee counts tokens for the usage history.
+
+The `codex` CLI's own requests (`cu codex`) take a separate route, `/codex/v1`, with
+their own pointer, so they never move the account Claude Code is on.
 
 ## Rotation rules
 
@@ -216,7 +225,7 @@ four (fable/opus/sonnet/haiku family heads). A legacy sparse-dict config is migr
 list at read time by `openai_models.normalize_parity` (no on-load rewrite; the file keeps
 its old shape until the next save). `claude_effort` is injected as `output_config.effort`
 onto oauth/api-served `/v1/messages` requests, gated per model by
-`openai_models.apply_claude_effort` so an unsupported model (Haiku, Sonnet ≤4.5) is never
+`openai_models.apply_claude_effort` so an unsupported model (Haiku <5.5, Sonnet ≤4.5) is never
 sent a value that would 400. Dropdown order is the catalogue rank (cost/generation desc).
 
 Codex quota is spent on reasoning tokens produced × model tier, not on context size — see

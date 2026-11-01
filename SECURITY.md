@@ -7,17 +7,17 @@ Claude Unlimited is a local daemon holding real Anthropic credentials on your ow
 Claude Unlimited defends against:
 
 - **A malicious website in your browser.** The daemon binds to `127.0.0.1` only and validates the `Host` header on every request (blocking DNS-rebinding), so a page open in another tab can't reach the Dashboard's API. State-changing requests additionally require a per-run CSRF token that only same-origin JavaScript can obtain.
-- **Another process on your machine reading credentials off disk.** Credentials never touch disk in plain text — they're stored in the OS's native secret store (macOS Keychain, Linux Secret Service, Windows DPAPI) and never appear in `config.json`, logs, or any API response.
+- **Another process on your machine reading credentials off disk.** Credentials are not kept on disk in plain text — they're stored in the OS's native secret store (macOS Keychain, Linux Secret Service, Windows DPAPI) and never appear in `config.json`, logs, or any API response. The one exception is brief: off macOS, `claude auth login` and `codex login` write a plaintext token file into the account's isolated login directory, which is deleted as soon as its contents are imported into the secret store.
 - **XSS via a crafted Profile name, project name, or model string.** Every piece of user- or upstream-controlled text is HTML-escaped before being rendered in the Dashboard.
 
 Claude Unlimited does **not** defend against:
 
 - **Someone with your OS user account already logged in.** Filesystem-level access to `~/.claude-unlimited` and your OS's secret store is the same trust boundary every local credential manager (browser password store, `gh` CLI, `git credential` helpers) relies on. If your machine is compromised at that level, this project's security model doesn't add protection beyond what those already assume.
-- **A malicious or compromised upstream gateway you've configured as an API/gateway Profile.** You're choosing what to point a Profile's `base_url` at; the daemon substitutes credentials into whatever you configured.
+- **A malicious or compromised upstream gateway you've configured as an API/gateway Profile.** You're choosing what to point a Profile's `base_url` at; the daemon substitutes credentials into whatever you configured. An API Profile may also use plain `http://` to any address you enter; that traffic, including the key, is unencrypted.
 
 ## What never leaves your machine
 
-Nothing — usage stats, project attribution, the activity log, your Profile configuration — is transmitted anywhere except to the provider you configured — Anthropic, OpenAI/Codex, or your own gateway — as part of the API requests you're already making. There is no telemetry, no analytics, and no phone-home beyond polling GitHub's public Releases API to compare version numbers. The daemon does make one other request you didn't directly trigger: refreshing an OAuth account's access token shortly before it expires, which sends that account's own refresh token to the provider it already belongs to and nothing else.
+Nothing — usage stats, project attribution, the activity log, your Profile configuration — is transmitted anywhere except to the provider you configured — Anthropic, OpenAI/Codex, or your own gateway — as part of the API requests you're already making. There is no telemetry, no analytics, and no phone-home beyond polling GitHub's public Releases API to compare version numbers. Three kinds of request go out that you didn't directly trigger, and no others: the once-a-day version check against GitHub's public API; refreshing an OAuth account's access token shortly before it expires (throttled per account, backing off to hours when it keeps failing), which sends that account's own refresh token to the provider it already belongs to and nothing else; and, while you're active, reading each subscription account's usage from the provider's read-only usage endpoint every 5–10 minutes, pausing after 30 minutes idle.
 
 ## Hardening in place
 

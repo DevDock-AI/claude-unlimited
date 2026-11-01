@@ -138,10 +138,12 @@ injected, so the suite runs offline and cannot spend someone's quota.
   expose someone's pooled accounts to their network.
 - Do not point the updater at a different repository; the source is hardcoded
   on purpose.
-- Do not add background polling of a provider's API. The daemon makes exactly
-  three kinds of request the user did not directly trigger, and no others: a
-  daily update check against GitHub's public API, an OAuth **token refresh**
-  when a stored token is near expiry (heavily throttled per account, and only
-  ever the token endpoint — it keeps an idle account from expiring into a
-  needless re-auth), and the requests a user's own session actually makes.
-  Nothing polls a provider for quota, usage, or account state.
+- Do not add background polling of a provider's API. Beyond the requests a
+  user's own session makes, the daemon sends exactly three kinds of request on
+  its own, and no others: a daily update check against GitHub's public API; an
+  OAuth **token refresh** when a stored token is near expiry (heavily
+  throttled per account, and only ever the token endpoint — it keeps an idle
+  account from expiring into a needless re-auth); and, while the user is
+  active, a read of each subscription account's usage from the provider's
+  read-only usage endpoint every 5–10 minutes (`keep_usage_fresh`, paused after
+  30 minutes idle, never sends a message). Nothing else polls a provider.
