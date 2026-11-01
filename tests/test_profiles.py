@@ -69,55 +69,34 @@ def test_create_oauth_profile_without_account_uuid_is_rejected(fake_store):
         profiles.create_profile(name="X", kind="oauth", credential="sk-ant-12345678")
 
 
-def test_create_api_profile_requires_https_for_a_remote_base_url(fake_store):
-    # base_url is the UPSTREAM the key is sent to: plain http off this machine
-    # puts it on the wire in the clear.
-    with pytest.raises(profiles.ValidationError):
-        profiles.create_profile(
-            name="Bad Gateway", kind="api", credential="sk-ant-12345678",
-            base_url="http://insecure.example",
-        )
-
-
 @pytest.mark.parametrize("url", [
     "http://localhost:11434",
     "http://127.0.0.1:1234/v1",
     "http://[::1]:8080",
     "http://192.168.1.50:5566",
-    "http://10.1.2.3:8000",
+    "http://mac-mini.local:8000",        # an mDNS name
+    "http://my-nas.lan:8080",
+    "http://gateway.example.com",        # any host: plain http is the user's call
 ])
-def test_http_is_accepted_for_a_local_model_server(fake_store, url):
-    # LM Studio, Ollama, llama.cpp and friends serve plain http on the machine
-    # or the LAN; requiring TLS there would mean a self-signed certificate for
-    # no gain in who can read the traffic.
-    p = profiles.create_profile(name=f"Local {url}", kind="api",
+def test_an_api_profile_accepts_plain_http_to_any_address(fake_store, url):
+    p = profiles.create_profile(name=f"Http {url}", kind="api",
                                 credential="sk-ant-12345678", base_url=url)
     assert p.base_url == url
 
 
 @pytest.mark.parametrize("url", [
-    "http://api.example.com",          # a name, not a local address
-    "http://8.8.8.8:1234",             # public IP
     "ftp://192.168.1.5",               # not http at all
     "http://",                         # no host
 ])
-def test_a_non_local_or_malformed_base_url_is_still_refused(fake_store, url):
+def test_a_malformed_base_url_is_still_refused(fake_store, url):
     with pytest.raises(profiles.ValidationError):
         profiles.create_profile(name="Nope", kind="api",
                                 credential="sk-ant-12345678", base_url=url)
 
 
-def test_a_hostname_is_never_treated_as_local(fake_store):
-    # Resolved at config-write time a name could point anywhere later, so only
-    # literal addresses and localhost count as local.
-    with pytest.raises(profiles.ValidationError):
-        profiles.create_profile(name="Name", kind="api", credential="sk-ant-12345678",
-                                base_url="http://my-nas.lan:8080")
-
-
-@pytest.mark.parametrize("url", ["http://localhost:11434", "http://192.168.1.50:5566"])
+@pytest.mark.parametrize("url", ["http://localhost:11434", "http://mac-mini.local:8000"])
 def test_a_codex_profile_never_accepts_plain_http(url):
-    # Local http is an API-profile feature; the Codex bridge speaks HTTPS only.
+    # Plain http is an API-profile feature; the Codex bridge speaks HTTPS only.
     with pytest.raises(profiles.ValidationError, match="Codex"):
         profiles._validate_base_url(url, "codex")
     profiles._validate_base_url(url, "api")
@@ -529,3 +508,25 @@ def test_leave_on_fable_limit_must_be_a_bool(fake_store):
     a = profiles.create_profile(name="Claude", kind="oauth", credential="sk-ant-12345678", account_uuid="u1")
     with pytest.raises(profiles.ValidationError):
         profiles.update_profile(a.id, leave_on_fable_limit="yes")
+
+
+def test_removing_login_artifacts_never_deletes_outside_our_accounts_roots(fake_store, tmp_path):
+    # config.json is hand-editable and read back unvalidated, so the delete
+    # re-checks the path itself rather than trusting what was stored.
+    from claude_unlimited.config import Profile
+
+    elsewhere = tmp_path.parent / f"{tmp_path.name}-not-ours"
+    elsewhere.mkdir()
+    (elsewhere / "auth.json").write_text("{}")
+    ours = tmp_path / "codex-accounts" / "abc"
+    ours.mkdir(parents=True)
+    try:
+        profiles._remove_isolated_login_artifacts(
+            Profile(id="x", name="X", kind="codex", codex_home=str(elsewhere)))
+        profiles._remove_isolated_login_artifacts(
+            Profile(id="y", name="Y", kind="codex", codex_home=str(ours)))
+        assert (elsewhere / "auth.json").exists()
+        assert not ours.exists()
+    finally:
+        import shutil
+        shutil.rmtree(elsewhere, ignore_errors=True)

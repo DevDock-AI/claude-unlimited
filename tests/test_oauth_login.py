@@ -38,9 +38,10 @@ def _fake_curl_run_factory(status: int, body: bytes, response_headers: bytes = b
     """
     captured = {}
 
-    def fake_run(cmd, input=None, capture_output=None, timeout=None):
+    def fake_run(cmd, input=None, capture_output=None, timeout=None, creationflags=None):
         captured["cmd"] = cmd
         captured["payload"] = json.loads(input)
+        captured["creationflags"] = creationflags
         header_path = cmd[cmd.index("-D") + 1]
         with open(header_path, "wb") as f:
             f.write(f"HTTP/1.1 {status}\r\n".encode() + response_headers)
@@ -73,6 +74,18 @@ def test_refresh_access_token_sends_correct_payload_and_parses_response(monkeypa
     assert ua and login_module.REFRESH_USER_AGENT in ua[0]
 
 
+def test_refresh_spawns_curl_without_a_console_window(monkeypatch):
+    # The Windows daemon runs under pythonw: a console-subsystem curl.exe
+    # spawned without CREATE_NO_WINDOW flashes a terminal on every refresh.
+    fake_run, captured = _fake_curl_run_factory(200, json.dumps({"access_token": "t"}).encode())
+    monkeypatch.setattr(login_module.shutil, "which", lambda name: "/usr/bin/curl")
+    monkeypatch.setattr(login_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(login_module.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+
+    refresh_access_token("ref-old")
+    assert captured["creationflags"] == 0x08000000
+
+
 def test_refresh_access_token_keeps_old_refresh_token_when_response_omits_one(monkeypatch):
     fake_run, _ = _fake_curl_run_factory(200, json.dumps({"access_token": "tok-new"}).encode())
     monkeypatch.setattr(login_module.shutil, "which", lambda name: "/usr/bin/curl")
@@ -87,7 +100,7 @@ def test_refresh_access_token_does_not_retry_a_dead_refresh_token(monkeypatch):
     # the account needs a re-login.
     calls = []
 
-    def fake_run(cmd, input=None, capture_output=None, timeout=None):
+    def fake_run(cmd, input=None, capture_output=None, timeout=None, creationflags=None):
         calls.append(1)
         header_path = cmd[cmd.index("-D") + 1]
         with open(header_path, "wb") as f:
@@ -105,7 +118,7 @@ def test_refresh_access_token_does_not_retry_a_dead_refresh_token(monkeypatch):
 def test_refresh_access_token_retries_on_5xx_then_succeeds(monkeypatch):
     calls = []
 
-    def fake_run(cmd, input=None, capture_output=None, timeout=None):
+    def fake_run(cmd, input=None, capture_output=None, timeout=None, creationflags=None):
         calls.append(1)
         header_path = cmd[cmd.index("-D") + 1]
         with open(header_path, "wb") as f:
@@ -124,7 +137,7 @@ def test_refresh_access_token_retries_on_5xx_then_succeeds(monkeypatch):
 
 
 def test_refresh_access_token_raises_after_exhausting_retries(monkeypatch):
-    def fake_run(cmd, input=None, capture_output=None, timeout=None):
+    def fake_run(cmd, input=None, capture_output=None, timeout=None, creationflags=None):
         header_path = cmd[cmd.index("-D") + 1]
         with open(header_path, "wb") as f:
             f.write(b"HTTP/1.1 503\r\n")
@@ -163,7 +176,7 @@ def test_refresh_access_token_raises_clear_error_when_curl_itself_fails(monkeypa
     # and this must not be treated as a retryable 5xx.
     calls = []
 
-    def fake_run(cmd, input=None, capture_output=None, timeout=None):
+    def fake_run(cmd, input=None, capture_output=None, timeout=None, creationflags=None):
         calls.append(1)
         return _FakeCompletedProcess(stdout=b"", returncode=6, stderr=b"Could not resolve host")
 
@@ -179,7 +192,7 @@ def test_refresh_access_token_raises_clear_error_when_curl_itself_fails(monkeypa
 def test_refresh_access_token_raises_clear_error_when_curl_times_out(monkeypatch):
     import subprocess as real_subprocess
 
-    def fake_run(cmd, input=None, capture_output=None, timeout=None):
+    def fake_run(cmd, input=None, capture_output=None, timeout=None, creationflags=None):
         raise real_subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
 
     monkeypatch.setattr(login_module.shutil, "which", lambda name: "/usr/bin/curl")

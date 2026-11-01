@@ -75,6 +75,9 @@ def _post_json_via_curl(url: str, payload: bytes, timeout: float,
                  "-w", "\n%{http_code}",
                  "--max-time", str(max(1, int(timeout)))],
                 input=payload, capture_output=True, timeout=timeout + 5,
+                # The daemon runs console-less (pythonw) on Windows: without this,
+                # every refresh flashes a new console window for curl.exe.
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except subprocess.TimeoutExpired as exc:
             raise OpenAILoginError(f"Timed out reaching the token endpoint: {exc}") from exc

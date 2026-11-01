@@ -26,9 +26,10 @@ class _FakeCompletedProcess:
 def _fake_curl_run_factory(status: int, body: bytes, response_headers: bytes = b""):
     captured = {}
 
-    def fake_run(cmd, input=None, capture_output=None, timeout=None):
+    def fake_run(cmd, input=None, capture_output=None, timeout=None, creationflags=None):
         captured["cmd"] = cmd
         captured["payload"] = json.loads(input)
+        captured["creationflags"] = creationflags
         header_path = cmd[cmd.index("-D") + 1]
         with open(header_path, "wb") as f:
             f.write(f"HTTP/1.1 {status}\r\n".encode() + response_headers)
@@ -57,6 +58,8 @@ def test_refresh_access_token_sends_the_real_confirmed_payload_shape(monkeypatch
     assert captured["payload"]["refresh_token"] == "ref-old"
     assert captured["payload"]["client_id"] == login_module.CLIENT_ID
     assert login_module.CLIENT_ID == "app_EMoamEEZ73f0CkXaXp7hrann"
+    # Windows daemon runs under pythonw: no console window for curl.exe.
+    assert captured["creationflags"] == getattr(login_module.subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def test_refresh_access_token_keeps_old_refresh_token_when_response_omits_one(monkeypatch):

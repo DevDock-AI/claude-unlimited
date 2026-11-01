@@ -103,3 +103,115 @@ def test_persisted_deadline_is_wall_clock_not_monotonic(env):
     raw = json.loads((env / "runtime_state.json").read_text())["profiles"]["a"]["refresh_backoff_until"]
     remaining = (datetime.fromisoformat(raw) - datetime.now(timezone.utc)).total_seconds()
     assert 1500 < remaining <= 1800
+
+
+def test_a_rejected_grants_escalation_survives_a_restart(env):
+    # issue #10: a dead grant backs off further each time; a restart must not
+    # drop it back to the first step.
+    gw = _new_gateway()
+    gw._refresh_failure_streak["a"] = 4
+    gw._refresh_check_not_before["a"] = time.monotonic() + 3600
+    gw._persist()
+
+    restarted = _new_gateway()
+    assert restarted._refresh_failure_streak.get("a") == 4
+    assert restarted._refresh_attempt_due("a") is False
+
+
+def test_a_state_file_without_the_failure_streak_still_loads(env):
+    gw = _new_gateway()
+    gw._refresh_rate_limited_streak["a"] = 2
+    gw._refresh_check_not_before["a"] = time.monotonic() + 3600
+    gw._persist()
+    state_file = env / "runtime_state.json"
+    data = json.loads(state_file.read_text())
+    del data["profiles"]["a"]["refresh_failure_streak"]   # written by an older version
+    state_file.write_text(json.dumps(data))
+
+    restarted = _new_gateway()
+    assert restarted._refresh_rate_limited_streak.get("a") == 2
+    assert "a" not in restarted._refresh_failure_streak
+
+
+# --- Codex Profiles: the clock lives in openai_bridge's module state ---------
+
+import claude_unlimited.openai_bridge as openai_bridge
+
+
+def _wipe_bridge_backoff():
+    """What a fresh process starts with: no module-level refresh state."""
+    openai_bridge._refresh_not_before.clear()
+    openai_bridge._refresh_rate_limited_streak.clear()
+    openai_bridge._refresh_failure_streak.clear()
+
+
+@pytest.fixture
+def codex_env(env):
+    save_pool(Pool(profiles=[Profile(id="c", name="C", kind="codex", automatic=True, enabled=True)]))
+    _wipe_bridge_backoff()
+    yield env
+    _wipe_bridge_backoff()
+
+
+def test_codex_backoff_persists_and_blocks_repoke_after_restart(codex_env):
+    gw = _new_gateway()
+    openai_bridge._refresh_rate_limited_streak["c"] = 3
+    openai_bridge._refresh_failure_streak["c"] = 2
+    openai_bridge._refresh_not_before["c"] = time.monotonic() + 3600
+    gw._persist()
+
+    raw = json.loads((codex_env / "runtime_state.json").read_text())["profiles"]["c"]
+    remaining = (datetime.fromisoformat(raw["refresh_backoff_until"])
+                 - datetime.now(timezone.utc)).total_seconds()
+    assert 3300 < remaining <= 3600   # wall-clock, not a monotonic float
+
+    _wipe_bridge_backoff()
+    _new_gateway()
+    assert openai_bridge._refresh_rate_limited_streak.get("c") == 3
+    assert openai_bridge._refresh_failure_streak.get("c") == 2
+    assert openai_bridge.refresh_attempt_due("c") is False
+    # Never leaks into the gateway's own (Anthropic-side) clock.
+    assert "c" not in gw._refresh_rate_limited_streak
+
+
+def test_codex_plain_throttle_is_not_persisted(codex_env):
+    gw = _new_gateway()
+    openai_bridge._refresh_not_before["c"] = time.monotonic() + 60
+    gw._persist()
+    data = json.loads((codex_env / "runtime_state.json").read_text())["profiles"]["c"]
+    assert data["refresh_backoff_until"] is None
+    _wipe_bridge_backoff()
+    _new_gateway()
+    assert openai_bridge.refresh_attempt_due("c") is True
+
+
+def test_codex_elapsed_backoff_keeps_streak(codex_env):
+    gw = _new_gateway()
+    openai_bridge._refresh_rate_limited_streak["c"] = 2
+    openai_bridge._refresh_not_before["c"] = time.monotonic() + 3600
+    gw._persist()
+    state_file = codex_env / "runtime_state.json"
+    data = json.loads(state_file.read_text())
+    data["profiles"]["c"]["refresh_backoff_until"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    state_file.write_text(json.dumps(data))
+
+    _wipe_bridge_backoff()
+    _new_gateway()
+    assert openai_bridge._refresh_rate_limited_streak.get("c") == 2
+    assert openai_bridge.refresh_attempt_due("c") is True
+
+
+def test_codex_old_state_file_without_backoff_fields_still_loads(codex_env):
+    gw = _new_gateway()
+    gw._persist()
+    state_file = codex_env / "runtime_state.json"
+    data = json.loads(state_file.read_text())
+    for k in ("refresh_backoff_until", "refresh_rate_limited_streak", "refresh_failure_streak"):
+        data["profiles"]["c"].pop(k, None)
+    state_file.write_text(json.dumps(data))
+
+    _wipe_bridge_backoff()
+    _new_gateway()
+    assert "c" not in openai_bridge._refresh_rate_limited_streak
+    assert openai_bridge.refresh_attempt_due("c") is True

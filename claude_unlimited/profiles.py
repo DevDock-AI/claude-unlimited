@@ -60,10 +60,9 @@ def _validate_base_url(base_url: str, kind: str = "api") -> None:
     """Delegates to net_scope, which upstream.py reads too — the rule that
     decides what is saved and the rule that decides what is sent must be the
     same one, or a Profile is accepted and then refused at send time. Plain
-    http to a local server is for API profiles only; the Codex bridge is
-    https-only."""
+    http is for API profiles only; the Codex bridge is https-only."""
     try:
-        net_scope.validate(base_url, allow_local_http=(kind != "codex"))
+        net_scope.validate(base_url, allow_http=(kind == "api"))
     except net_scope.InvalidUpstreamURL as exc:
         raise ValidationError(str(exc)) from exc
 
@@ -357,6 +356,7 @@ def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan:
         update_credential(existing.id, credential, refresh_token=refresh_token, expires_at=expires_at)
         changes = {k: v for k, v in {"plan": plan, "claude_config_dir": claude_config_dir}.items() if v is not None}
         updated = update_profile(existing.id, **changes) if changes else existing
+        _retire_replaced_login_dirs(existing, updated)
         return updated, True
 
     profile = create_profile(name=name, kind="oauth", credential=credential, account_uuid=account_uuid,
@@ -380,6 +380,7 @@ def upsert_codex_profile(*, name: str, account_id: str, encoded_credential: str,
         update_credential_raw(existing.id, encoded_credential)
         changes = {k: v for k, v in {"plan": plan, "codex_home": codex_home}.items() if v is not None}
         updated = update_profile(existing.id, **changes) if changes else existing
+        _retire_replaced_login_dirs(existing, updated)
         return updated, True
 
     profile = create_profile(name=name, kind="codex", credential=encoded_credential,
@@ -500,15 +501,44 @@ def _remove_isolated_login_artifacts(p: Profile) -> None:
     roots when they are set (see _validate_isolated_dir)."""
     import shutil as _shutil
 
-    for directory in (p.codex_home, p.claude_config_dir):
-        if directory:
-            _shutil.rmtree(directory, ignore_errors=True)
-    if p.claude_config_dir:
+    # Re-checked here, not only on write: config.json is hand-editable and
+    # load_pool() reads these paths back as-is, so a stored value is not proof
+    # it still lies under our own roots. Outside them, nothing is deleted.
+    claude_root, codex_root = config_module.accounts_roots()
+    owned = {}
+    for directory, field, root in ((p.codex_home, "codex_home", codex_root),
+                                   (p.claude_config_dir, "claude_config_dir", claude_root)):
+        if not directory:
+            continue
+        try:
+            _validate_isolated_dir(directory, field, root)
+        except ValidationError:
+            continue
+        owned[field] = directory
+        _shutil.rmtree(directory, ignore_errors=True)
+    if owned.get("claude_config_dir"):
         try:
             from . import anthropic_oauth
             anthropic_oauth.remove_isolated_logins([p.claude_config_dir])
         except Exception:
             pass
+
+
+def _retire_replaced_login_dirs(before: Profile, after: Profile) -> None:
+    """Removes the login directory a re-added account just stopped using.
+
+    Re-adding an account already in the Pool logs in again under a fresh
+    directory and repoints the Profile at it. The old directory still holds a
+    LIVE refresh token that nothing references any more, so it is cleaned up
+    exactly as delete_profile() would clean it."""
+    stale = replace(
+        before,
+        codex_home=before.codex_home if before.codex_home != after.codex_home else None,
+        claude_config_dir=(before.claude_config_dir
+                           if before.claude_config_dir != after.claude_config_dir else None),
+    )
+    if stale.codex_home or stale.claude_config_dir:
+        _remove_isolated_login_artifacts(stale)
 
 
 def reset_all_profiles() -> int:

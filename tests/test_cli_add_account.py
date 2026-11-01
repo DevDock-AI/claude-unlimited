@@ -176,3 +176,136 @@ def test_cli_aliases_dispatch_to_the_right_command(monkeypatch):
     assert cli.main(["aca"]) == 0
     assert cli.main(["add-codex-account"]) == 0
     assert calls == ["add_account", "add_codex_account", "add_codex_account"]
+
+
+def _record_keychain_cleanup(monkeypatch):
+    removed = []
+    monkeypatch.setattr(anthropic_oauth, "remove_isolated_logins", lambda dirs: removed.extend(dirs) or 0)
+    return removed
+
+
+def test_add_account_run_twice_removes_the_login_dir_it_stopped_using(env, monkeypatch, tmp_path, capsys):
+    # The second login lands in a fresh dir and the Profile is repointed at
+    # it. The first dir still holds a live refresh token nobody references.
+    accounts = tmp_path / "claude-accounts"
+    monkeypatch.setattr(cli, "CLAUDE_ACCOUNTS_DIR", accounts)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: _FakeCompletedProcess(0))
+    removed = _record_keychain_cleanup(monkeypatch)
+    creds, account = _fake_add_account_credentials()
+    monkeypatch.setattr(anthropic_oauth, "read_claude_code_credentials", lambda config_dir=None: creds)
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda token: account)
+
+    assert cli.add_account() == 0
+    first = profile_repo.list_profiles()[0].claude_config_dir
+    assert cli.add_account() == 0
+    second = profile_repo.list_profiles()[0].claude_config_dir
+
+    assert first != second
+    assert not os.path.exists(first)
+    assert os.path.isdir(second)
+    assert removed == [first]  # its Keychain entry too, never the live one
+
+
+def test_add_account_failures_leave_no_login_dir_behind(env, monkeypatch, tmp_path):
+    accounts = tmp_path / "claude-accounts"
+    monkeypatch.setattr(cli, "CLAUDE_ACCOUNTS_DIR", accounts)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+    removed = _record_keychain_cleanup(monkeypatch)
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: _FakeCompletedProcess(1))
+    assert cli.add_account() == 1
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: _FakeCompletedProcess(0))
+    creds, _ = _fake_add_account_credentials()
+    monkeypatch.setattr(anthropic_oauth, "read_claude_code_credentials", lambda config_dir=None: creds)
+
+    def boom(token):
+        raise anthropic_oauth.ProfileLookupError("bad token")
+
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", boom)
+    assert cli.add_account() == 1
+
+    assert list(accounts.iterdir()) == []
+    assert len(removed) == 2
+
+
+def _fake_codex_login(monkeypatch, account_id="acct-1", write=True):
+    import json
+
+    def fake_run(cmd, **kwargs):
+        if write:
+            home = kwargs["env"]["CODEX_HOME"]
+            with open(os.path.join(home, "auth.json"), "w", encoding="utf-8") as fh:
+                json.dump({"tokens": {"access_token": "tok-a", "refresh_token": "ref-a",
+                                      "account_id": account_id, "id_token": None}}, fh)
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+
+def test_add_codex_account_run_twice_removes_the_codex_home_it_stopped_using(env, monkeypatch, tmp_path):
+    accounts = tmp_path / "codex-accounts"
+    monkeypatch.setattr(cli, "CODEX_ACCOUNTS_DIR", accounts)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/codex")
+    monkeypatch.setattr(cli, "_prime_via_daemon", lambda profile_id: None)
+    _fake_codex_login(monkeypatch)
+
+    assert cli.add_codex_account() == 0
+    first = profile_repo.list_profiles()[0].codex_home
+    assert cli.add_codex_account() == 0
+    profiles = profile_repo.list_profiles()
+
+    assert len(profiles) == 1
+    assert profiles[0].codex_home != first
+    assert [p.name for p in accounts.iterdir()] == [os.path.basename(profiles[0].codex_home)]
+
+
+def test_add_codex_account_failures_leave_no_codex_home_behind(env, monkeypatch, tmp_path):
+    accounts = tmp_path / "codex-accounts"
+    monkeypatch.setattr(cli, "CODEX_ACCOUNTS_DIR", accounts)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/codex")
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: _FakeCompletedProcess(1))
+    assert cli.add_codex_account() == 1
+    _fake_codex_login(monkeypatch, write=False)  # login "succeeded" but wrote no auth.json
+    assert cli.add_codex_account() == 1
+
+    assert list(accounts.iterdir()) == []
+    assert profile_repo.list_profiles() == []
+
+
+def test_add_codex_account_deletes_auth_json_but_keeps_the_codex_home(env, monkeypatch, tmp_path):
+    # The tokens are in the keystore once imported; a plaintext copy left
+    # behind is a live refresh token on disk. The dir stays for reauth.
+    monkeypatch.setattr(cli, "CODEX_ACCOUNTS_DIR", tmp_path / "codex-accounts")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/codex")
+    monkeypatch.setattr(cli, "_prime_via_daemon", lambda profile_id: None)
+    _fake_codex_login(monkeypatch)
+
+    assert cli.add_codex_account() == 0
+    home = profile_repo.list_profiles()[0].codex_home
+
+    assert os.path.isdir(home)
+    assert not os.path.exists(os.path.join(home, "auth.json"))
+
+
+def test_add_account_deletes_credentials_json_but_keeps_the_login_dir(env, monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "CLAUDE_ACCOUNTS_DIR", tmp_path / "claude-accounts")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+
+    def fake_run(cmd, **kwargs):  # what `claude auth login` does off macOS
+        with open(os.path.join(kwargs["env"]["CLAUDE_CONFIG_DIR"], ".credentials.json"), "w") as fh:
+            fh.write("{}")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    creds, account = _fake_add_account_credentials()
+    monkeypatch.setattr(anthropic_oauth, "read_claude_code_credentials", lambda config_dir=None: creds)
+    monkeypatch.setattr(anthropic_oauth, "fetch_account_profile", lambda token: account)
+
+    assert cli.add_account() == 0
+    login_dir = profile_repo.list_profiles()[0].claude_config_dir
+
+    assert os.path.isdir(login_dir)
+    assert not os.path.exists(os.path.join(login_dir, ".credentials.json"))
