@@ -51,6 +51,9 @@ kind is not verified on the others — this is the project's most repeated defec
   size limit per Profile kind (Anthropic Messages 32 MB, Codex/OpenAI 50 MB — the
   provider's own numbers); over it the daemon answers HTTP 413 `request_too_large` in
   Anthropic's envelope, which Claude Code recovers from by stripping images and compacting.
+- `media_budget.py` — before that 413, trims the oldest base64 images/documents in a
+  `/v1/messages` history to a short text note until the body fits, so a screenshot-heavy
+  session keeps its recent images. Never touches text or the latest message.
 - `openai_bridge.py` — the codex path: owns its own HTTPS call and response translation.
 - `openai_translate.py` — pure Anthropic ⇄ OpenAI shape mapping, both directions.
 - `wire_formats.py` — which endpoint shape a Profile speaks, and how to translate to it.

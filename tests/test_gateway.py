@@ -291,6 +291,30 @@ def test_body_exactly_at_the_limit_is_forwarded(pool_env):
     assert gw.handle("POST", "/v1/messages", {}, b"x" * MESSAGES_MAX_REQUEST_BYTES).status == 200
 
 
+def test_oversized_body_with_old_screenshots_is_trimmed_and_forwarded_not_413(pool_env):
+    # A long session's history of screenshots: trimming the oldest keeps it
+    # going with the recent ones, instead of a 413 whose recovery strips all.
+    import json
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
+    seen = []
+    gw = Gateway(transport=lambda req: (seen.append(req.body), fake_response(200))[1])
+    shot = {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                        "data": "A" * (MESSAGES_MAX_REQUEST_BYTES // 2)}}
+    body = json.dumps({"model": "m", "messages": [
+        {"role": "user", "content": [shot]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [shot]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "what changed?"},
+    ]}).encode()
+    result = gw.handle("POST", "/v1/messages", {}, body)
+    assert result.status == 200
+    assert len(seen[0]) <= MESSAGES_MAX_REQUEST_BYTES
+    sent = json.loads(seen[0])["messages"]
+    assert sent[0]["content"][0]["type"] == "text"   # oldest trimmed
+    assert sent[2]["content"][0]["type"] == "image"  # newer one kept
+
+
 def test_oversized_body_for_a_pinned_profile_is_413_too(pool_env):
     save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True, enabled=True)]))
     gw = Gateway(transport=lambda req: fake_response(200))
