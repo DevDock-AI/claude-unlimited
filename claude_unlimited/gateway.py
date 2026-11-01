@@ -29,12 +29,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 from urllib.parse import urlparse
 
-from . import activity, codex_cli, eco, refresh_backoff, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
+from . import activity, codex_cli, eco, refresh_backoff, gpt_windows, media_budget, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, BudgetUnavailable, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
 from .proxy import (REQUEST_TOO_LARGE_STATUS, RequestTooLarge, build_upstream_request, check_request_size,
-                    filter_response_headers, request_model, rewrite_model, retry_without_rejected_thinking)
+                    filter_response_headers, max_request_bytes, request_model, rewrite_model, retry_without_rejected_thinking)
 from .router import (
     PoolSnapshot,
     ProfileRuntime,
@@ -1354,6 +1354,12 @@ class Gateway:
                                                         getattr(pool.settings, "speech_level", "off"))
                     # Last, so nothing above can reintroduce one.
                     eco_body = _drop_empty_text_blocks(eco_body)
+
+            # Over the limit, first trim the oldest images/documents from the
+            # history (media_budget): the session keeps its recent screenshots
+            # instead of Claude Code's 413 recovery stripping all of them.
+            if path.rstrip("/").endswith("/v1/messages"):
+                eco_body = media_budget.fit_body(eco_body, max_request_bytes(profile))
 
             # The body that would actually be sent (after ECO), against what
             # this Profile's upstream accepts. Answered with the status and
