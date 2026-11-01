@@ -236,3 +236,29 @@ def test_fetch_account_profile_still_raises_generic_message_for_other_403s(monke
     # A 403 for an unrelated reason (no "scope requirement" in the body)
     # must not be swallowed into the scope-specific message.
     assert "setup-token" not in str(exc_info.value)
+
+
+def _acct(**kw):
+    from claude_unlimited.anthropic_oauth import AccountProfile
+    base = dict(account_uuid="a", email=None, display_name=None, org_uuid=None, org_name=None,
+                has_claude_max=None, has_claude_pro=None)
+    base.update(kw)
+    return AccountProfile(**base)
+
+
+@pytest.mark.parametrize("kw,expected", [
+    (dict(has_claude_max=True, has_claude_pro=False), "max"),
+    (dict(has_claude_max=False, has_claude_pro=True), "pro"),
+    (dict(has_claude_max=True, has_claude_pro=True), "max"),
+    (dict(has_claude_max=False, has_claude_pro=False), "ultra"),
+    (dict(has_claude_max=True, rate_limit_tier="default_claude_max_20x"), "ultra"),
+    (dict(has_claude_max=False, has_claude_pro=False, organization_type="claude_ultra"), "ultra"),
+    (dict(has_claude_max=False, has_claude_pro=False, organization_type="claude_team"), None),
+    (dict(has_claude_max=False, has_claude_pro=False, organization_type="claude_enterprise"), None),
+    (dict(has_claude_max=False, has_claude_pro=False, organization_type="claude_free"), None),
+    (dict(), None),
+    (dict(has_claude_max=False), None),
+])
+def test_plan_from_account(kw, expected):
+    from claude_unlimited.anthropic_oauth import plan_from_account
+    assert plan_from_account(_acct(**kw)) == expected

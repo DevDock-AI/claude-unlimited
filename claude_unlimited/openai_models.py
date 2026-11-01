@@ -13,7 +13,8 @@ request (docs/adr/0007). `gpt-6-astra` is the flagship, and NO tier maps to it
 by default: Claude Code picks Fable on its own for ordinary work, so mapping
 Fable to the flagship meant a user who never chose the expensive model still
 had their Codex quota spent at the top tier. Fable therefore lands on
-`gpt-5.6-sol` at medium effort, and astra stays one explicit edit away in the
+`gpt-6.1-sol` at medium effort (Opus/Sonnet on `gpt-6.1-terra`, Haiku on
+`gpt-6-luna` — there is no gpt-6.1 Luna), and astra stays one explicit edit away in the
 parity table for anyone who wants it.
 Raising a row here raises what a session costs, so treat it as a spending
 decision — which is exactly why a catalogue refresh NEVER changes what a
@@ -79,7 +80,7 @@ def apply_claude_effort(model_id: str, requested: Optional[str]) -> Optional[str
     output_config.effort support is per-model and UPSTREAM-COUPLED (keep in
     sync with the Messages API — see the Claude Code upstream-watch note). We
     are deliberately conservative: an unknown family/version, or a model that
-    rejects the knob (Haiku, Sonnet <= 4.5), returns None so we never inject a
+    rejects the knob (Haiku < 5.5, Sonnet <= 4.5), returns None so we never inject a
     value that would 400 every request. Where a model supports `max` but not
     `xhigh` (Opus/Sonnet 4.6) an `xhigh` request is clamped to `high`; where a
     model supports only low/medium/high (Opus 4.5) higher requests clamp down.
@@ -88,22 +89,23 @@ def apply_claude_effort(model_id: str, requested: Optional[str]) -> Optional[str
         return None
     base = base_id(model_id).lower()
     if "haiku" in base:
-        return None
+        # Haiku 5.5 takes the full range like Sonnet 5; older Haiku rejects it.
+        return requested if model_catalogue._version_of(base) >= (5, 5) else None
     if "fable" in base or "mythos" in base:
         return requested  # top tier: full range
     ver = model_catalogue._version_of(base)
     if "opus" in base:
-        if ver >= 4.7:
+        if ver >= (4, 7):
             return requested
-        if ver >= 4.6:
+        if ver >= (4, 6):
             return "high" if requested == "xhigh" else requested  # all but xhigh
-        if ver >= 4.5:
+        if ver >= (4, 5):
             return _clamp_effort(requested, "high")               # low/medium/high
         return None
     if "sonnet" in base:
-        if ver >= 5:
+        if ver >= (5, 0):
             return requested
-        if ver >= 4.6:
+        if ver >= (4, 6):
             return "high" if requested == "xhigh" else requested  # all but xhigh
         return None                                               # <= 4.5 rejects it
     return None  # unknown family: don't risk a 400
@@ -117,28 +119,34 @@ class OpenAIModelTarget:
 
 # Ordered most-capable-first — used only for the substring-match fallback below.
 _MODEL_MAP: dict[str, OpenAIModelTarget] = {
-    "claude-fable-5": OpenAIModelTarget("gpt-5.6-sol", "medium"),
-    "claude-opus-5-5": OpenAIModelTarget("gpt-5.6-terra", "high"),
+    "claude-fable-5": OpenAIModelTarget("gpt-6.1-sol", "medium"),
+    "claude-opus-5-5": OpenAIModelTarget("gpt-6.1-terra", "high"),
     # Kept beside 5.5, not replaced by it: a saved parity row naming Opus 5
     # with no effort of its own takes its effort from here.
-    "claude-opus-5": OpenAIModelTarget("gpt-5.6-terra", "high"),
-    "claude-sonnet-5": OpenAIModelTarget("gpt-5.6-terra", "medium"),
-    "claude-haiku-4-5-20251001": OpenAIModelTarget("gpt-5.6-luna", "low"),
+    "claude-opus-5": OpenAIModelTarget("gpt-6.1-terra", "high"),
+    # Sonnet 5.5 / Haiku 5.5 FIRST in their families: they are the ids cli
+    # _MODEL_TIER_IDS claims for the Sonnet/Haiku tiers, and the no-catalogue
+    # default_parity_rows seeds each family from its FIRST entry here. The
+    # older ids stay so a saved row naming them keeps its curated effort.
+    "claude-sonnet-5-5": OpenAIModelTarget("gpt-6.1-terra", "medium"),
+    "claude-sonnet-5": OpenAIModelTarget("gpt-6.1-terra", "medium"),
+    "claude-haiku-5-5": OpenAIModelTarget("gpt-6-luna", "low"),
+    "claude-haiku-4-5-20251001": OpenAIModelTarget("gpt-6-luna", "low"),
 }
 
 # Any unrecognized Claude model id falls back to the balanced, mid-tier pick
 # rather than guessing at a specific match.
-_DEFAULT_TARGET = OpenAIModelTarget("gpt-5.6-terra", "medium")
+_DEFAULT_TARGET = OpenAIModelTarget("gpt-6.1-terra", "medium")
 
 # Family-prefix fallback for a model id that isn't an exact match above but
 # still names a recognizable tier (e.g. a dated Sonnet id this table hasn't
 # been updated for). Checked in order, first match wins, before
 # _DEFAULT_TARGET.
 _FAMILY_FALLBACKS: list[tuple[str, OpenAIModelTarget]] = [
-    ("claude-fable", OpenAIModelTarget("gpt-5.6-sol", "medium")),
-    ("claude-opus", OpenAIModelTarget("gpt-5.6-terra", "high")),
-    ("claude-sonnet", OpenAIModelTarget("gpt-5.6-terra", "medium")),
-    ("claude-haiku", OpenAIModelTarget("gpt-5.6-luna", "low")),
+    ("claude-fable", OpenAIModelTarget("gpt-6.1-sol", "medium")),
+    ("claude-opus", OpenAIModelTarget("gpt-6.1-terra", "high")),
+    ("claude-sonnet", OpenAIModelTarget("gpt-6.1-terra", "medium")),
+    ("claude-haiku", OpenAIModelTarget("gpt-6-luna", "low")),
 ]
 
 
@@ -248,8 +256,10 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
     """The parity list a fresh install (or a Reset) starts from: one row per
     family in _DEFAULT_FAMILIES, each the highest-ranked model of that family
     with its curated Codex target. With the vendored catalogue this is exactly
-    claude-fable-5-1 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5 —
-    the same ids cli.py's _MODEL_TIER_IDS use, so the /model picker relabels
+    claude-fable-5-1 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5
+    (the snapshot predates Sonnet/Haiku 5.5); a live catalogue listing them
+    seeds claude-sonnet-5-5 / claude-haiku-5-5 — the ids cli.py's
+    _MODEL_TIER_IDS use, so the /model picker relabels
     the native tiers instead of duplicating them. No catalogue -> one
     _MODEL_MAP literal per family (the newest listed)."""
     cat = _catalogue_or_current(catalogue)
@@ -391,6 +401,10 @@ def claude_effort_for(requested_claude_model: Optional[str], parity=None,
 # label the /v1/models listing a codex Profile serves — never sent upstream.
 _OPENAI_DISPLAY_NAMES: dict[str, str] = {
     "gpt-6-astra": "GPT-6 Astra",
+    "gpt-6.1-sol": "GPT-6.1 Sol",
+    "gpt-6.1-terra": "GPT-6.1 Terra",
+    "gpt-6-sol": "GPT-6 Sol",
+    "gpt-6-luna": "GPT-6 Luna",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
     "gpt-5.6-luna": "GPT-5.6 Luna",
@@ -403,7 +417,8 @@ _OPENAI_DISPLAY_NAMES: dict[str, str] = {
 # account"). Rather than hardcode one id per tier and fail hard when it goes
 # away, a rejected model walks down this ladder, so the pool keeps working as
 # long as any one model in it is still served.
-_MODEL_LADDER: tuple[str, ...] = ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+_MODEL_LADDER: tuple[str, ...] = ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
+                                   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 
 
 def model_ladder(catalogue: Optional[Catalogue] = None) -> list[str]:
@@ -445,7 +460,9 @@ _CLAUDE_DISPLAY_NAMES: dict[str, str] = {
     "claude-fable-5": "Claude Fable 5",
     "claude-opus-5-5": "Claude Opus 5.5",
     "claude-opus-5": "Claude Opus 5",
+    "claude-sonnet-5-5": "Claude Sonnet 5.5",
     "claude-sonnet-5": "Claude Sonnet 5",
+    "claude-haiku-5-5": "Claude Haiku 5.5",
     "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
 }
 
@@ -498,7 +515,10 @@ def automatic_mapping(parity=None,
 
 
 # Older ids that remain selectable for a Profile pinned to one, even though
-# nothing maps to them by default.
+# nothing maps to them by default. Both are retired for ChatGPT sign-in
+# (gpt-5.5 left Codex on 2026-10-14, gpt-5.2 earlier — learn.chatgpt.com/docs/models)
+# but stay on the OpenAI API, so an API-key Profile can still pin them; a
+# ChatGPT account pinned to one walks the ladder on the refusal.
 _LEGACY_SELECTABLE: tuple[str, ...] = ("gpt-5.5", "gpt-5.2")
 
 
@@ -577,18 +597,18 @@ def unmapped_claude_models(parity=None,
         return []
     saved = normalize_parity(parity, cat)
     covered = {base_id(row["claude_model"]) for row in saved}
-    saved_peak: dict[str, float] = {}
+    saved_peak: dict[str, tuple[int, int]] = {}
     for row in saved:
         family = _family_of(row["claude_model"])
         version = model_catalogue._version_of(row["claude_model"])
-        saved_peak[family] = max(saved_peak.get(family, 0.0), version)
+        saved_peak[family] = max(saved_peak.get(family, (0, 0)), version)
 
-    candidates: dict[str, tuple[float, object]] = {}
+    candidates: dict[str, tuple[tuple[int, int], object]] = {}
     for model in cat.anthropic:
         if base_id(model.id) in covered:
             continue
         version = model_catalogue._version_of(model.id)
-        if version <= 0.0:                      # preview / unversioned
+        if version <= (0, 0):                      # preview / unversioned
             continue
         family = _family_of(model.id)
         if family in saved_peak:

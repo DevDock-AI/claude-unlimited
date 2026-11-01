@@ -130,27 +130,22 @@ def _strip_namespace(key: str) -> str:
     return key
 
 
-def _version_of(model_id: str) -> float:
-    """Best-effort family version for ranking ties: claude-opus-4-8 -> 4.8,
-    gpt-5.6-terra -> 5.6, o3-mini -> 3."""
+def _version_of(model_id: str) -> tuple[int, int]:
+    """Best-effort family version for ranking ties, as a comparable
+    (major, minor) tuple: claude-opus-4-8 -> (4, 8), gpt-5.6-terra -> (5, 6),
+    o3-mini -> (3, 0), unversioned -> (0, 0). A tuple, not a float, so
+    claude-fable-5-10 (5, 10) ranks above claude-fable-5-9 (5, 9) — as a
+    float it would be 5.1."""
     stripped = base_id(model_id)
-    match = re.search(r"-(\d+(?:\.\d+)?)(?:-(\d+))?", stripped)
+    match = re.search(r"-(\d+)(?:\.(\d+))?(?:-(\d+))?", stripped)
     if match:
-        major = match.group(1)
-        minor = match.group(2)
-        if minor is not None and "." not in major:
-            try:
-                return float(f"{major}.{minor}")
-            except ValueError:
-                pass
-        try:
-            return float(major)
-        except ValueError:
-            pass
+        major = int(match.group(1))
+        minor = match.group(2) if match.group(2) is not None else match.group(3)
+        return (major, int(minor) if minor is not None else 0)
     match = re.match(r"^o(\d+)", stripped)
     if match:
-        return float(match.group(1))
-    return 0.0
+        return (int(match.group(1)), 0)
+    return (0, 0)
 
 
 def _is_past_deprecation(entry: dict, today: Optional[date]) -> bool:
@@ -192,7 +187,7 @@ def _wanted(key: str, entry: dict, today: Optional[date]) -> Optional[str]:
         # unversioned experiments like gpt-daybreak): legacy/non-Codex, and
         # keeping them let a $600/M outlier or an old model outrank the current
         # flagship. Anything *codex* is kept regardless of version parse.
-        if is_gpt and not codexish and _version_of(model_id) < 5:
+        if is_gpt and not codexish and _version_of(model_id) < (5, 0):
             return None
         return "openai"
     return None
@@ -248,10 +243,10 @@ def _sort_key(model_id: str, entry: dict, lineup: str = "openai"):
         # not the per-token price. Cost-first put a fringe expensive reasoning
         # model (o1-pro, $600/M out) at rank 0 and buried the actual flagship
         # (gpt-6-astra) — wrong tier for the mapping + a polluted dropdown.
-        return (-version, -cost, model_id)
+        return (tuple(-v for v in version), -cost, model_id)
     # Anthropic: price tracks capability well and there is no fringe outlier,
     # so cost-first keeps the flagship (fable) on top; version + id break ties.
-    return (-cost, -version, model_id)
+    return (-cost, tuple(-v for v in version), model_id)
 
 
 def parse(raw: dict, today: Optional[date] = None) -> Catalogue:

@@ -31,7 +31,23 @@ def test_the_subscription_rows_are_window_then_ceiling():
         assert 0 < window <= ceiling, model
         # Budgeting past `window` walks a subscription into the higher-usage
         # band (D3); the ceiling is recorded for the freshness check only.
-        assert gw.window_for(model).window == window
+        assert gw.window_for(model).window == min(window, gw.CODEX_BACKEND_BUDGET_CAPS.get(model, window))
+
+
+def test_a_window_past_the_2x_band_is_budgeted_at_its_edge():
+    # gpt-6.1-* list a 500K window, but OpenAI bills >272K input at 2x for the
+    # whole request; the owner chose not to let the guard walk into that.
+    for model in ("gpt-6.1-sol", "gpt-6.1-terra"):
+        assert gw.CODEX_BACKEND_WINDOWS[model][0] == 500_000
+        info = gw.window_for(model)
+        assert info.window == 272_000 and not info.assumed
+    assert all(cap <= 272_000 for cap in gw.CODEX_BACKEND_BUDGET_CAPS.values())
+
+
+def test_api_key_6_1_models_are_budgeted_at_the_2x_band_edge():
+    for model in ("gpt-6.1-sol", "gpt-6.1-terra"):
+        info = gw.window_for(model, auth_mode="api_key")
+        assert (info.backend, info.window, info.assumed) == (gw.BACKEND_OPENAI_API, 272_000, False)
 
 
 def test_budget_is_the_cli_headroom_minus_the_output_reserve():
@@ -43,7 +59,7 @@ def test_budget_is_the_cli_headroom_minus_the_output_reserve():
 # --- backends --------------------------------------------------------------
 
 def test_subscription_profiles_get_the_chatgpt_backend_window():
-    info = gw.window_for("gpt-5.6-terra", auth_mode="chatgpt_subscription")
+    info = gw.window_for("gpt-6.1-terra", auth_mode="chatgpt_subscription")
     assert (info.backend, info.window, info.budget, info.assumed) == \
         (gw.BACKEND_SUBSCRIPTION, 272_000, 226_400, False)
 
@@ -166,7 +182,7 @@ def test_codex_profile_windows_reports_the_tightest_budget_across_targets():
     summary = openai_models.codex_profile_windows(p, parity=None)
     assert summary["window"] == 272_000 and summary["budget"] == 226_400
     assert summary["assumed"] is False
-    assert "gpt-5.6-terra" in summary["models"]
+    assert "gpt-6.1-terra" in summary["models"]
 
 
 def test_codex_profile_windows_flags_an_override_it_has_not_met():

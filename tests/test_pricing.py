@@ -230,3 +230,64 @@ def test_estimate_cost_uses_catalogue_rates_when_the_catalogue_is_live(monkeypat
     monkeypatch.setattr(mc, "_current", cat)
     cost = pricing.estimate_cost_usd("claude-sonnet-5", {"input_tokens": 1_000_000})
     assert cost == pytest.approx(4.0)  # the catalogue's rate, not the literal 2
+
+
+# --- Sonnet 5.5 / Haiku 5.5, and a Claude id newer than anything priced ---
+
+def test_sonnet_5_5_out_matches_sonnet_5_and_has_its_own_cache_read_rate():
+    price = pricing.find_price("claude-sonnet-5-5", catalogue=None)
+    assert price.prefix == "claude-sonnet-5-5"
+    assert price.cache_read_per_mtok == pytest.approx(0.10)  # 0.05x input, not Sonnet 5's 0.20
+
+
+def test_haiku_5_5_pays_five_times_every_rate_over_100k_prompt_tokens(monkeypatch):
+    monkeypatch.setattr(mc, "_current", None)
+    short = pricing.estimate_cost_usd("claude-haiku-5-5", {"input_tokens": 100_000, "output_tokens": 1_000_000})
+    assert short == pytest.approx(0.01 + 0.50)
+    # Cache reads count toward the prompt length.
+    long = pricing.estimate_cost_usd("claude-haiku-5-5", {"input_tokens": 1, "cache_read_input_tokens": 100_000,
+                                                          "output_tokens": 1_000_000})
+    assert long == pytest.approx(5 * (0.0000001 + 0.001 + 0.50))
+
+
+@pytest.mark.parametrize("model", ["claude-fable-5-5", "claude-fable-5-5-20261107", "claude-fable-5-5[1m]"])
+def test_an_unreleased_fable_prices_as_the_newest_known_fable(model):
+    # Longest-prefix alone would land claude-fable-5-5 on claude-fable-5,
+    # whose cache reads cost 4x Fable 5.1's.
+    assert pricing.find_price(model, catalogue=None) == pricing.find_price("claude-fable-5-1", catalogue=None)
+    vendored = mc.parse(json.loads(mc._VENDORED_FILE.read_text()), today=TODAY)
+    assert pricing.find_price(model, catalogue=vendored) == pricing.find_price("claude-fable-5-1", catalogue=vendored)
+
+
+def test_a_known_older_model_keeps_its_own_price():
+    assert pricing.find_price("claude-fable-5", catalogue=None).cache_read_per_mtok == pytest.approx(1)
+    assert pricing.find_price("claude-opus-4-1", catalogue=None).input_per_mtok == pytest.approx(15)
+
+
+def test_a_literal_newer_than_the_catalogue_beats_the_catalogues_older_sibling():
+    # A catalogue that predates Sonnet 5.5 must not price it as Sonnet 5.
+    vendored = mc.parse(json.loads(mc._VENDORED_FILE.read_text()), today=TODAY)
+    assert pricing.find_price("claude-sonnet-5-5", catalogue=vendored).prefix == "claude-sonnet-5-5"
+
+
+def test_newest_in_family_ranks_a_two_digit_minor_above_single_digits():
+    # As floats, 5-10 was 5.1 and lost to 5-9; as version tuples it wins.
+    candidates = [("claude-fable-5-1", "p51"), ("claude-fable-5-5", "p55"), ("claude-fable-5-9", "p59")]
+    assert pricing._newest_in_family("claude-fable-5-10", candidates) == "p59"
+    assert pricing._newest_in_family("claude-fable-5-9", candidates) is None
+    candidates.append(("claude-fable-5-10", "p510"))
+    assert pricing._newest_in_family("claude-fable-5-11", candidates) == "p510"
+    assert pricing._newest_in_family("claude-fable-5-9", candidates) is None
+
+
+def test_version_of_orders_point_releases_numerically():
+    v = mc._version_of
+    assert v("claude-fable-5-10") > v("claude-fable-5-9") > v("claude-fable-5-5") > v("claude-fable-5-1") > v("claude-fable-5")
+    assert v("gpt-5.6-terra") == (5, 6) and v("o3-mini") == (3, 0) and v("gpt-daybreak") == (0, 0)
+
+
+def test_gpt_6x_default_targets_are_priced():
+    from claude_unlimited.pricing import find_price
+    for model, out in (("gpt-6.1-sol", 10), ("gpt-6.1-terra", 5), ("gpt-6-luna", 0.50)):
+        price = find_price(model)
+        assert price is not None and price.output_per_mtok == out

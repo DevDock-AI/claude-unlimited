@@ -23,12 +23,13 @@ one that would also match ("claude-opus-4").
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Optional
 
 from . import model_catalogue
 
 PRICING_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
-PRICING_FETCHED = "2026-09-23"
+PRICING_FETCHED = "2026-10-31"
 OPENAI_PRICING_SOURCE = "https://platform.openai.com/docs/pricing"
 OPENAI_PRICING_FETCHED = "2026-09-17"
 
@@ -86,10 +87,16 @@ MODEL_PRICES: tuple[ModelPrice, ...] = (
     ModelPrice("claude-opus-4-5", 5, 6.25, 10, 0.50, 25),
     ModelPrice("claude-opus-4-1", 15, 18.75, 30, 1.50, 75),
     ModelPrice("claude-opus-4", 15, 18.75, 30, 1.50, 75),
+    # Sonnet 5.5's cache hits are 0.05x input, like Opus 5.5; must out-match
+    # the "claude-sonnet-5" prefix.
+    ModelPrice("claude-sonnet-5-5", 2, 2.50, 4, 0.10, 10),
     ModelPrice("claude-sonnet-5", 2, 2.50, 4, 0.20, 10),
     ModelPrice("claude-sonnet-4-6", 3, 3.75, 6, 0.30, 15),
     ModelPrice("claude-sonnet-4-5", 3, 3.75, 6, 0.30, 15),
     ModelPrice("claude-sonnet-4", 3, 3.75, 6, 0.30, 15),
+    # Haiku 5.5's rates for a prompt up to 100K tokens; a longer prompt pays
+    # LONG_PROMPT_TIERS' multiple of every rate (see estimate_cost_usd).
+    ModelPrice("claude-haiku-5-5", 0.10, 0.125, 0.20, 0.01, 0.50),
     ModelPrice("claude-haiku-4-5", 1, 1.25, 2, 0.10, 5),
     ModelPrice("claude-haiku-3-5", 0.80, 1, 1.60, 0.08, 4),
     ModelPrice("claude-3-5-haiku", 0.80, 1, 1.60, 0.08, 4),  # older dot-release id style
@@ -104,6 +111,12 @@ MODEL_PRICES: tuple[ModelPrice, ...] = (
     # write bills as ordinary input. Cache-read is OpenAI's cached-input rate,
     # 10% of input; the `-pro` models do not support prompt caching at all, so
     # theirs is that same derived 10% rather than a published figure.
+    # gpt-6.1-sol/-terra and gpt-6-luna: OpenAI's published standard rates
+    # (2026-10/11), no cache-write rate stated. Their >272K-input surcharge
+    # is not modelled; Codex budgets the 6.1 pair at 272K (gpt_windows).
+    ModelPrice("gpt-6.1-sol", 2, 2, 2, 0.10, 10),
+    ModelPrice("gpt-6.1-terra", 1, 1, 1, 0.05, 5),
+    ModelPrice("gpt-6-luna", 0.10, 0.10, 0.10, 0.01, 0.50),
     ModelPrice("gpt-6-astra", 10, 12.50, 10, 1, 50),
     ModelPrice("gpt-5.6-cyber", 12.50, 15.625, 12.50, 1.25, 75),
     ModelPrice("gpt-5.6-sol", 4, 5, 4, 0.40, 20),
@@ -156,6 +169,38 @@ def _price_from_model_info(info, cache_write_multipliers=None) -> Optional[Model
     )
 
 
+# Models priced by prompt length: prefix -> (threshold, multiplier). A
+# request whose prompt (input + cache writes + cache reads) is OVER the
+# threshold pays every rate times the multiplier. Haiku 5.5 is exactly 5x on
+# all five rates above 100K tokens (Anthropic's pricing page). The catalogue
+# has no field for this, so it applies whichever source supplied the rates.
+LONG_PROMPT_TIERS: dict[str, tuple[int, float]] = {
+    "claude-haiku-5-5": (100_000, 5.0),
+}
+
+_FAMILY = re.compile(r"^(claude-[a-z]+)-\d")
+
+
+def _newest_in_family(normalized: str, candidates) -> Optional[ModelPrice]:
+    """For a Claude id NEWER than every known member of its family (an
+    unreleased `claude-fable-5-5` while 5.1 is the newest priced Fable), the
+    newest known member's price. Plain longest-prefix would land it on an
+    older sibling instead (`claude-fable-5` — 4x the cache-read rate of 5.1).
+    None when the id is not newer than everything known, so a known or older
+    id keeps its exact longest-prefix match. `candidates` is (prefix, price)."""
+    match = _FAMILY.match(normalized)
+    if not match:
+        return None
+    family = match.group(1) + "-"
+    version = model_catalogue._version_of(normalized)
+    members = [(model_catalogue._version_of(prefix), price) for prefix, price in candidates
+               if prefix.startswith(family) and _FAMILY.match(prefix)]
+    if not members:
+        return None
+    newest_version, newest = max(members, key=lambda m: m[0])
+    return newest if version > newest_version else None
+
+
 _USE_CURRENT_CATALOGUE = object()  # sentinel: default to model_catalogue.current()
 
 
@@ -169,6 +214,17 @@ def find_price(model: Optional[str], catalogue=_USE_CURRENT_CATALOGUE) -> Option
     if catalogue is _USE_CURRENT_CATALOGUE:
         catalogue = model_catalogue.current()
     normalized = model.lower()
+
+    # Catalogue members first: on a version tie max() keeps the first, so the
+    # catalogue's rate wins over the literal for the same model.
+    family_candidates = [] if catalogue is None else [
+        (model_catalogue.base_id(info.id).lower(), price)
+        for info in catalogue.anthropic
+        if (price := _price_from_model_info(info)) is not None]
+    family_candidates += [(p.prefix, p) for p in MODEL_PRICES]
+    newest = _newest_in_family(normalized, family_candidates)
+    if newest is not None:
+        return newest
 
     if catalogue is not None:
         best_info = None
@@ -186,13 +242,17 @@ def find_price(model: Optional[str], catalogue=_USE_CURRENT_CATALOGUE) -> Option
                     price = _price_from_model_info(info, multipliers)
                     if price is not None:
                         best_info, best_len = price, len(prefix)
-        if best_info is not None:
-            return best_info
-
     best: Optional[ModelPrice] = None
     for price in MODEL_PRICES:
         if normalized.startswith(price.prefix) and (best is None or len(price.prefix) > len(best.prefix)):
             best = price
+
+    if catalogue is not None and best_info is not None:
+        # The catalogue wins a tie, but a literal that matches MORE of the id
+        # is a model the catalogue doesn't carry yet (Sonnet 5.5 beside a
+        # catalogue that only knows Sonnet 5) — its sibling's rate is wrong.
+        if best is None or best_len >= len(best.prefix):
+            return best_info
     return best
 
 
@@ -215,7 +275,13 @@ def estimate_cost_usd(model: Optional[str], usage: Optional[dict]) -> Optional[f
     cache_write_tokens = usage.get("cache_creation_input_tokens") or 0
     cache_read_tokens = usage.get("cache_read_input_tokens") or 0
 
-    cost = (
+    multiplier = 1.0
+    normalized = (model or "").lower()
+    for prefix, (threshold, tier_multiplier) in LONG_PROMPT_TIERS.items():
+        if normalized.startswith(prefix) and input_tokens + cache_write_tokens + cache_read_tokens > threshold:
+            multiplier = tier_multiplier
+
+    cost = multiplier * (
         input_tokens / 1_000_000 * price.input_per_mtok
         + output_tokens / 1_000_000 * price.output_per_mtok
         + cache_write_tokens / 1_000_000 * price.cache_write_5m_per_mtok

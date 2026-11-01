@@ -14,10 +14,10 @@ def test_known_claude_models_map_to_their_confirmed_parity_target():
     # output weighted by model tier (docs/adr/0007), and Claude Code chooses
     # Fable on its own, so a user who never picked the expensive model must
     # not end up paying for it.
-    assert map_model("claude-fable-5") == OpenAIModelTarget("gpt-5.6-sol", "medium")
-    assert map_model("claude-opus-5") == OpenAIModelTarget("gpt-5.6-terra", "high")
-    assert map_model("claude-sonnet-5") == OpenAIModelTarget("gpt-5.6-terra", "medium")
-    assert map_model("claude-haiku-4-5-20251001") == OpenAIModelTarget("gpt-5.6-luna", "low")
+    assert map_model("claude-fable-5") == OpenAIModelTarget("gpt-6.1-sol", "medium")
+    assert map_model("claude-opus-5") == OpenAIModelTarget("gpt-6.1-terra", "high")
+    assert map_model("claude-sonnet-5") == OpenAIModelTarget("gpt-6.1-terra", "medium")
+    assert map_model("claude-haiku-4-5-20251001") == OpenAIModelTarget("gpt-6-luna", "low")
 
 
 def test_no_tier_reaches_the_expensive_model_by_default():
@@ -29,16 +29,16 @@ def test_no_tier_reaches_the_expensive_model_by_default():
 
 
 def test_unknown_model_falls_back_to_the_balanced_default():
-    assert map_model("some-future-claude-model") == OpenAIModelTarget("gpt-5.6-terra", "medium")
-    assert map_model(None) == OpenAIModelTarget("gpt-5.6-terra", "medium")
+    assert map_model("some-future-claude-model") == OpenAIModelTarget("gpt-6.1-terra", "medium")
+    assert map_model(None) == OpenAIModelTarget("gpt-6.1-terra", "medium")
 
 
 def test_family_prefix_fallback_for_an_unrecognized_but_familiar_id():
     # A dated id the table has no exact entry for, but which still names a
     # recognizable tier by substring.
-    assert map_model("claude-opus-4-1-20260101") == OpenAIModelTarget("gpt-5.6-terra", "high")
-    assert map_model("claude-fable-legacy") == OpenAIModelTarget("gpt-5.6-sol", "medium")
-    assert map_model("claude-haiku-legacy") == OpenAIModelTarget("gpt-5.6-luna", "low")
+    assert map_model("claude-opus-4-1-20260101") == OpenAIModelTarget("gpt-6.1-terra", "high")
+    assert map_model("claude-fable-legacy") == OpenAIModelTarget("gpt-6.1-sol", "medium")
+    assert map_model("claude-haiku-legacy") == OpenAIModelTarget("gpt-6-luna", "low")
 
 
 def test_per_profile_model_override_wins_outright():
@@ -53,28 +53,32 @@ def test_per_profile_model_override_wins_outright():
 
 def test_per_profile_reasoning_effort_override_alone_keeps_the_mapped_model():
     target = map_model("claude-fable-5", override_reasoning_effort="xhigh")
-    assert target.model == "gpt-5.6-sol"
+    assert target.model == "gpt-6.1-sol"
     assert target.reasoning_effort == "xhigh"
 
 
 def test_both_overrides_together():
-    target = map_model("claude-sonnet-5", override_model="gpt-5.6-luna", override_reasoning_effort="max")
-    assert target == OpenAIModelTarget("gpt-5.6-luna", "max")
+    target = map_model("claude-sonnet-5", override_model="gpt-6-luna", override_reasoning_effort="max")
+    assert target == OpenAIModelTarget("gpt-6-luna", "max")
 
 
 def test_fallbacks_start_below_the_rejected_model():
     # A model rejected as too capable (or withdrawn from a plan) should not
     # retry something more capable first — it walks down, then wraps to the
     # rungs above (so a retired mid-tier can still reach a working one).
-    assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"]
+    assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
+                                              "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]
 
 
 def test_fallbacks_wrap_around_for_a_mid_tier_model():
-    assert fallback_models("gpt-5.6-terra") == ["gpt-5.6-luna", "gpt-6-astra", "gpt-5.6-sol"]
+    assert fallback_models("gpt-5.6-terra") == ["gpt-5.6-luna", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra",
+                                                "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"]
 
 
 def test_an_unknown_model_falls_back_to_the_whole_ladder():
-    assert fallback_models("gpt-4o-legacy") == ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+    assert fallback_models("gpt-4o-legacy") == list(_MODEL_LADDER)
+    assert _MODEL_LADDER == ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
+                             "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 
 
 def test_every_model_in_the_map_can_reach_every_other_one():
@@ -123,8 +127,8 @@ def test_the_dashboard_does_not_restate_the_mapping():
 
 
 def test_parity_override_applies_to_the_mapping():
-    parity = {"claude-opus-5": {"model": "gpt-5.6-sol", "effort": "max"}}
-    assert map_model("claude-opus-5", parity=parity) == OpenAIModelTarget("gpt-5.6-sol", "max")
+    parity = {"claude-opus-5": {"model": "gpt-6.1-sol", "effort": "max"}}
+    assert map_model("claude-opus-5", parity=parity) == OpenAIModelTarget("gpt-6.1-sol", "max")
 
 
 def test_a_parity_row_may_override_only_one_field():
@@ -136,9 +140,9 @@ def test_a_parity_row_may_override_only_one_field():
 
 def test_a_profile_override_still_beats_the_parity_map():
     # Narrower wins: the Profile setting is more specific than a global table.
-    parity = {"claude-opus-5": {"model": "gpt-5.6-sol"}}
-    t = map_model("claude-opus-5", override_model="gpt-5.6-luna", parity=parity)
-    assert t.model == "gpt-5.6-luna"
+    parity = {"claude-opus-5": {"model": "gpt-6.1-sol"}}
+    t = map_model("claude-opus-5", override_model="gpt-6-luna", parity=parity)
+    assert t.model == "gpt-6-luna"
 
 
 def test_parity_reaches_a_dated_model_id_through_the_family_fallback():
@@ -154,7 +158,7 @@ def test_untouched_rows_follow_the_shipped_defaults():
 def test_advertised_models_reflect_parity():
     # The /model picker must not advertise one thing while the bridge runs
     # another — that is the drift class this work exists to remove.
-    parity = {"claude-opus-5": {"model": "gpt-5.6-sol", "effort": "max"}}
+    parity = {"claude-opus-5": {"model": "gpt-6.1-sol", "effort": "max"}}
     labels = dict(advertised_models(parity))
     assert "Sol" in labels["claude-opus-5"] and "max" in labels["claude-opus-5"]
 
@@ -164,11 +168,11 @@ def test_automatic_mapping_marks_overridden_rows():
     assert rows["claude-opus-5"]["overridden"] is True
     assert rows["claude-opus-5"]["reasoning_effort"] == "max"
     assert rows["claude-opus-5"]["default_effort"] == _MODEL_MAP["claude-opus-5"].reasoning_effort
-    assert rows["claude-sonnet-5"]["overridden"] is False
+    assert rows["claude-sonnet-5-5"]["overridden"] is False
 
 
 def test_the_effort_list_matches_what_the_backend_accepts():
-    """Verified live (2026-09-17) against gpt-5.6-terra and gpt-5.6-sol:
+    """Verified live (2026-09-17) against gpt-6.1-terra and gpt-6.1-sol:
     "Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and
     'max'." `none` returns 0 reasoning tokens — the thing a Codex subscription
     is charged for (ADR 0007). `minimal` is rejected outright, so offering it
@@ -192,3 +196,51 @@ def test_none_reaches_the_request_body_as_the_effort():
 def test_a_profile_can_be_saved_with_reasoning_off():
     from claude_unlimited.profiles import _validate_field_types
     _validate_field_types(codex_reasoning_effort="none")
+
+
+def test_an_unreleased_fable_is_treated_as_fable_everywhere():
+    from claude_unlimited import model_catalogue
+    from claude_unlimited.openai_models import apply_claude_effort, bucket_matches, model_bucket_name
+    for model in ("claude-fable-5-5", "claude-fable-5-5-20261107"):
+        assert map_model(model) == map_model("claude-fable-5-1")
+        assert apply_claude_effort(model, "max") == "max"
+        assert model_bucket_name(model) == "Fable"           # drives fable_spent / leave_on_fable_limit
+        assert bucket_matches(model, "Fable")
+    assert model_catalogue.display_name_for("claude-fable-5-5") == "Claude Fable 5.5"
+
+
+def test_sonnet_and_haiku_5_5_map_to_their_familys_tier():
+    assert map_model("claude-sonnet-5-5") == map_model("claude-sonnet-5")
+    assert map_model("claude-haiku-5-5") == map_model("claude-haiku-4-5-20251001")
+
+
+def test_haiku_5_5_passes_claude_effort_through_older_haiku_does_not():
+    from claude_unlimited.openai_models import apply_claude_effort
+    for effort in ("low", "medium", "high", "xhigh", "max"):
+        assert apply_claude_effort("claude-haiku-5-5", effort) == effort
+    assert apply_claude_effort("claude-haiku-4-5", "high") is None
+    assert apply_claude_effort("claude-haiku-4-5-20251001", "low") is None
+
+
+def test_shipped_defaults_are_the_gpt_6_generation_and_astra_stays_unmapped():
+    assert _MODEL_MAP["claude-fable-5"] == OpenAIModelTarget("gpt-6.1-sol", "medium")
+    assert _MODEL_MAP["claude-opus-5-5"] == OpenAIModelTarget("gpt-6.1-terra", "high")
+    assert _MODEL_MAP["claude-sonnet-5-5"] == OpenAIModelTarget("gpt-6.1-terra", "medium")
+    assert _MODEL_MAP["claude-haiku-5-5"] == OpenAIModelTarget("gpt-6-luna", "low")
+    assert all(t.model != "gpt-6-astra" for t in _MODEL_MAP.values())
+    # Sonnet/Haiku 5.5 lead their families so the no-catalogue seed matches cli._MODEL_TIER_IDS.
+    from claude_unlimited.cli import _MODEL_TIER_IDS
+    rows = [r["claude_model"] for r in default_parity_rows_no_cat()]
+    assert _MODEL_TIER_IDS["SONNET"] in rows and _MODEL_TIER_IDS["HAIKU"] in rows
+
+
+def test_a_saved_row_keeps_its_target_when_the_defaults_move():
+    from claude_unlimited.openai_models import normalize_parity
+    rows = normalize_parity([{"claude_model": "claude-sonnet-5", "model": "gpt-5.6-terra",
+                              "effort": "medium", "claude_effort": None}])
+    assert rows[0]["model"] == "gpt-5.6-terra"
+
+
+def default_parity_rows_no_cat():
+    from claude_unlimited import openai_models
+    return openai_models.default_parity_rows(None)

@@ -529,6 +529,7 @@ struct DetailCard: View {
         guard p.enabled, let raw = p.plan?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
         switch raw.lowercased() {
         case "max": return "Max"
+        case "ultra": return "Ultra"
         case "pro": return "Pro"
         case "plus": return "Plus"
         case "team": return "Team"

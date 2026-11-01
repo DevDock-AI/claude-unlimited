@@ -31,7 +31,11 @@ from typing import Optional
 # subscription into the 2x band is the spending ADR 0007 exists to prevent.
 # Changing a row is a spending decision.
 CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
+    "gpt-6.1-sol": (500_000, 872_000),      # cache 2026-10-31 (client 0.166.0); budget capped below
+    "gpt-6.1-terra": (500_000, 872_000),    # cache 2026-10-31 (client 0.166.0); budget capped below
     "gpt-6-astra": (272_000, 872_000),      # cache 2026-09-21, visibility list
+    "gpt-6-sol": (272_000, 872_000),        # cache 2026-10-18 (client 0.162.1), visibility list
+    "gpt-6-luna": (272_000, 872_000),       # cache 2026-10-18 (client 0.162.1), visibility list
     "gpt-5.6-sol": (272_000, 872_000),      # cache 2026-09-21, visibility list
     "gpt-5.6-terra": (272_000, 872_000),    # cache 2026-09-21, visibility list
     "gpt-5.6-luna": (272_000, 872_000),     # cache 2026-09-21, visibility list
@@ -39,6 +43,16 @@ CODEX_BACKEND_WINDOWS: dict[str, tuple[int, int]] = {
     "gpt-5.4": (272_000, 1_000_000),        # 0.149.0 bundled catalogue
     "gpt-5.4-mini": (272_000, 272_000),     # 0.149.0 bundled catalogue
     "gpt-5.2": (272_000, 272_000),          # 0.149.0 bundled catalogue
+}
+
+# Slugs whose backend context_window lies past the 272K edge of the 2x usage
+# band. The table above keeps the backend's real numbers (so the freshness
+# check stays exact); the guard budgets these at the band edge instead, by
+# owner decision 2026-10-31: a longer conversation is not worth silently
+# doubling its cost (ADR 0007/0009). Raising a cap is a spending decision.
+CODEX_BACKEND_BUDGET_CAPS: dict[str, int] = {
+    "gpt-6.1-sol": 272_000,
+    "gpt-6.1-terra": 272_000,
 }
 
 # effective_context_window_percent from the same listing: the headroom the
@@ -57,11 +71,19 @@ UNKNOWN_WINDOW = 272_000
 # 2026-09): the 1,050,000 context window minus the 128,000 max output.
 OPENAI_API_MAX_INPUT: dict[str, int] = {
     "gpt-6-astra": 922_000,
+    "gpt-6-sol": 922_000,             # model page, 2026-10-18
+    "gpt-6-luna": 922_000,            # model page, 2026-10-18
     "gpt-5.6": 922_000,
     "gpt-5.6-sol": 922_000,
     "gpt-5.6-terra": 922_000,
     "gpt-5.6-luna": 922_000,
     "gpt-5.2": 272_000,
+    # gpt-6.1-sol/-terra: budgeted at the 2x billing band edge (>272K input
+    # bills the whole request at 2x), the same policy as
+    # CODEX_BACKEND_BUDGET_CAPS / ADR 0007/0009. The real API max is not
+    # modelled here.
+    "gpt-6.1-sol": 272_000,
+    "gpt-6.1-terra": 272_000,
 }
 
 # openai_translate sends no max_output_tokens, so the reply plus reasoning is
@@ -123,6 +145,7 @@ def window_for(model: Optional[str], auth_mode: Optional[str] = None,
     key = (model or "").strip().lower()
     if backend == BACKEND_SUBSCRIPTION and key in CODEX_BACKEND_WINDOWS:
         window = CODEX_BACKEND_WINDOWS[key][0]
+        window = min(window, CODEX_BACKEND_BUDGET_CAPS.get(key, window))
         return WindowInfo(key, backend, window, budget_for(window), assumed=False)
     if backend == BACKEND_OPENAI_API and key in OPENAI_API_MAX_INPUT:
         window = OPENAI_API_MAX_INPUT[key]

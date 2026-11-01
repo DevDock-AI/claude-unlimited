@@ -70,7 +70,7 @@ def test_a_new_top_claude_model_gets_the_top_openai_tier():
     # model in existence: nothing maps to the flagship by default, so a brand
     # new top Claude model must not invent that spending level either.
     emap = effective_model_map(make_catalogue())
-    assert emap["claude-zenith-6"] == OpenAIModelTarget("gpt-5.6-sol", "medium")
+    assert emap["claude-zenith-6"] == OpenAIModelTarget("gpt-6.1-sol", "medium")
     assert "gpt-6-astra" not in {t.model for t in emap.values()}
 
 
@@ -78,7 +78,7 @@ def test_a_new_mid_tier_model_takes_its_conservative_neighbours_tier():
     # Between Opus (terra/high) and Sonnet (terra/medium): the cheaper
     # neighbour wins, because raising a row raises what a session costs.
     emap = effective_model_map(make_catalogue())
-    assert emap["claude-nova-4"] == OpenAIModelTarget("gpt-5.6-terra", "medium")
+    assert emap["claude-nova-4"] == OpenAIModelTarget("gpt-6.1-terra", "medium")
 
 
 def test_the_tier_system_does_not_collapse_onto_one_model():
@@ -100,7 +100,8 @@ def test_without_a_catalogue_everything_falls_back_to_the_literals():
             heads.append(claude_id)
     assert [r["claude_model"] for r in automatic_mapping()] == heads
     assert list(dict(advertised_models()).keys()) == heads   # the picker gets no duplicate Opus
-    assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"]
+    assert fallback_models("gpt-5.6-sol") == ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
+                                              "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]
 
 
 def test_selectable_models_are_ordered_most_expensive_first():
@@ -131,24 +132,24 @@ def test_advertised_models_are_exactly_the_saved_rows():
     assert ids == ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
     assert "claude-zenith-6" not in ids and "claude-nova-4" not in ids
     labels = dict(ads)
-    assert labels["claude-fable-5"] == "Claude Fable 5 | GPT-5.6 Sol · medium"
+    assert labels["claude-fable-5"] == "Claude Fable 5 | GPT-6.1 Sol · medium"
 
 
 def test_advertised_models_reflect_a_saved_list_with_claude_effort():
     cat = make_catalogue()
     saved = [
-        {"claude_model": "claude-fable-5", "model": "gpt-5.6-sol",
+        {"claude_model": "claude-fable-5", "model": "gpt-6.1-sol",
          "effort": "high", "claude_effort": "xhigh"},
-        {"claude_model": "claude-haiku-4-5", "model": "gpt-5.6-luna",
+        {"claude_model": "claude-haiku-4-5", "model": "gpt-6-luna",
          "effort": "low", "claude_effort": "high"},
     ]
     labels = dict(advertised_models(saved, catalogue=cat))
     ids = [cid for cid, _ in advertised_models(saved, catalogue=cat)]
     assert ids == ["claude-fable-5", "claude-haiku-4-5"]  # exactly the saved rows, in order
     # fable accepts output_config.effort -> surfaced; codex effort stays last segment.
-    assert labels["claude-fable-5"] == "Claude Fable 5 (effort xhigh) | GPT-5.6 Sol · high"
+    assert labels["claude-fable-5"] == "Claude Fable 5 (effort xhigh) | GPT-6.1 Sol · high"
     # haiku rejects it (gate returns None) -> no effort annotation even if set.
-    assert labels["claude-haiku-4-5"] == "Claude Haiku 4.5 | GPT-5.6 Luna · low"
+    assert labels["claude-haiku-4-5"] == "Claude Haiku 4.5 | GPT-6 Luna · low"
 
 
 def test_automatic_mapping_rows_come_from_the_saved_list():
@@ -163,19 +164,19 @@ def test_automatic_mapping_rows_come_from_the_saved_list():
 def test_map_model_resolves_catalogue_only_models():
     cat = make_catalogue()
     # Inherits the TOP CURATED tier, which is Fable's — no longer the flagship.
-    assert map_model("claude-zenith-6", catalogue=cat) == OpenAIModelTarget("gpt-5.6-sol", "medium")
+    assert map_model("claude-zenith-6", catalogue=cat) == OpenAIModelTarget("gpt-6.1-sol", "medium")
     # A dated spelling of a catalogue row lands on the same row.
-    assert map_model("claude-nova-4-20260901", catalogue=cat) == OpenAIModelTarget("gpt-5.6-terra", "medium")
+    assert map_model("claude-nova-4-20260901", catalogue=cat) == OpenAIModelTarget("gpt-6.1-terra", "medium")
 
 
 def test_parity_overlay_still_wins_over_the_catalogue_mapping():
     cat = make_catalogue()
-    parity = {"claude-zenith-6": {"model": "gpt-5.6-luna", "effort": "low"}}
+    parity = {"claude-zenith-6": {"model": "gpt-6-luna", "effort": "low"}}
     assert map_model("claude-zenith-6", parity=parity, catalogue=cat) == \
-        OpenAIModelTarget("gpt-5.6-luna", "low")
+        OpenAIModelTarget("gpt-6-luna", "low")
     rows = {r["claude_model"]: r for r in automatic_mapping(parity, catalogue=cat)}
     assert rows["claude-zenith-6"]["overridden"] is True
-    assert rows["claude-zenith-6"]["openai_model"] == "gpt-5.6-luna"
+    assert rows["claude-zenith-6"]["openai_model"] == "gpt-6-luna"
     # Per-Profile override remains narrower and still beats the parity map.
     assert map_model("claude-zenith-6", override_model="gpt-5.2",
                      parity=parity, catalogue=cat).model == "gpt-5.2"
@@ -186,12 +187,12 @@ def test_an_unknown_model_still_resolves_safely_with_a_catalogue():
     assert map_model("mystery-model-9000", catalogue=cat) == _DEFAULT_TARGET
     assert map_model(None, catalogue=cat) == _DEFAULT_TARGET
     # Family fallback still works for a familiar family the catalogue lacks.
-    assert map_model("claude-haiku-legacy", catalogue=cat) == OpenAIModelTarget("gpt-5.6-luna", "low")
+    assert map_model("claude-haiku-legacy", catalogue=cat) == OpenAIModelTarget("gpt-6-luna", "low")
 
 
 def test_fallback_ladder_derives_from_the_catalogue_and_stays_exhaustive():
     cat = make_catalogue()
-    ladder_walk = {"gpt-5.6-sol", *fallback_models("gpt-5.6-sol", cat)}
+    ladder_walk = {"gpt-6.1-sol", *fallback_models("gpt-6.1-sol", cat)}
     for target in effective_model_map(cat).values():
         assert target.model in ladder_walk
 
@@ -223,7 +224,7 @@ def test_a_fully_renamed_lineup_spreads_across_the_curated_tiers():
                             input_cost=1e-06, output_cost=1e-05, rank=rank)
     cat = mc.Catalogue(
         anthropic=tuple(info(f"claude-alien-{i}", i) for i in range(4)),
-        openai=(info("gpt-5.6-sol", 0),))
+        openai=(info("gpt-6.1-sol", 0),))
     emap = effective_model_map(cat)
     assert emap["claude-alien-0"] == list(_MODEL_MAP.values())[0]
     assert emap["claude-alien-3"] == list(_MODEL_MAP.values())[-1]
@@ -261,8 +262,8 @@ def test_apply_claude_effort_gate(model, requested, expected):
 def test_claude_effort_for_matches_a_row_and_gates_by_model():
     cat = make_catalogue()
     saved = [
-        {"claude_model": "claude-fable-5", "model": "gpt-5.6-sol", "effort": "high", "claude_effort": "max"},
-        {"claude_model": "claude-haiku-4-5", "model": "gpt-5.6-luna", "effort": "low", "claude_effort": "high"},
+        {"claude_model": "claude-fable-5", "model": "gpt-6.1-sol", "effort": "high", "claude_effort": "max"},
+        {"claude_model": "claude-haiku-4-5", "model": "gpt-6-luna", "effort": "low", "claude_effort": "high"},
     ]
     assert claude_effort_for("claude-fable-5", saved, cat) == "max"
     # a dated spelling still matches the row by base id
@@ -278,16 +279,16 @@ def test_claude_effort_for_matches_a_row_and_gates_by_model():
 def test_normalize_parity_migrates_a_legacy_dict_to_the_default_rows_plus_extras():
     cat = make_catalogue()
     legacy = {
-        "claude-opus-5": {"model": "gpt-5.6-luna", "effort": "low"},  # overlay a default
-        "claude-zenith-6": {"model": "gpt-5.6-sol", "effort": "high"},  # a key outside defaults
+        "claude-opus-5": {"model": "gpt-6-luna", "effort": "low"},  # overlay a default
+        "claude-zenith-6": {"model": "gpt-6.1-sol", "effort": "high"},  # a key outside defaults
     }
     rows = normalize_parity(legacy, cat)
     by_id = {r["claude_model"]: r for r in rows}
     # the four defaults are present, opus overlaid
     assert set(["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]) <= set(by_id)
-    assert by_id["claude-opus-5"]["model"] == "gpt-5.6-luna"
+    assert by_id["claude-opus-5"]["model"] == "gpt-6-luna"
     # the non-default key survives as its own appended row
-    assert by_id["claude-zenith-6"]["model"] == "gpt-5.6-sol"
+    assert by_id["claude-zenith-6"]["model"] == "gpt-6.1-sol"
 
 
 def test_normalize_parity_empty_shapes_yield_the_defaults():
@@ -300,7 +301,7 @@ def test_normalize_parity_empty_shapes_yield_the_defaults():
 def test_normalize_parity_fills_missing_fields_in_a_list_row():
     cat = make_catalogue()
     rows = normalize_parity([{"claude_model": "claude-opus-5"}], cat)  # no model/effort
-    assert rows == [{"claude_model": "claude-opus-5", "model": "gpt-5.6-terra",
+    assert rows == [{"claude_model": "claude-opus-5", "model": "gpt-6.1-terra",
                      "effort": "high", "claude_effort": None}]
 
 
@@ -322,7 +323,7 @@ def test_unmapped_reports_a_family_with_no_saved_row():
     ids = [r["claude_model"] for r in unmapped_claude_models(catalogue=cat)]
     assert ids == ["claude-zenith-6", "claude-nova-4"]
     zenith = unmapped_claude_models(catalogue=cat)[0]
-    assert zenith["would_map_to"] == "gpt-5.6-sol"
+    assert zenith["would_map_to"] == "gpt-6.1-sol"
     assert zenith["would_use_effort"] == "medium"
     assert zenith["claude_label"]
 
@@ -348,7 +349,7 @@ def test_unmapped_reports_a_model_newer_than_its_saved_row():
     # list — with no saved list the defaults track the catalogue's newest
     # member per family, so by construction nothing is ever outstanding.
     cat = make_catalogue(extra={"claude-sonnet-6": entry("anthropic", 1.4e-05)})
-    saved = [{"claude_model": "claude-sonnet-5", "model": "gpt-5.6-terra",
+    saved = [{"claude_model": "claude-sonnet-5", "model": "gpt-6.1-terra",
               "effort": "medium", "claude_effort": None}]
     ids = [r["claude_model"] for r in unmapped_claude_models(saved, catalogue=cat)]
     assert "claude-sonnet-6" in ids
@@ -373,7 +374,7 @@ def test_unmapped_never_reports_an_unversioned_preview():
 
 def test_unmapped_counts_a_dated_spelling_as_covered():
     cat = make_catalogue()
-    saved = [{"claude_model": "claude-zenith-6-20260901", "model": "gpt-5.6-sol",
+    saved = [{"claude_model": "claude-zenith-6-20260901", "model": "gpt-6.1-sol",
               "effort": "medium", "claude_effort": None}]
     assert "claude-zenith-6" not in [r["claude_model"] for r in unmapped_claude_models(saved, catalogue=cat)]
 

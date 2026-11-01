@@ -301,18 +301,38 @@ class AccountProfile:
     org_name: Optional[str]
     has_claude_max: Optional[bool]
     has_claude_pro: Optional[bool]
+    organization_type: Optional[str] = None
+    rate_limit_tier: Optional[str] = None
+
+
+# Organisation types that are not a personal subscription: both plan flags
+# are false for them too (and for a free account), so the Ultra fallback below
+# must not claim them.
+_NON_PERSONAL_ORG_TYPES = ("team", "enterprise", "api", "console", "free")
 
 
 def plan_from_account(account: AccountProfile) -> Optional[str]:
     """The plan detected from Anthropic's /api/oauth/profile response.
 
-    "max" takes priority, since an account can carry both flags. None means
-    undetermined, never a guess. Every OAuth-adding path shares this one
-    implementation — see profiles.upsert_oauth_profile()."""
+    The response carries only two booleans, account.has_claude_max and
+    account.has_claude_pro; Ultra (formerly "Max 20x") has no documented flag.
+    So: an explicit "ultra"/"20x" in organization_type or rate_limit_tier
+    wins; then Max, then Pro; and when BOTH flags are explicitly false on a
+    personal (non-team/enterprise) organisation, the account is subscribed
+    (it completed a Claude Code login) but neither Max nor Pro, which today
+    means Ultra. A missing flag (None) still means undetermined. Every
+    OAuth-adding path shares this one implementation — see
+    profiles.upsert_oauth_profile()."""
+    hints = " ".join(filter(None, (account.organization_type, account.rate_limit_tier))).lower()
+    if "ultra" in hints or "20x" in hints:
+        return "ultra"
     if account.has_claude_max:
         return "max"
     if account.has_claude_pro:
         return "pro"
+    if (account.has_claude_max is False and account.has_claude_pro is False
+            and not any(t in hints for t in _NON_PERSONAL_ORG_TYPES)):
+        return "ultra"
     return None
 
 
@@ -361,4 +381,6 @@ def fetch_account_profile(access_token: str, timeout: float = 15.0) -> AccountPr
         org_name=org.get("name"),
         has_claude_max=account.get("has_claude_max"),
         has_claude_pro=account.get("has_claude_pro"),
+        organization_type=org.get("organization_type"),
+        rate_limit_tier=org.get("rate_limit_tier"),
     )

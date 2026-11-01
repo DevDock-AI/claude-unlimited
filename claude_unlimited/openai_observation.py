@@ -23,6 +23,7 @@ from typing import Optional
 
 from .observation import (
     AuthInvalid,
+    BudgetUnavailable,
     Observation,
     ProviderUnavailable,
     QuotaExhausted,
@@ -132,6 +133,10 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
     contract."""
     if status_code == 401:
         return AuthInvalid()
+
+    if status_code == 402:
+        # Same as observation.py: the account needs funding, not a reset.
+        return BudgetUnavailable()
 
     if status_code == 429:
         primary = _parse_window(headers, "primary", now)

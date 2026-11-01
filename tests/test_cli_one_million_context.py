@@ -273,7 +273,7 @@ def test_the_settings_endpoint_publishes_the_decision_reason(monkeypatch, tmp_pa
     assert entry["id"] == "c" and entry["name"] == "C"
     assert entry["window"] == 272_000 and entry["budget"] == 226_400
     assert entry["assumed"] is False and preview["guard"]["assumed"] is False
-    assert "gpt-5.6-terra" in entry["models"]
+    assert "gpt-6.1-terra" in entry["models"]
 
     claude_only = Pool(profiles=[Profile(id="a", name="A", kind="oauth", automatic=True)],
                         settings=Settings(context_1m="auto"))
@@ -316,7 +316,7 @@ def test_the_launch_note_names_each_codex_account_and_its_window():
                     auth_mode="chatgpt_subscription")
     pool = Pool(profiles=[_OAUTH, codex], settings=Settings())
     [line] = cli._codex_guard_lines(pool, pool.profiles, None)
-    assert "Work ChatGPT" in line and "~226K" in line and "gpt-5.6-terra" in line
+    assert "Work ChatGPT" in line and "~226K" in line and "gpt-6.1-terra" in line
     assert "assumed" not in line
     assert cli._codex_guard_lines(Pool(profiles=[_OAUTH], settings=Settings()), [_OAUTH], None) == []
 
@@ -326,7 +326,8 @@ def test_the_launch_note_names_each_codex_account_and_its_window():
     assert "assumed" in line and "gpt-99-nova" in line
 
     # An api_key codex Profile talks to api.openai.com: the public API's window.
-    public = Profile(id="k", name="K", kind="codex", automatic=True, auth_mode="api_key")
+    public = Profile(id="k", name="K", kind="codex", automatic=True, auth_mode="api_key",
+                     codex_model="gpt-6-astra")  # default gpt-6.1 targets are 272K on the public API
     [line] = cli._codex_guard_lines(Pool(profiles=[public], settings=Settings()), [public], None)
     assert "~843K" in line
 
