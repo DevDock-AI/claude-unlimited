@@ -245,7 +245,7 @@ def test_every_setting_survives_a_save_and_load(pool_env):
                    "notify_rotated": True, "notify_quota_reset": True, "notify_needs_attention": False,
                    "distribute_sessions_default": True, "keep_usage_fresh": False,
                    "model_parity": {"rows": []}, "eco_tier": "light", "speech_level": "ultra",
-                   "codex_spend_credits": True, "return_to_preferred": True,
+                   "codex_spend_credits": True, "return_to_preferred": True, "codex_cli_serving": True,
                    "fable_limit_all_profiles": True, "context_1m": "prefer_200k"}
     assert set(non_default) == {f.name for f in fields(Settings)}, "add the new field to this test"
     save_pool(Pool(profiles=[], settings=Settings(**non_default)))

@@ -4,6 +4,7 @@ These lock in which schtasks commands get run; they do not exercise a real
 Task Scheduler. See windows_taskscheduler.py's module docstring.
 """
 
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -182,3 +183,38 @@ def test_console_programs_are_launched_without_a_window():
 
     assert "creationflags" in seen
     assert seen["creationflags"] == backend._NO_WINDOW
+
+
+def _uninstall_with(responses):
+    """Runs uninstall() with stop() a no-op and `_run` answering each schtasks
+    verb from `responses`; returns the verbs that ran."""
+    ran = []
+
+    def fake_run(*args):
+        verb = args[1]
+        ran.append(verb)
+        return responses[verb].pop(0) if isinstance(responses[verb], list) else responses[verb]
+
+    with patch.object(backend, "stop", lambda: None), \
+         patch.object(backend, "_run", side_effect=fake_run):
+        backend.uninstall()
+    return ran
+
+
+def test_uninstall_when_not_registered_is_silent_and_deletes_nothing():
+    assert _uninstall_with({"/query": _ok(returncode=1)}) == ["/query"]
+
+
+def test_uninstall_deletes_a_registered_task():
+    ran = _uninstall_with({"/query": _ok(returncode=0), "/delete": _ok(returncode=0)})
+    assert ran == ["/query", "/delete"]
+
+
+def test_a_refused_delete_is_reported_not_swallowed():
+    # Issue #11: a task registered elevated refuses a non-elevated /delete,
+    # and purge used to print "deregistered" while it kept running at logon.
+    denied = subprocess.CompletedProcess([], 1, stdout="", stderr="ERROR: Access is denied.")
+    with pytest.raises(backend.DaemonInstallerError) as err:
+        _uninstall_with({"/query": _ok(returncode=0), "/delete": denied})
+    assert "Access is denied" in str(err.value)
+    assert f"schtasks /delete /tn {backend.TASK_NAME} /f" in str(err.value)

@@ -19,11 +19,11 @@ def test_codex_pinned_session_relabels_the_model_picker(monkeypatch):
     # The id must stay Anthropic-shaped: openai_models.map_model is keyed on it,
     # AND must equal Claude Code's native tier default so our override REPLACES
     # the native picker entry rather than adding a duplicate beside it.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5-5"
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
-    assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-4-5"
+    assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-5-5"
     # ...while the visible label names BOTH the Claude tier and the backing GPT.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5.5 | GPT-6.1 Terra"
     desc = os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"]
     assert "Codex" in desc and "high" in desc, desc
 
@@ -81,7 +81,7 @@ def test_rotated_mixed_pool_uses_provider_neutral_labels(monkeypatch):
 
     # Names BOTH the Claude tier and the GPT model it maps to: accurate whoever
     # serves, and still says what is being picked.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5.5 | GPT-6.1 Terra"
     labels = [os.environ[f"ANTHROPIC_DEFAULT_{t}_MODEL_NAME"] for t in ("FABLE", "OPUS", "SONNET", "HAIKU")]
     assert len(set(labels)) == len(labels), labels  # every entry distinguishable
     assert all("GPT" in l for l in labels), labels  # both providers named
@@ -89,7 +89,7 @@ def test_rotated_mixed_pool_uses_provider_neutral_labels(monkeypatch):
     for tier, level in (("FABLE", "high"), ("OPUS", "high"), ("SONNET", "medium"), ("HAIKU", "low")):
         assert level in os.environ[f"ANTHROPIC_DEFAULT_{tier}_MODEL_DESCRIPTION"]
     # ...and the id still has to be one map_model() understands.
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5-5"
 
 
 def test_codex_labels_come_from_the_live_parity_map_when_reachable(monkeypatch):
@@ -104,17 +104,17 @@ def test_codex_labels_come_from_the_live_parity_map_when_reachable(monkeypatch):
 
     # Stand in for the daemon's parity listing.
     monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **k: {
-        "claude-fable-5-1": ("Fable 5.1 | GPT-6 Astra", "high"),
+        "claude-fable-5-1": ("Fable 5.1 | GPT-6.1 Sol", "high"),
         "claude-opus-5": ("Opus 5 | GPT-6 Astra", "high"),
-        "claude-sonnet-5": ("Sonnet 5 | GPT-5.6 Terra", "medium"),
-        "claude-haiku-4-5": ("Haiku 4.5 | GPT-5.6 Luna", "low"),
+        "claude-sonnet-5": ("Sonnet 5.5 | GPT-6.1 Terra", "medium"),
+        "claude-haiku-4-5": ("Haiku 5.5 | GPT-6 Luna", "low"),
     })
     cli._apply_model_labels(
         Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
         [], host="127.0.0.1", port=4317, token="tok")
 
-    # Live value, not the module literal (which says GPT-5.6 Terra for FABLE).
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
+    # Live value, not the module literal (which says GPT-6.1 Terra for FABLE).
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6.1 Sol"
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
     desc = os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"]
     assert "Served by Codex" in desc and "high" in desc, desc
@@ -132,7 +132,7 @@ def test_parity_label_fetch_failure_falls_back_to_the_literals(monkeypatch):
     cli._apply_model_labels(
         Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
         [], host="127.0.0.1", port=4317, token="tok")
-    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5 | GPT-5.6 Terra"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5.5 | GPT-6.1 Terra"
 
 
 def test_rotated_all_claude_pool_keeps_native_labels(monkeypatch):
@@ -261,8 +261,8 @@ def test_codex_picker_reflects_saved_list_and_unsets_removed_tiers(monkeypatch):
     import os
     _clear(monkeypatch)
     monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **k: {
-        "claude-fable-5-1-20260101": ("Fable 5.1 | GPT-6 Astra", "high"),  # dated id
-        "claude-opus-5": ("Opus 5 | GPT-5.6 Terra", "high"),
+        "claude-fable-5-1-20260101": ("Fable 5.1 | GPT-6.1 Sol", "high"),  # dated id
+        "claude-opus-5": ("Opus 5 | GPT-6.1 Terra", "high"),
     })
     cli._apply_model_labels(
         Profile(id="c", name="Codex", kind="codex", priority=1, automatic=True, enabled=True),
@@ -270,8 +270,99 @@ def test_codex_picker_reflects_saved_list_and_unsets_removed_tiers(monkeypatch):
 
     # Fable labelled via family match; the tier id stays the native default.
     assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
-    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6 Astra"
-    assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "Opus 5 | GPT-5.6 Terra"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6.1 Sol"
+    # The older opus-5 row labels the opus-5-5 slot, re-led with the id it sends.
+    assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "Opus 5.5 | GPT-6.1 Terra"
     # Sonnet and Haiku are not in the saved list -> left unset.
     assert "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" not in os.environ
     assert "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME" not in os.environ
+
+
+def _fable_catalogue(*fable_ids):
+    from claude_unlimited.model_catalogue import Catalogue, ModelInfo
+    models = tuple(ModelInfo(id=mid, display_name=mid, supports_reasoning=True,
+                             input_cost=None, output_cost=None, rank=i)
+                   for i, mid in enumerate(fable_ids + ("claude-sonnet-5", "claude-haiku-4-5")))
+    return Catalogue(anthropic=models, openai=())
+
+
+def _fable_picker(monkeypatch, catalogue):
+    from claude_unlimited import cli, model_catalogue
+    import os
+    _clear(monkeypatch)
+    monkeypatch.setattr(model_catalogue, "current", lambda: catalogue)
+    cli._apply_model_labels(_p("codex", "c"), [])
+    return {k: v for k, v in os.environ.items() if k.startswith("ANTHROPIC_DEFAULT_")}
+
+
+def test_fable_tier_stays_5_1_when_catalogue_only_has_5_1(monkeypatch):
+    env = _fable_picker(monkeypatch, _fable_catalogue("claude-fable-5-1", "claude-fable-5"))
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6.1 Sol"
+
+
+def test_fable_tier_follows_5_5_in_the_catalogue_as_one_entry(monkeypatch):
+    env = _fable_picker(monkeypatch, _fable_catalogue("claude-fable-5-5", "claude-fable-5-1"))
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-5"
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.5 | GPT-6.1 Sol"
+    # One Fable slot only, and the other tiers keep their native defaults.
+    assert [v for k, v in env.items() if k.endswith("_MODEL") and "fable" in v] == ["claude-fable-5-5"]
+    assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5-5"
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-5-5"
+
+
+def test_fable_tier_falls_back_to_5_1_without_a_catalogue(monkeypatch):
+    from claude_unlimited import model_catalogue
+    monkeypatch.setattr(model_catalogue, "_load_offline", lambda: None)
+    env = _fable_picker(monkeypatch, None)
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
+
+
+def test_fable_label_releads_when_slot_is_newer_than_saved_row(monkeypatch):
+    """A saved parity row for Fable 5.1 with a catalogue whose newest Fable is
+    5.5: the slot claims claude-fable-5-5, and its name must lead with 5.5."""
+    from claude_unlimited import cli, model_catalogue
+    import os
+    _clear(monkeypatch)
+    monkeypatch.setattr(model_catalogue, "current",
+                        lambda: _fable_catalogue("claude-fable-5-5", "claude-fable-5-1"))
+    monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **k: {
+        "claude-fable-5-1": ("Fable 5.1 | GPT-6.1 Sol", "high"),
+    })
+    cli._apply_model_labels(_p("codex", "c"), [], host="h", port=1, token="t")
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-5"
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.5 | GPT-6.1 Sol"
+
+
+def test_sonnet_and_haiku_labels_relead_when_saved_rows_are_older(monkeypatch):
+    """Parity rows seeded from an older catalogue (claude-sonnet-5,
+    claude-haiku-4-5) must not label the 5.5 ids the picker actually sends."""
+    from claude_unlimited import cli, model_catalogue
+    import os
+    _clear(monkeypatch)
+    monkeypatch.setattr(model_catalogue, "current",
+                        lambda: _fable_catalogue("claude-fable-5-1"))
+    monkeypatch.setattr(cli, "_fetch_parity_labels", lambda *a, **k: {
+        "claude-fable-5-1": ("Fable 5.1 | GPT-6.1 Sol", "high"),
+        "claude-sonnet-5": ("Sonnet 5 | GPT-6.1 Terra", "medium"),
+        "claude-haiku-4-5-20251001": ("Haiku 4.5 | GPT-6 Luna", "low"),
+    })
+    cli._apply_model_labels(_p("codex", "c"), [], host="h", port=1, token="t")
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5-5"
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "Sonnet 5.5 | GPT-6.1 Terra"
+    assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-5-5"
+    assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"] == "Haiku 5.5 | GPT-6 Luna"
+    # Fable's own row matches its slot exactly: untouched.
+    assert os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "Fable 5.1 | GPT-6.1 Sol"
+
+
+def test_tier_label_kept_when_a_saved_row_is_newer_than_the_slot():
+    from claude_unlimited import cli
+    live = {"claude-sonnet-6": ("Sonnet 6 | X", "medium")}
+    assert cli._relead_newer_tier(live, "claude-sonnet-5-5", "claude-sonnet", "Sonnet 6 | X") == "Sonnet 6 | X"
+
+
+def test_newest_fable_id_ranks_two_digit_minor_above_single_digit():
+    from claude_unlimited import cli
+    cat = _fable_catalogue("claude-fable-5-1", "claude-fable-5-9", "claude-fable-5-10", "claude-fable-5-5")
+    assert cli._newest_fable_id(cat) == "claude-fable-5-10"

@@ -152,6 +152,11 @@ def doctor() -> int:
         ok = False
 
     print("Live proxy: ready — rotation, credential substitution, and usage tracking active.")
+    # Optional (issue #7): only worth a line when someone could use it.
+    if pool.settings.codex_cli_serving or shutil.which("codex"):
+        state = "on" if pool.settings.codex_cli_serving else "off (Settings → Routing → Codex CLI)"
+        found = "codex found on PATH" if shutil.which("codex") else "codex NOT found on PATH"
+        print(f"Codex CLI serving: {state} — {found}")
 
     if hud_installer.is_supported():
         # Also the least surprising place to repair it: someone running
@@ -370,15 +375,50 @@ def _prompt_profile_choice(profiles: list):
 # of replacing it (v2.1.263 showed both a relabelled Fable and a native "Fable
 # 5.1"). Read out of the binary's model table (2.1.280, where the opus tier
 # moved from claude-opus-5 to claude-opus-5-5): fable->claude-fable-5-1,
-# opus->claude-opus-5-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5. This
+# opus->claude-opus-5-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5; the Sonnet/Haiku tiers
+# now claim Sonnet 5.5 / Haiku 5.5 per owner decision). This
 # is upstream-coupled — see the "Claude Code upstream watch" note; a Claude
 # Code release that moves a tier default can reintroduce the duplicate.
 _MODEL_TIER_IDS = {
     "FABLE": "claude-fable-5-1",
     "OPUS": "claude-opus-5-5",
-    "SONNET": "claude-sonnet-5",
-    "HAIKU": "claude-haiku-4-5",
+    "SONNET": "claude-sonnet-5-5",
+    "HAIKU": "claude-haiku-5-5",
 }
+
+_FABLE_FALLBACK_ID = _MODEL_TIER_IDS["FABLE"]
+
+
+def _newest_fable_id(catalogue=None) -> str:
+    """The Fable tier id the picker should claim: the newest Fable in the model
+    catalogue (live if loaded, else the offline cache / vendored snapshot),
+    never older than _FABLE_FALLBACK_ID. Claude Code moves its native Fable
+    default to each new point release, and claiming a stale id would add a
+    SECOND Fable entry beside the native one — the same duplicate described
+    above. Sonnet/Haiku stay pinned to the ids in _MODEL_TIER_IDS (Sonnet 5.5 /
+    Haiku 5.5; see openai_models._MODEL_MAP). Never raises."""
+    from . import model_catalogue
+    try:
+        cat = catalogue or model_catalogue.current() or model_catalogue._load_offline()
+        ids = [m.id for m in (cat.anthropic if cat else ())
+               if model_catalogue.base_id(m.id).lower().startswith("claude-fable-")]
+    except Exception:
+        ids = []
+    best = _FABLE_FALLBACK_ID
+    for mid in ids:
+        mid = model_catalogue.base_id(mid)
+        if model_catalogue._version_of(mid) > model_catalogue._version_of(best):
+            best = mid
+    return best
+
+
+def _fable_label(fable_id: str, label: str) -> str:
+    """Swap the tier lead of a label (e.g. "Fable 5.1") for fable_id's own
+    display name; used for every tier, not only Fable."""
+    from .model_catalogue import display_name_for
+    name = display_name_for(fable_id).removeprefix("Claude ")
+    return name + label[label.index(" |"):] if " |" in label else name
+
 
 # Each tier's family prefix — a saved parity row is matched to a tier by family
 # (not exact id), so a row saved with a dated or point-release id still labels
@@ -407,6 +447,21 @@ def _tier_live_label(live: dict, tier_id: str, family: str):
             return value
     return None
 
+
+def _relead_newer_tier(live: dict, tier_id: str, family: str, name: str) -> str:
+    """When a tier slot claims a newer id than any saved parity row of its
+    family (the row matched by family prefix only), lead the label with the
+    slot's own display name, so the picker never says "Fable 5.1" beside
+    claude-fable-5-5, or "Sonnet 5" beside claude-sonnet-5-5."""
+    from .model_catalogue import _version_of, base_id
+    base = base_id(tier_id)
+    rows = [base_id(k) for k in live if base_id(k).lower().startswith(family)]
+    if base in rows or not rows:
+        return name
+    if all(_version_of(base) > _version_of(r) for r in rows):
+        return _fable_label(tier_id, name)
+    return name
+
 # OFFLINE FALLBACK ONLY. The live labels are derived per launch from the
 # daemon's own parity map (_fetch_parity_labels -> GET /v1/models), so they
 # always name the model that will really serve and never go stale. These
@@ -417,10 +472,10 @@ def _tier_live_label(live: dict, tier_id: str, family: str):
 # Pinned to a codex Profile: every request this session makes is served by
 # OpenAI, so name the real backing model outright.
 _CODEX_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Served by Codex · reasoning: high"),
-    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "Served by Codex · reasoning: high"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Served by Codex · reasoning: medium"),
-    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Served by Codex · reasoning: low"),
+    "FABLE": ("Fable 5.1 | GPT-6.1 Sol", "Served by Codex · reasoning: high"),
+    "OPUS": ("Opus 5.5 | GPT-6.1 Terra", "Served by Codex · reasoning: high"),
+    "SONNET": ("Sonnet 5.5 | GPT-6.1 Terra", "Served by Codex · reasoning: medium"),
+    "HAIKU": ("Haiku 5.5 | GPT-6 Luna", "Served by Codex · reasoning: low"),
 }
 
 # Rotated across a pool that mixes providers: which provider serves a given
@@ -429,10 +484,10 @@ _CODEX_MODEL_LABELS = {
 # to stays accurate whichever one serves, and still says what is being
 # picked; a provider-neutral tier word would name no model at all.
 _MIXED_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6 Astra", "Whichever account is active · Codex reasoning: high"),
-    "OPUS": ("Opus 5.5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: high"),
-    "SONNET": ("Sonnet 5 | GPT-5.6 Terra", "Whichever account is active · Codex reasoning: medium"),
-    "HAIKU": ("Haiku 4.5 | GPT-5.6 Luna", "Whichever account is active · Codex reasoning: low"),
+    "FABLE": ("Fable 5.1 | GPT-6.1 Sol", "Whichever account is active · Codex reasoning: high"),
+    "OPUS": ("Opus 5.5 | GPT-6.1 Terra", "Whichever account is active · Codex reasoning: high"),
+    "SONNET": ("Sonnet 5.5 | GPT-6.1 Terra", "Whichever account is active · Codex reasoning: medium"),
+    "HAIKU": ("Haiku 5.5 | GPT-6 Luna", "Whichever account is active · Codex reasoning: low"),
 }
 
 
@@ -506,11 +561,16 @@ def _apply_model_labels(forced_profile, enabled_profiles=None,
         return
 
     live = _fetch_parity_labels(host, port, token) if (host and port and token) else {}
+    fable_id = _newest_fable_id()
     for tier, (fallback_name, fallback_desc) in labels.items():
         tier_id = _MODEL_TIER_IDS[tier]
+        if tier == "FABLE":
+            tier_id = fable_id
+            fallback_name = _fable_label(fable_id, fallback_name)
         match = _tier_live_label(live, tier_id, _MODEL_TIER_FAMILY[tier]) if live else None
         if match is not None:
             name, effort = match
+            name = _relead_newer_tier(live, tier_id, _MODEL_TIER_FAMILY[tier], name)
             lead = "Served by Codex" if codex_pinned else "Whichever account is active · Codex"
             description = f"{lead} · reasoning: {effort}" if effort else lead
         elif live:
@@ -846,6 +906,14 @@ def purge(port: int = DEFAULT_PORT, assume_yes: bool = False) -> int:
         if link.exists() or link.is_symlink():
             link.unlink(missing_ok=True)
             print(f"Removed: {link}")
+
+    # Installed with pip rather than install.sh: the package lives in that
+    # Python's site-packages, which none of the paths above cover.
+    package_dir = Path(__file__).resolve().parent
+    if install_root.resolve() not in package_dir.parents:
+        print()
+        print("The package itself was installed with pip. To remove it too, run:")
+        print(f"  {shlex.quote(sys.executable)} -m pip uninstall claude-unlimited")
 
     print()
     print("Claude Unlimited is gone. ~/.claude was left untouched.")
@@ -1608,6 +1676,71 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
     return 0  # unreachable: execvp replaces this process on success
 
 
+def codex(port: int, codex_args: list[str], profile_arg: Optional[str] = None) -> int:
+    """Launch the real `codex` CLI served from the pool's ChatGPT accounts
+    (issue #7). The provider override is per invocation — see
+    codex_cli.launch_overrides — so the user's own ~/.codex and their plain
+    `codex` login are never touched."""
+    from . import codex_cli
+
+    _banner()
+    if not shutil.which("codex"):
+        print("The Codex CLI (`codex`) was not found on PATH. Install it first "
+              "(npm install -g @openai/codex, or brew install codex).", file=sys.stderr)
+        return 1
+    try:
+        pool = load_pool()
+    except Exception as exc:
+        print(f"Could not read the configuration: {exc}", file=sys.stderr)
+        return 1
+    if not pool.settings.codex_cli_serving:
+        print("Serving the codex CLI is turned off. Turn it on in the Dashboard under "
+              "Settings → Routing → Codex CLI — read the note there about OpenAI's terms first.",
+              file=sys.stderr)
+        return 1
+    candidates = [p for p in pool.enabled_profiles()
+                  if p.kind == "codex" and p.auth_mode == "chatgpt_subscription"]
+    if not candidates:
+        print("No enabled ChatGPT-subscription account in the pool. Add one with "
+              "`claude-unlimited add-codex-account`, or enable one in the Dashboard.", file=sys.stderr)
+        return 1
+
+    if not _ensure_daemon(port):
+        return 1
+
+    forced_profile = None
+    if profile_arg:
+        forced_profile = _match_profile(candidates, profile_arg)
+        if forced_profile is None:
+            print(f"No enabled ChatGPT account matches --profile {profile_arg!r}.", file=sys.stderr)
+            print("Available: " + ", ".join(p.name for p in candidates), file=sys.stderr)
+            return 1
+    elif len(candidates) > 1 and sys.stdin.isatty():
+        try:
+            forced_profile = _prompt_profile_choice(candidates)
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.", file=sys.stderr)
+            return 1
+
+    try:
+        token = (_fetch_session_token(LOOPBACK_HOST, port, forced_profile.id) if forced_profile is not None
+                 else _fetch_placeholder_token(LOOPBACK_HOST, port))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError) as exc:
+        print(f"Could not fetch the local credential from the daemon: {exc}", file=sys.stderr)
+        return 1
+
+    os.environ[codex_cli.TOKEN_ENV] = token
+    where = f"pinned to {forced_profile.name}" if forced_profile is not None else "rotating ChatGPT accounts"
+    print(f"Routing codex through Claude Unlimited at {LOOPBACK_HOST}:{port}, {where} — launching codex…\n")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    argv = ["codex", *codex_cli.launch_overrides(port), *codex_args]
+    if os.name == "nt":
+        return _run_tool(argv).returncode  # see code(): no real exec on Windows
+    os.execvp(_resolve_launcher("codex"), argv)
+    return 0  # unreachable: execvp replaces this process on success
+
+
 def install(port: int) -> int:
     _banner()
 
@@ -1761,6 +1894,7 @@ def add_account() -> int:
     login_proc = _run_tool(["claude", "auth", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`claude auth login` did not complete successfully.", file=sys.stderr)
+        _discard_login_dir(config_dir, claude=True)
         return 1
 
     print("\nResolving the newly logged-in account...")
@@ -1769,6 +1903,7 @@ def add_account() -> int:
         account = anthropic_oauth.fetch_account_profile(imported.access_token)
     except (anthropic_oauth.CredentialImportError, anthropic_oauth.ProfileLookupError) as exc:
         print(f"Logged in, but could not read/resolve the new account: {exc}", file=sys.stderr)
+        _discard_login_dir(config_dir, claude=True)
         return 1
 
     name = account.email or "Imported Claude account"
@@ -1781,7 +1916,10 @@ def add_account() -> int:
         )
     except (profile_repo.ValidationError, profile_repo.ProfileRepositoryError) as exc:
         print(f"Logged in, but could not save the profile: {exc}", file=sys.stderr)
+        _discard_login_dir(config_dir, claude=True)
         return 1
+
+    _drop_plaintext_login(config_dir, ".credentials.json")
 
     if not reused:
         # So the Dashboard shows real usage for it straight away, rather than
@@ -1791,7 +1929,7 @@ def add_account() -> int:
     print(f"\n{'Refreshed existing profile' if reused else 'Added profile'}: {profile.name}")
     if account.org_name:
         print(f"  Organization: {account.org_name}")
-    tier = "Max" if account.has_claude_max else "Pro" if account.has_claude_pro else "unknown tier"
+    tier = {"ultra": "Ultra", "max": "Max", "pro": "Pro"}.get(anthropic_oauth.plan_from_account(account), "unknown tier")
     print(f"  Plan: {tier}")
     print("\nManage priority, threshold, and everything else for it from the Dashboard.")
     return 0
@@ -1808,9 +1946,9 @@ def add_codex_account() -> int:
     After that one interactive step the daemon never shells out to `codex`
     again for this Profile: requests and token refreshes go through
     openai_bridge.py's direct HTTPS calls. The isolated CODEX_HOME only
-    holds the auth.json this function reads once and re-encodes into
-    secret_store via openai_credential.py, rather than leaving the
-    credential in the plaintext file `codex login` writes."""
+    holds the auth.json this function reads once, re-encodes into
+    secret_store via openai_credential.py, and then deletes, rather than
+    leaving the credential in the plaintext file `codex login` writes."""
     _banner()
     if not shutil.which("codex"):
         print("Codex CLI (`codex`) was not found on PATH — this command drives it directly for the "
@@ -1832,6 +1970,7 @@ def add_codex_account() -> int:
     login_proc = _run_tool(["codex", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`codex login` did not complete successfully.", file=sys.stderr)
+        _discard_login_dir(config_dir)
         return 1
 
     print("\nResolving the newly logged-in account...")
@@ -1847,6 +1986,7 @@ def add_codex_account() -> int:
         id_token = tokens.get("id_token")
     except (OSError, json.JSONDecodeError, KeyError) as exc:
         print(f"Logged in, but could not read the new account's credentials: {exc}", file=sys.stderr)
+        _discard_login_dir(config_dir)
         return 1
 
     name = (openai_credential.chatgpt_email(id_token) if id_token else None) or "ChatGPT/Codex account"
@@ -1861,7 +2001,10 @@ def add_codex_account() -> int:
         )
     except (profile_repo.ValidationError, profile_repo.ProfileRepositoryError) as exc:
         print(f"Logged in, but could not save the profile: {exc}", file=sys.stderr)
+        _discard_login_dir(config_dir)
         return 1
+
+    _drop_plaintext_login(config_dir, "auth.json")
 
     if not reused:
         _prime_via_daemon(profile.id)
@@ -1871,6 +2014,36 @@ def add_codex_account() -> int:
         print(f"  Plan: {plan}")
     print("\nManage priority, threshold, and everything else for it from the Dashboard.")
     return 0
+
+
+def _drop_plaintext_login(config_dir: Path, filename: str) -> None:
+    """Deletes the plaintext token file a login tool wrote, once its contents
+    are in the OS keystore.
+
+    `codex login` writes auth.json and `claude auth login` writes
+    .credentials.json off macOS. Nothing reads either again — requests and
+    refreshes use the keystore copy — so keeping them only leaves a live
+    refresh token on disk. The directory itself stays: reauth logs in there
+    again. Best-effort: the account is already saved."""
+    try:
+        (config_dir / filename).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _discard_login_dir(config_dir: Path, *, claude: bool = False) -> None:
+    """Removes a login directory this run created when the add did not finish.
+
+    A cancelled or failed login can still have written a LIVE token into it
+    (`auth.json`, `.credentials.json` or a directory-derived Keychain entry),
+    and no Profile will ever point at it. Best-effort: the add already failed,
+    and tidying up must not replace that message with another."""
+    shutil.rmtree(config_dir, ignore_errors=True)
+    if claude:
+        try:
+            anthropic_oauth.remove_isolated_logins([str(config_dir)])
+        except Exception:  # noqa: BLE001 - cleanup never masks the real failure
+            pass
 
 
 def _prime_via_daemon(profile_id: str, port: int = DEFAULT_PORT, timeout: float = 25.0) -> None:
@@ -1972,6 +2145,7 @@ def reauth(port: int) -> int:
     # A Profile added by manual paste or "Import current login" has no
     # isolated dir of its own, so give it a fresh one the way add-account
     # does for a new Profile.
+    fresh_dir = not target.claude_config_dir
     config_dir = (Path(target.claude_config_dir) if target.claude_config_dir
                   else CLAUDE_ACCOUNTS_DIR / secrets.token_hex(8))
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -1984,6 +2158,8 @@ def reauth(port: int) -> int:
     login_proc = _run_tool(["claude", "auth", "login"], env=login_env)
     if login_proc.returncode != 0:
         print("\n`claude auth login` did not complete successfully.", file=sys.stderr)
+        if fresh_dir:
+            _discard_login_dir(config_dir, claude=True)
         return 1
 
     print("\nResolving the account...")
@@ -1992,6 +2168,8 @@ def reauth(port: int) -> int:
         account = anthropic_oauth.fetch_account_profile(imported.access_token)
     except (anthropic_oauth.CredentialImportError, anthropic_oauth.ProfileLookupError) as exc:
         print(f"Logged in, but could not read/resolve the account: {exc}", file=sys.stderr)
+        if fresh_dir:
+            _discard_login_dir(config_dir, claude=True)
         return 1
 
     if target.account_uuid and account.account_uuid != target.account_uuid:
@@ -2001,6 +2179,8 @@ def reauth(port: int) -> int:
             "this as a new Profile.",
             file=sys.stderr,
         )
+        if fresh_dir:
+            _discard_login_dir(config_dir, claude=True)
         return 1
 
     try:
@@ -2012,8 +2192,11 @@ def reauth(port: int) -> int:
         )
     except (profile_repo.ValidationError, profile_repo.ProfileRepositoryError) as exc:
         print(f"Logged in, but could not save the profile: {exc}", file=sys.stderr)
+        if fresh_dir:
+            _discard_login_dir(config_dir, claude=True)
         return 1
 
+    _drop_plaintext_login(config_dir, ".credentials.json")
     print(f"\n{profile.name} is re-authenticated — the daemon will pick it back up automatically.")
     return 0
 
@@ -2055,6 +2238,12 @@ def main(argv=None) -> int:
     # `claude-unlimited code --model opus`, where argparse matches --model
     # against code_p's options first). parse_known_args() below is what
     # lets unrecognized arguments fall through to `claude` untouched.
+    codex_p = sub.add_parser("codex", help="launch the `codex` CLI served from the pool's ChatGPT accounts "
+                                          "(turn it on in Settings first)")
+    codex_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    codex_p.add_argument("--profile", metavar="NAME_OR_ID", default=None,
+                         help="pin this codex session to one ChatGPT account by name or id")
+    # Like `code`: unrecognised arguments go to codex untouched (parse_known_args).
     install_p = sub.add_parser("install", help="register the daemon to start automatically on login")
     install_p.add_argument("--port", type=int, default=DEFAULT_PORT)
     sub.add_parser("uninstall", help="stop the daemon from starting automatically on login")
@@ -2086,6 +2275,8 @@ def main(argv=None) -> int:
         return reauth(args.port)
     if args.cmd == "code":
         return code(args.port, unknown, profile_arg=args.profile, distribute=args.distribute)
+    if args.cmd == "codex":
+        return codex(args.port, unknown, profile_arg=args.profile)
     if args.cmd == "desktop":
         return desktop_revert() if args.revert else desktop(args.port)
     if args.cmd == "install":

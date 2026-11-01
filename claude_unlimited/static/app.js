@@ -1317,6 +1317,14 @@ function planBadge(p) {
     return `<span class="plan-badge api">${API_ICON}<span>${esc(t('profiles.kind_api_badge'))}</span></span>`;
   }
   // Same icon and position as the codex/api badges above, for parity.
+  // "ultra" is Anthropic's top tier (formerly "Max 20x"); it shares Max's
+  // badge styling. Detected by anthropic_oauth.plan_from_account, which
+  // falls back to Ultra when the profile says neither Max nor Pro.
+  if (p.plan === 'ultra') {
+    return `<span class="plan-badge max" title="${esc(t('profiles.kind_oauth_ultra'))}">
+      <span class="spark"></span><span class="spark"></span><span class="spark"></span>
+      ${OAUTH_ICON}<span>${esc(t('profiles.plan_badge_ultra'))}</span></span>`;
+  }
   if (p.plan === 'max') {
     return `<span class="plan-badge max" title="${esc(t('profiles.kind_oauth_max'))}">
       <span class="spark"></span><span class="spark"></span><span class="spark"></span>
@@ -3089,6 +3097,7 @@ async function loadSettings() {
     setToggleState(document.getElementById('distributeDefaultToggle'), settings.distribute_sessions_default);
     setToggleState(document.getElementById('usageFreshToggle'), settings.keep_usage_fresh);
     setToggleState(document.getElementById('codexSpendCreditsToggle'), settings.codex_spend_credits);
+    setToggleState(document.getElementById('codexCliToggle'), settings.codex_cli_serving);
     setToggleState(document.getElementById('returnPreferredToggle'), settings.return_to_preferred);
     setToggleState(document.getElementById('fableLimitAllToggle'), settings.fable_limit_all_profiles);
     refreshCodexCreditsVisibility();
@@ -3235,6 +3244,12 @@ async function refreshCodexCreditsVisibility(opts = {}) {
     }
   }
   section.style.display = profiles.some((p) => p.kind === 'codex') ? '' : 'none';
+  // Only a ChatGPT-subscription account can serve the codex CLI.
+  const cliSection = document.getElementById('codexCliSection');
+  if (cliSection) {
+    cliSection.style.display = profiles.some(
+      (p) => p.kind === 'codex' && p.auth_mode === 'chatgpt_subscription') ? '' : 'none';
+  }
 }
 
 // What a session launched right now would actually get, and why. The decision
@@ -3285,6 +3300,11 @@ async function toggleFableLimitAll() {
 async function toggleReturnPreferred() {
   const el = document.getElementById('returnPreferredToggle');
   await patchSettingToggle(el, 'return_to_preferred', el.classList.contains('off'));
+}
+
+async function toggleCodexCli() {
+  const el = document.getElementById('codexCliToggle');
+  await patchSettingToggle(el, 'codex_cli_serving', el.classList.contains('off'));
 }
 
 async function toggleCodexSpendCredits() {
@@ -4220,6 +4240,7 @@ document.getElementById('settingsRetryBtn').addEventListener('click', () => load
 document.getElementById('returnPreferredToggle').addEventListener('click', toggleReturnPreferred);
 document.getElementById('fableLimitAllToggle').addEventListener('click', toggleFableLimitAll);
 document.getElementById('codexSpendCreditsToggle').addEventListener('click', toggleCodexSpendCredits);
+document.getElementById('codexCliToggle').addEventListener('click', toggleCodexCli);
 document.getElementById('autostartToggle').addEventListener('click', toggleAutostart);
 document.getElementById('regenTokenBtn').addEventListener('click', regeneratePlaceholderToken);
 document.getElementById('killProcessBtn').addEventListener('click', killProcess);

@@ -272,7 +272,7 @@
                        color: var(--text-faint); background: var(--bg-panel-alt); padding: 2px 7px; border-radius: 5px; margin-left: auto; }
   .mono-num { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 
-  /* Plan badge — Pro/Max/API, styled distinctly per tier. */
+  /* Plan badge — Pro/Max/Ultra/API (Ultra shares Max's style), styled distinctly per tier. */
   .plan-badge { display: inline-flex; align-items: center; gap: 3px; font-size: var(--fs-micro); font-weight: 700;
                 text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 7px 2px 6px; border-radius: 5px;
                 white-space: nowrap; position: relative; overflow: hidden; }
@@ -767,7 +767,7 @@
   .toast.leaving { animation: slide-out-right 220ms ease-in both; overflow: hidden; }
   .toast-icon { width: 30px; height: 30px; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .toast-icon svg { width: 15px; height: 15px; }
-  .toast-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .toast-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
   .toast-title { font-size: var(--fs-body); font-weight: 700; }
   .toast-sub { font-size: var(--fs-micro); color: var(--text-faint); line-height: 1.4; }
 
@@ -879,7 +879,7 @@
      clicks stay unchanged. */
   :focus-visible { outline: 2px solid var(--accent, #7C6CFF); outline-offset: 2px; border-radius: 6px; }
   .rail-item:focus-visible, .toggle:focus-visible { outline-offset: 3px; }
-  .toast-close { margin-left: 6px; align-self: flex-start; background: none; border: 0; padding: 4px;
+  .toast-close { margin: -6px -8px 0 auto; align-self: flex-start; flex-shrink: 0; background: none; border: 0; padding: 4px;
                   border-radius: 6px; color: var(--text-faint); cursor: pointer; display: flex;
                   min-width: 24px; min-height: 24px; align-items: center; justify-content: center; }
   .toast-close svg { width: 13px; height: 13px; }
@@ -1532,7 +1532,7 @@
         </div>
         <div class="context1m-verdict" id="context1mVerdict"></div>
         <div class="routing-explainer">
-          <div data-i18n="settings.context1m.explainer">Several Claude models hold a million tokens — Sonnet 5, Opus 4.7, 4.8 and 5, Fable 5 and 5.1, Mythos 5 and 5.1. Claude Code only uses that window when it is talking straight to Anthropic; pointed at any other address, including this daemon on your own machine, it falls back to 200K because it cannot tell what is on the other end. For a Claude or Anthropic-API account that caution is unnecessary: the daemon relays to Anthropic with your own credential, so the million really is there. A ChatGPT/Codex account in the same pool is a GPT model with a ~272K window of its own — so the daemon sizes every turn before routing it, sends a ChatGPT account only what fits, and gives longer turns to a Claude account. Auto says so whenever a Claude account can take the session.</div>
+          <div data-i18n="settings.context1m.explainer">Several Claude models hold a million tokens — Sonnet 5 and 5.5, Haiku 5.5, Opus 4.7, 4.8, 5 and 5.5, Fable 5 and 5.1, Mythos 5 and 5.1. Claude Code only uses that window when it is talking straight to Anthropic; pointed at any other address, including this daemon on your own machine, it falls back to 200K because it cannot tell what is on the other end. For a Claude or Anthropic-API account that caution is unnecessary: the daemon relays to Anthropic with your own credential, so the million really is there. A ChatGPT/Codex account in the same pool is a GPT model with a ~272K window of its own — so the daemon sizes every turn before routing it, sends a ChatGPT account only what fits, and gives longer turns to a Claude account. Auto says so whenever a Claude account can take the session.</div>
           <div class="routing-when" data-i18n="settings.context1m.limits">Auto stays quiet whenever it cannot be sure: a pool with only ChatGPT/Codex accounts (nothing there holds more than ~272K, so 1M would only mean compacting sooner), an API profile pointing somewhere other than Anthropic, or a Claude Code version this build has not checked. Force 1M overrides all three. Your own CLAUDE_CODE_DISABLE_1M_CONTEXT always wins, and a bigger window does not mean a bigger quota — the same conversation just compacts far less often. The one visible sign of the guard in a mixed pool is a compaction that comes earlier than it would on Claude accounts alone, when nothing but a ChatGPT account is left to take a long turn.</div>
           <div class="routing-note" data-i18n="settings.context1m.force_desc">Force 1M sets the window on every session whatever the route — a ChatGPT/Codex-only pool, a pinned ChatGPT account, an API profile pointing elsewhere, even a Claude Code version this build has not checked. The capacity guard stays on: a ChatGPT/Codex account still takes only turns that fit its ~272K, and a turn nothing can hold gets a prompt-too-long so Claude Code compacts. It cannot enlarge a model that is not natively 1M (Sonnet 4.6 and Haiku 4.5 stay at 200K — only the eight native-1M Claude models change), and a backend you pointed it at may reject what the client now sends.</div>
         </div>
@@ -1554,6 +1554,28 @@
         </div>
         <div class="routing-explainer">
           <div data-i18n="settings.credits.explainer">When a ChatGPT account runs out of its plan window, Claude Unlimited rotates away from it and comes back when the window resets. If you have bought credits on that account, they can carry it through instead — but every request then costs real money, so this stays off until you turn it on. While it is on, an account running on credits is marked as such on its card, in the table and in the HUD, with the balance beside it. Accounts with no credits are unaffected, and so is every Claude account.</div>
+        </div>
+      </div>
+    </div>
+
+    <div data-sgroup="routing" class="section" id="codexCliSection" style="display:none">
+      <div class="section-head">
+        <div class="section-title" data-i18n="settings.codex_cli.title">Codex CLI</div>
+        <div class="section-sub" data-i18n="settings.codex_cli.sub">Run OpenAI's own codex CLI on the pool's ChatGPT accounts</div>
+      </div>
+      <div class="section-body">
+        <div class="field-row">
+          <div class="field-text">
+            <div class="field-title" data-i18n="settings.codex_cli.label">Serve the codex CLI from the pool</div>
+            <div class="field-sub" data-i18n="settings.codex_cli.label_sub">Off by default. Then launch it with cu codex — your own codex login and ~/.codex are never touched.</div>
+          </div>
+          <div class="toggle off" id="codexCliToggle" data-field="codex_cli_serving"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="routing-explainer">
+          <div data-i18n="settings.codex_cli.explainer">cu codex starts the real codex CLI and sends its requests through this daemon to one of your ChatGPT-subscription accounts. When that account reaches its limit, the next request goes to another one before codex sees an error; a conversation stays on the account it started on while that account has room. Only ChatGPT-subscription accounts serve codex — never a Claude account or an API key. Usage appears under each account like any other.</div>
+        </div>
+        <div class="routing-explainer">
+          <div data-i18n="settings.codex_cli.terms">Read this before turning it on: OpenAI's Terms of Use forbid using the services in a way that circumvents rate limits, and moving one person's work between several ChatGPT subscriptions to get past each one's limit can be read that way. OpenAI has not said whether it allows it. Each account stays subject to its own plan's terms, and the risk to those accounts is yours.</div>
         </div>
       </div>
     </div>
@@ -1985,6 +2007,18 @@
         <div class="divider"></div>
         <div class="cmd-row">
           <div class="code-row">
+            <code id="cmd-codex">cu codex</code>
+            <span class="cmd-optional">[--profile &lt;name&gt;] [codex args]</span>
+            <div class="copy-btn" data-copy-target="cmd-codex">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-i18n="settings.network.copy">Copy</span>
+            </div>
+          </div>
+          <div class="field-sub" data-i18n="help.cmd.codex">Launches OpenAI's codex CLI served from the pool's ChatGPT-subscription accounts, rotating between them as each reaches its limit. Turn it on first under Settings → Routing → Codex CLI. --profile &lt;name&gt; pins the session to one ChatGPT account; every other argument passes straight through to codex. With more than one enabled ChatGPT account and no --profile, it asks — like code — whether to rotate across them or use one. Your own codex login and ~/.codex are left alone.</div>
+        </div>
+        <div class="divider"></div>
+        <div class="cmd-row">
+          <div class="code-row">
             <code id="cmd-desktop">cu desktop</code>
             <div class="copy-btn" data-copy-target="cmd-desktop">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -2375,7 +2409,7 @@
         </div>
 
         <div class="field-group" id="f_base_url_wrap" style="display:none;">
-          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com; http:// only for localhost or a LAN address)</div>
+          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com; http:// or https://)</div>
           <input class="text-input mono" id="f_base_url" data-i18n-placeholder="modal.add_profile.base_url_placeholder" placeholder="https://api.anthropic.com">
         </div>
 
@@ -2707,7 +2741,7 @@
       </div>
       <div id="pd_api_fields" style="display:none">
         <div class="field-group">
-          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com; http:// only for localhost or a LAN address)</div>
+          <div class="field-label" data-i18n="modal.add_profile.base_url_label">Base URL (blank = api.anthropic.com; http:// or https://)</div>
           <input class="text-input" id="pd_base_url_input" type="text" data-i18n-placeholder="modal.add_profile.base_url_placeholder" placeholder="https://api.anthropic.com">
         </div>
         <div class="field-group">

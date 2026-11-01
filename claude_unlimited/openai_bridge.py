@@ -25,8 +25,9 @@ from dataclasses import dataclass, replace
 from typing import Iterator, Optional
 from urllib.parse import urlsplit
 
-from . import codex_state, openai_credential, openai_login
+from . import activity, codex_state, openai_credential, openai_login, refresh_backoff
 from . import openai_translate
+from .upstream import _connect as upstream_connect
 from .openai_translate import user_turn_index
 from .config import Profile
 from .openai_models import fallback_models, map_model
@@ -108,6 +109,14 @@ def _codex_user_agent() -> str:
 _REFRESH_CHECK_COOLDOWN_SECONDS = 60.0
 _RATE_LIMIT_BACKOFF_SECONDS = 900.0
 _refresh_not_before: dict[str, float] = {}
+# Consecutive failed refreshes per Profile, split as in gateway.py: 429s and
+# everything else escalate on their own streaks (see refresh_backoff).
+_refresh_rate_limited_streak: dict[str, int] = {}
+_refresh_failure_streak: dict[str, int] = {}
+# Profiles whose last refresh attempt the token endpoint refused outright
+# (refresh_backoff.is_rejection). Read by the gateway, which marks the
+# account needs-re-auth only once its access token has also expired.
+_refresh_rejected: set = set()
 # Guards the check-and-set on _refresh_not_before, and records which Profiles
 # are mid-refresh. See refresh_now() for why both are needed.
 _refresh_lock = threading.Lock()
@@ -293,7 +302,7 @@ def _refresh_if_needed(profile: Profile, cred: openai_credential.StoredOpenAICre
     the request itself is what drives AUTH_INVALID."""
     if not cred.refresh_token or not openai_credential.is_expiring_soon(cred.access_token):
         return cred
-    return refresh_now(profile.id, cred) or cred
+    return refresh_now(profile.id, cred, profile_name=profile.name) or cred
 
 
 def refresh_attempt_due(profile_id: str) -> bool:
@@ -307,8 +316,55 @@ def refresh_attempt_due(profile_id: str) -> bool:
     return not_before is None or time.monotonic() >= not_before
 
 
+def forget_refresh_backoff(profile_id: str) -> None:
+    """A replaced credential is a fresh start — called by the gateway when a
+    Profile is re-authenticated, exactly as it clears its own clock."""
+    with _refresh_lock:
+        _refresh_not_before.pop(profile_id, None)
+        _refresh_rate_limited_streak.pop(profile_id, None)
+        _refresh_failure_streak.pop(profile_id, None)
+        _refresh_rejected.discard(profile_id)
+
+
+def export_refresh_backoff(profile_id: str, now_monotonic: float) -> tuple:
+    """(seconds_remaining or None, rate_limited_streak, failure_streak) for the
+    gateway's _persist — the Codex half of carrying a refresh backoff across a
+    restart. Only a Profile with a streak reports a deadline, so the ordinary
+    60s throttle never leaks into the persisted state."""
+    with _refresh_lock:
+        streak = _refresh_rate_limited_streak.get(profile_id, 0)
+        failures = _refresh_failure_streak.get(profile_id, 0)
+        remaining = None
+        if streak > 0 or failures > 0:
+            not_before = _refresh_not_before.get(profile_id)
+            if not_before is not None and not_before - now_monotonic > 0:
+                remaining = not_before - now_monotonic
+    return remaining, streak, failures
+
+
+def restore_refresh_backoff(profile_id: str, remaining: Optional[float],
+                            rate_limited_streak: int, failure_streak: int) -> None:
+    """Inverse of export_refresh_backoff, called by the gateway after a restart
+    with the wall-clock deadline already converted to seconds remaining."""
+    with _refresh_lock:
+        if rate_limited_streak > 0:
+            _refresh_rate_limited_streak[profile_id] = rate_limited_streak
+        if failure_streak > 0:
+            _refresh_failure_streak[profile_id] = failure_streak
+        if remaining is not None and remaining > 0:
+            _refresh_not_before[profile_id] = time.monotonic() + remaining
+
+
+def refresh_was_rejected(profile_id: str) -> bool:
+    """Whether this Profile's most recent refresh was refused outright (a dead
+    grant), as opposed to throttled, failed in transit, or never tried."""
+    return profile_id in _refresh_rejected
+
+
 def refresh_now(profile_id: str,
-                cred: openai_credential.StoredOpenAICredential
+                cred: openai_credential.StoredOpenAICredential,
+                *, cooldown: Optional[float] = None,
+                profile_name: Optional[str] = None,
                 ) -> Optional[openai_credential.StoredOpenAICredential]:
     """The ONE place that calls openai_login.refresh_access_token.
 
@@ -323,6 +379,10 @@ def refresh_now(profile_id: str,
 
     Returns None both when still inside the backoff window and when the
     refresh genuinely failed; the caller keeps using whatever it had.
+
+    `cooldown` replaces the ordinary 60s throttle (the gateway passes its
+    longer recovery interval for an AUTH_INVALID Profile). Every failure
+    escalates the wait, not only a 429, and is logged — see refresh_backoff.
     """
     now = time.monotonic()
     # Claim the slot atomically, exactly as gateway._try_refresh does on the
@@ -342,16 +402,40 @@ def refresh_now(profile_id: str,
         not_before = _refresh_not_before.get(profile_id)
         if not_before is not None and now < not_before:
             return None  # still inside the backoff window from a recent failed attempt
-        _refresh_not_before[profile_id] = now + _REFRESH_CHECK_COOLDOWN_SECONDS
+        base = cooldown if cooldown is not None else _REFRESH_CHECK_COOLDOWN_SECONDS
+        _refresh_not_before[profile_id] = now + base
         _refresh_in_progress.add(profile_id)
 
     try:
         refreshed = openai_login.refresh_access_token(cred.refresh_token)
     except openai_login.OpenAILoginError as exc:
-        if exc.status_code == 429:
-            # A rate limit, not a dead refresh_token: back off far longer
-            # than the normal cooldown.
-            _refresh_not_before[profile_id] = now + _RATE_LIMIT_BACKOFF_SECONDS
+        # A 429 is a rate limit, not a dead refresh_token, and backs off far
+        # longer than the normal cooldown; anything else escalates on its own.
+        streaks = _refresh_rate_limited_streak if exc.status_code == 429 else _refresh_failure_streak
+        streak = streaks.get(profile_id, 0) + 1
+        streaks[profile_id] = streak
+        wait = refresh_backoff.failure_wait(exc.status_code, streak, base, _RATE_LIMIT_BACKOFF_SECONDS)
+        _refresh_not_before[profile_id] = now + wait
+        if refresh_backoff.is_rejection(exc.status_code):
+            _refresh_rejected.add(profile_id)
+        elif exc.status_code is not None:
+            _refresh_rejected.discard(profile_id)
+        if refresh_backoff.worth_logging(streak):
+            activity.record("error", f"{profile_name or profile_id} — token refresh failed",
+                             meta=f"{refresh_backoff.describe(exc.status_code, streak, wait)} ({str(exc)[:160]})")
+        if streak == 1 and refresh_backoff.is_rejection(exc.status_code):
+            # The same heads-up a Claude account gets: the access token stops
+            # working when it expires, and only a new login fixes that.
+            try:
+                from . import notifications
+                from .config import load_pool
+                notifications.notify_if_enabled(
+                    "needs_attention", "Claude Unlimited",
+                    f"{profile_name or profile_id}: renewing its sign-in was refused — "
+                    "run `claude-unlimited add-codex-account` again.",
+                    load_pool().settings)
+            except Exception:
+                pass   # a notification must never break a refresh path
         return None
     finally:
         # Must run on EVERY exit, including the success path below and any
@@ -359,6 +443,9 @@ def refresh_now(profile_id: str,
         # Profile's refreshes for the life of the process.
         with _refresh_lock:
             _refresh_in_progress.discard(profile_id)
+    _refresh_rate_limited_streak.pop(profile_id, None)
+    _refresh_failure_streak.pop(profile_id, None)
+    _refresh_rejected.discard(profile_id)
     new_cred = openai_credential.StoredOpenAICredential(
         access_token=refreshed.access_token,
         refresh_token=refreshed.refresh_token or cred.refresh_token,
@@ -485,9 +572,10 @@ def run(profile: Profile, stored_credential: str, body: bytes,
 
         try:
             conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout)
+            conn._create_connection = upstream_connect
             conn.request("POST", parts.path or "/", body=payload, headers=headers)
             resp = conn.getresponse()
-        except OSError as exc:
+        except (OSError, http.client.HTTPException) as exc:   # BadStatusLine is not an OSError
             raise OpenAIBridgeError(f"Could not reach {parts.hostname}: {exc}") from exc
 
         if resp.status < 400:
@@ -554,7 +642,9 @@ def run(profile: Profile, stored_credential: str, body: bytes,
             while True:
                 incomplete = None
                 try:
-                    chunk = resp.read(CHUNK_READ_SIZE)
+                    # read1, not read: read(n) on a chunked response waits
+                    # for n bytes, batching small SSE events into bursts.
+                    chunk = resp.read1(CHUNK_READ_SIZE)
                 except http.client.IncompleteRead as exc:
                     # ChatGPT's backend sometimes closes a chunked response
                     # after sending a complete SSE stream but before writing

@@ -1239,7 +1239,7 @@ def test_an_auth_invalid_codex_profile_recovers_via_its_refresh_token(pool_env, 
     fresh = openai_credential.StoredOpenAICredential(
         access_token="alive", refresh_token="ref-2", account_id="acct-1", id_token=None)
     monkeypatch.setattr(gateway_module.openai_bridge, "refresh_now",
-                        lambda profile_id, cred: calls.append(profile_id) or fresh)
+                        lambda profile_id, cred, **kw: calls.append(profile_id) or fresh)
 
     gw = Gateway(transport=lambda req: fake_response(200))
     gw.runtime_snapshot()  # populate _runtime before observing into it
@@ -1262,7 +1262,7 @@ def test_a_codex_profile_whose_refresh_token_is_dead_stays_auth_invalid(pool_env
         access_token="dead", refresh_token="revoked", account_id="acct-1", id_token=None))
     monkeypatch.setattr(gateway_module, "secret_store", FakeSecretStore({"a": stored}))
     monkeypatch.setattr(gateway_module.openai_bridge, "refresh_now",
-                        lambda profile_id, cred: None)
+                        lambda profile_id, cred, **kw: None)
 
     gw = Gateway(transport=lambda req: fake_response(200))
     gw.runtime_snapshot()  # populate _runtime before observing into it
@@ -1278,7 +1278,7 @@ def test_a_codex_api_key_profile_is_left_alone(pool_env, monkeypatch):
         automatic=True, enabled=True)]))
     monkeypatch.setattr(gateway_module, "secret_store", FakeSecretStore({"a": "sk-proj-x"}))
     monkeypatch.setattr(gateway_module.openai_bridge, "refresh_now",
-                        lambda profile_id, cred: pytest.fail("refreshed an API-key profile"))
+                        lambda profile_id, cred, **kw: pytest.fail("refreshed an API-key profile"))
 
     gw = Gateway(transport=lambda req: fake_response(200))
     gw.runtime_snapshot()  # populate _runtime before observing into it
@@ -2137,3 +2137,94 @@ def test_is_model_refusal_wording():
     assert refusal(400, b'{"error":{"message":"model claude-x does not exist"}}')
     assert not refusal(400, b'{"error":{"message":"model: field required"}}')
     assert not refusal(404, b'{"error":{"message":"prompt is too long"}}')
+
+
+def _idle_oauth_profile_whose_refresh_fails(monkeypatch, status_code):
+    """An ELIGIBLE (not AUTH_INVALID) oauth Profile whose token is past expiry,
+    nobody routing requests to it, and every refresh failing with `status_code`
+    — the exact shape of issue #10."""
+    import claude_unlimited.gateway as gw_mod
+
+    save_pool(Pool(profiles=[Profile(id="a", name="A", kind="oauth", priority=1,
+                                      automatic=True, enabled=True, account_uuid="u")]))
+    stored = gw_mod.oauth_credential.encode(gw_mod.oauth_credential.StoredOAuthCredential(
+        access_token="tok", refresh_token="r", expires_at=1))
+    monkeypatch.setattr(gw_mod, "secret_store", FakeSecretStore({"a": stored}))
+    calls, logged, notified = [], [], []
+
+    def failing(_token):
+        calls.append(1)
+        raise gw_mod.oauth_login.OAuthLoginError("refused", status_code=status_code)
+
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token", failing)
+    monkeypatch.setattr("claude_unlimited.gateway.activity.record",
+                        lambda category, text, meta=None: logged.append((text, meta)))
+    monkeypatch.setattr("claude_unlimited.gateway.notifications.notify_if_enabled",
+                        lambda *a, **k: notified.append(a))
+    now = [1000.0]
+    monkeypatch.setattr(gw_mod.time, "monotonic", lambda: now[0])
+    gw = Gateway(transport=lambda req: fake_response(200))
+    return gw, now, calls, logged, notified
+
+
+def _run_sync_ticks_for(gw, now, seconds, step=1.0):
+    end = now[0] + seconds
+    while now[0] < end:
+        gw.runtime_snapshot()
+        gw.wait_for_credential_checks()
+        now[0] += step * 60
+
+
+@pytest.mark.parametrize("status_code", [400, 500, None])
+def test_a_failing_refresh_on_an_idle_account_does_not_retry_every_minute(pool_env, monkeypatch, status_code):
+    """Issue #10: every non-429 failure re-armed only the 60s cooldown, so an
+    idle account whose refresh kept failing asked the token endpoint about
+    1,440 times a day, for days, and logged nothing."""
+    gw, now, calls, logged, _ = _idle_oauth_profile_whose_refresh_fails(monkeypatch, status_code)
+
+    _run_sync_ticks_for(gw, now, 24 * 3600)
+
+    # Never faked broken by a transient failure; a refused grant on a token
+    # already past expiry is genuinely broken (see test_refresh_rejection_reauth).
+    expected = ProfileState.AUTH_INVALID if status_code == 400 else ProfileState.ELIGIBLE
+    assert gw.runtime_snapshot()["a"].state == expected
+    assert len(calls) <= 60, f"{len(calls)} refresh attempts in a day is still hammering"
+    logged = [entry for entry in logged if "needs re-authentication" not in entry[0]]
+    assert logged and all("token refresh failed" in text for text, _ in logged)
+    assert len(logged) < len(calls) or len(calls) <= 2, "one stuck account must not flood Activity"
+
+
+def test_a_rejected_refresh_tells_the_person_once(pool_env, monkeypatch):
+    """invalid_grant means the access token will die at expiry: say so
+    before it does — once, not on every retry."""
+    gw, now, calls, logged, notified = _idle_oauth_profile_whose_refresh_fails(monkeypatch, 400)
+
+    _run_sync_ticks_for(gw, now, 6 * 3600)
+
+    assert len(calls) >= 2
+    assert len(notified) == 1
+    assert "HTTP 400" in logged[0][1] and "next attempt in" in logged[0][1]
+
+
+def test_a_transient_refresh_failure_does_not_notify(pool_env, monkeypatch):
+    gw, now, calls, logged, notified = _idle_oauth_profile_whose_refresh_fails(monkeypatch, 503)
+
+    _run_sync_ticks_for(gw, now, 3600)
+
+    assert calls and logged and not notified
+
+
+def test_a_successful_refresh_resets_the_failure_backoff(pool_env, monkeypatch):
+    import claude_unlimited.gateway as gw_mod
+    gw, now, calls, _, _ = _idle_oauth_profile_whose_refresh_fails(monkeypatch, 500)
+    for _ in range(4):
+        try:
+            gw._try_refresh("a", "r")
+        except gw_mod.oauth_login.OAuthLoginError:
+            pass
+        now[0] = gw._refresh_check_not_before["a"] + 1
+    assert gw._refresh_failure_streak["a"] == 4
+    monkeypatch.setattr(gw_mod.oauth_login, "refresh_access_token",
+                        lambda _t: gw_mod.oauth_login.LoginTokens("new", "r2", None))
+    assert gw._try_refresh("a", "r") is not None
+    assert "a" not in gw._refresh_failure_streak

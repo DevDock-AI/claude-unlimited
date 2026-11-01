@@ -45,6 +45,7 @@ from . import db
 from . import usage_probe
 from . import activity
 from . import anthropic_oauth
+from . import codex_cli
 from . import connection_test
 from . import context_window
 from . import daemon_installer
@@ -483,6 +484,10 @@ _FORCED_PROFILE_ERROR_MESSAGES = {
     "forced_profile_needs_reauth": "[claude-unlimited] The Profile this session is pinned to needs re-authentication.",
     "upstream_unreachable": "[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to.",
 }
+
+
+def _is_codex_cli_path(path: str) -> bool:
+    return path == codex_cli.BASE_PATH or path.startswith(codex_cli.BASE_PATH + "/")
 
 
 def _wants_event_stream(method: str, path: str, body: bytes) -> bool:
@@ -1010,6 +1015,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         # GET /v1/models to build its `/model` picker; a 404 here makes the
         # client fall back to its built-in Claude list, so the proxy path
         # answers it per active Profile instead.
+        if _is_codex_cli_path(path):
+            self._handle_codex_cli_request("GET", path)
+            return
         if not path.startswith("/api/"):
             self._handle_proxy_request("GET", path)
             return
@@ -1024,6 +1032,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
 
+        if _is_codex_cli_path(path):
+            # Never falls through to the Claude Code path below: an OpenAI
+            # body sent there would be relayed to whichever account is current.
+            self._handle_codex_cli_request("POST", path)
+            return
         if not path.startswith("/api/"):
             self._handle_proxy_request("POST", path)
             return
@@ -1506,6 +1519,47 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         self._write_proxy_result(serve())
 
+    def _handle_codex_cli_request(self, method: str, path: str) -> None:
+        """The official `codex` CLI, served from the pool (codex_cli.py).
+        Same local credential as Claude Code — `claude-unlimited codex` passes
+        the placeholder (or a `--profile` session token) as codex's provider
+        key — but errors go back in OpenAI's shape, which is what codex reads."""
+        _note_user_activity()
+        auth = self.headers.get("Authorization", "")
+        presented = auth[len("Bearer "):] if auth.startswith("Bearer ") else auth
+        if placeholder_token.matches(presented):
+            grant = session_tokens.SessionGrant()
+        else:
+            grant = session_tokens.resolve_grant(presented)
+            if grant.forced_profile_id is None and not grant.distribute:
+                self._send_raw_json(401, codex_cli.error_body(
+                    "Invalid local credential — start codex with `claude-unlimited codex`.",
+                    error_type="invalid_api_key"))
+                return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > MAX_REQUEST_BYTES:
+            # Same guard as the proxy path: never buffer it, drain it so codex
+            # sees the answer, and answer 413 (codex retries any 5xx).
+            self._discard_body(length)
+            activity.record("error", "codex CLI: request too large — rejected", meta=f"{length:,} bytes")
+            self._send_raw_json(REQUEST_TOO_LARGE_STATUS, codex_cli.error_body(
+                f"The request body is {length:,} bytes; the limit is {MAX_REQUEST_BYTES:,}.",
+                error_type="request_too_large"))
+            return
+        body = self.rfile.read(length) if length > 0 else b""
+        if method == "GET" and path.rstrip("/") == codex_cli.MODELS_PATH:
+            self._write_proxy_result(_gateway.handle_codex_cli_models(
+                {k: v for k, v in self.headers.items()}, urlparse(self.path).query,
+                forced_profile_id=grant.forced_profile_id))
+            return
+        if method != "POST" or path.rstrip("/") != codex_cli.RESPONSES_PATH:
+            self._send_raw_json(404, codex_cli.error_body(
+                f"{method} {path} is not served here; only POST {codex_cli.RESPONSES_PATH} is."))
+            return
+        inbound_headers = {k: v for k, v in self.headers.items()}
+        self._write_proxy_result(_gateway.handle_codex_cli(inbound_headers, body,
+                                                           forced_profile_id=grant.forced_profile_id))
+
     def _write_proxy_result(self, result) -> None:
         """The ordinary response: whatever the gateway decided, as-is."""
         if result.error is not None:
@@ -1667,7 +1721,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-class _WindowsExclusiveHTTPServer(ThreadingHTTPServer):
+class _DaemonHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that does not log a client hanging up mid-reply.
+
+    The Dashboard, the HUD and `curl | head` all close connections early as a
+    matter of course; socketserver's default prints a full traceback to the
+    error log for each one, which buries the errors that matter."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class _WindowsExclusiveHTTPServer(_DaemonHTTPServer):
     """Windows-only: bind with SO_EXCLUSIVEADDRUSE so no other process can bind
     our port alongside us. Never instantiated off Windows (the socket option
     does not exist there); referencing the class is harmless."""
@@ -1705,7 +1772,7 @@ def make_server(host: str = LOOPBACK_HOST, port: int = DEFAULT_PORT) -> Threadin
         _WindowsExclusiveHTTPServer.allow_reuse_address = False
         server = _WindowsExclusiveHTTPServer((host, port), _DashboardHandler)
     else:
-        server = ThreadingHTTPServer((host, port), _DashboardHandler)
+        server = _DaemonHTTPServer((host, port), _DashboardHandler)
     _assert_bound_to_loopback(server)
     # Remember the actually-bound port (port 0 resolves to a real one) so the
     # background update loops can restart onto the SAME port — they have no

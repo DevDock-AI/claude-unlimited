@@ -169,7 +169,7 @@ def test_codex_profile_answers_models_listing_with_its_own_mapped_models(pool_en
     ids = [m["id"] for m in payload["data"]]
     # Anthropic-shaped ids on purpose: Claude Code sends the picked id back
     # in /v1/messages and openai_models.map_model is keyed on exactly these.
-    assert "claude-sonnet-5" in ids
+    assert "claude-sonnet-5-5" in ids
     # ...but every display name must name the backing model.
     assert all("GPT" in m["display_name"] for m in payload["data"])
 
@@ -180,9 +180,9 @@ def test_codex_models_retrieve_form_returns_one_model(pool_env):
     save_pool(Pool(profiles=[_codex_profile()]))
     gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no transport expected")))
 
-    result = gw.handle("GET", "/v1/models/claude-sonnet-5", {}, b"")
+    result = gw.handle("GET", "/v1/models/claude-sonnet-5-5", {}, b"")
     assert result.status == 200
-    assert json.loads(b"".join(result.body_chunks))["id"] == "claude-sonnet-5"
+    assert json.loads(b"".join(result.body_chunks))["id"] == "claude-sonnet-5-5"
 
     missing = gw.handle("GET", "/v1/models/gpt-does-not-exist", {}, b"")
     assert missing.status == 404
@@ -296,7 +296,7 @@ def test_pinned_codex_profile_that_fails_returns_error_not_rotate(pool_env, monk
 
 def _sse_ok_bridge(monkeypatch):
     """A bridge result shaped like a real translated streaming answer."""
-    sse = (b'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","model":"gpt-5.6-sol"}}\n\n'
+    sse = (b'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","model":"gpt-6.1-sol"}}\n\n'
            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
            b'"content_block":{"type":"text","text":""}}\n\n'
            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
@@ -348,7 +348,7 @@ def test_tool_call_survives_the_non_streaming_collapse(pool_env, monkeypatch):
     """A tool call arrives as streamed argument fragments; collapsing must
     reassemble them into real JSON input, not drop the call."""
     save_pool(Pool(profiles=[_codex_profile()]))
-    sse = (b'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","model":"gpt-5.6-sol"}}\n\n'
+    sse = (b'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","model":"gpt-6.1-sol"}}\n\n'
            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
            b'"content_block":{"type":"tool_use","id":"call_1","name":"Read","input":{}}}\n\n'
            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
@@ -417,7 +417,7 @@ def test_a_non_streaming_codex_request_still_records_both_models(pool_env, monke
 
     def fake_run(profile, credential, body, timeout=120, parity=None, context=None):
         return OpenAIBridgeResult(status=200, headers={"content-type": "text/event-stream"},
-                                   body_chunks=iter(_usage_sse("gpt-5.6-terra")))
+                                   body_chunks=iter(_usage_sse("gpt-6.1-terra")))
 
     monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
     gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no Anthropic transport")))
@@ -431,7 +431,7 @@ def test_a_non_streaming_codex_request_still_records_both_models(pool_env, monke
     assert json.loads(body)["type"] == "message"
     events = usage_history.list_events()
     assert len(events) == 1
-    assert (events[0].model, events[0].requested_model) == ("gpt-5.6-terra", "claude-opus-5")
+    assert (events[0].model, events[0].requested_model) == ("gpt-6.1-terra", "claude-opus-5")
 
 
 
@@ -449,7 +449,7 @@ def test_only_an_explicit_stream_true_gets_sse_back(pool_env, monkeypatch, strea
 
     def fake_run(profile, credential, body, timeout=120, parity=None, context=None):
         return OpenAIBridgeResult(status=200, headers={"content-type": "text/event-stream"},
-                                   body_chunks=iter(_usage_sse("gpt-5.6-terra")))
+                                   body_chunks=iter(_usage_sse("gpt-6.1-terra")))
 
     monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
     gw = Gateway(transport=lambda req: (_ for _ in ()).throw(AssertionError("no Anthropic transport")))
@@ -620,7 +620,7 @@ def _unavailable(gpt_model, resets_at=None):
 
 
 def test_a_codex_profile_counts_as_spent_when_fables_gpt_target_is_unavailable(pool_env):
-    """The whole point: claude-fable-5 maps to gpt-5.6-sol, and if OpenAI says
+    """The whole point: claude-fable-5 maps to gpt-6.1-sol, and if OpenAI says
     that model is unavailable on this account the account has spent its
     Fable week — the Codex counterpart of Anthropic's Fable bucket."""
     from datetime import datetime, timedelta, timezone
@@ -634,7 +634,7 @@ def test_a_codex_profile_counts_as_spent_when_fables_gpt_target_is_unavailable(p
     gw.runtime_snapshot()   # prime
     later = datetime.now(timezone.utc) + timedelta(hours=3)
     with gw._lock:
-        gw._runtime["c"].model_usage = _unavailable("gpt-5.6-sol", later)
+        gw._runtime["c"].model_usage = _unavailable("gpt-6.1-sol", later)
     gw.runtime_snapshot()   # re-sync recomputes blocked_models
 
     assert "claude-fable-5" in gw._runtime["c"].blocked_models
@@ -676,7 +676,7 @@ def test_an_available_codex_model_does_not_block(pool_env):
     gw.runtime_snapshot()
     with gw._lock:
         gw._runtime["c"].model_usage = (
-            ModelWindow(name="gpt-5.6-sol", percent=0.0, resets_at=None, active=False),)
+            ModelWindow(name="gpt-6.1-sol", percent=0.0, resets_at=None, active=False),)
     gw.runtime_snapshot()
     assert gw._runtime["c"].blocked_models == frozenset()
 
@@ -691,7 +691,7 @@ def test_an_expired_availability_window_stops_blocking(pool_env):
     gw.runtime_snapshot()
     past = datetime.now(timezone.utc) - timedelta(minutes=1)
     with gw._lock:
-        gw._runtime["c"].model_usage = _unavailable("gpt-5.6-sol", past)
+        gw._runtime["c"].model_usage = _unavailable("gpt-6.1-sol", past)
     gw.runtime_snapshot()
     assert gw._runtime["c"].blocked_models == frozenset()
 
@@ -714,7 +714,7 @@ def test_a_per_profile_codex_model_override_is_respected(pool_env):
     assert "claude-fable-5" in blocked and "claude-opus-5-5" in blocked
     # ...and the model the parity list would otherwise have mapped is NOT the
     # thing being consulted.
-    assert "gpt-5.6-sol" not in blocked
+    assert "gpt-6.1-sol" not in blocked
 
 
 def test_blocked_models_survives_the_per_tick_runtime_rebuild(pool_env):
@@ -729,7 +729,7 @@ def test_blocked_models_survives_the_per_tick_runtime_rebuild(pool_env):
     gw.runtime_snapshot()
     later = datetime.now(timezone.utc) + timedelta(hours=2)
     with gw._lock:
-        gw._runtime["c"].model_usage = _unavailable("gpt-5.6-sol", later)
+        gw._runtime["c"].model_usage = _unavailable("gpt-6.1-sol", later)
 
     for _ in range(3):        # several ticks, as an open dashboard would cause
         gw.runtime_snapshot()
@@ -790,7 +790,7 @@ def test_a_real_session_leaves_a_codex_account_whose_fable_target_is_unavailable
     gw = Gateway(transport=transport)
     gw.runtime_snapshot()
     with gw._lock:
-        gw._runtime["c"].model_usage = _unavailable("gpt-5.6-sol", later)
+        gw._runtime["c"].model_usage = _unavailable("gpt-6.1-sol", later)
     for model in (b'{"model": "claude-fable-5"}', b'{"model": "claude-opus-5"}'):
         result = gw.handle("POST", "/v1/messages", {}, model)
         if result.body_chunks:
@@ -809,7 +809,7 @@ def test_a_real_session_leaves_a_codex_account_whose_fable_target_is_unavailable
     fresh.runtime_snapshot()
     with fresh._lock:
         fresh._current_profile_id = None
-        fresh._runtime["c"].model_usage = _unavailable("gpt-5.6-sol", later)
+        fresh._runtime["c"].model_usage = _unavailable("gpt-6.1-sol", later)
     result2 = fresh.handle("POST", "/v1/messages", {}, b'{"model": "claude-opus-5"}')
     if result2.body_chunks:
         list(result2.body_chunks)
@@ -842,7 +842,7 @@ def test_an_explicit_pin_still_reaches_a_codex_account_with_an_unavailable_model
     gw.runtime_snapshot()
     later = datetime.now(timezone.utc) + timedelta(hours=3)
     with gw._lock:
-        gw._runtime["c"].model_usage = _unavailable("gpt-5.6-sol", later)
+        gw._runtime["c"].model_usage = _unavailable("gpt-6.1-sol", later)
 
     result = gw.handle("POST", "/v1/messages", {}, b'{"model": "claude-fable-5"}',
                        forced_profile_id="c")
@@ -1114,7 +1114,9 @@ def test_an_unknown_gpt_id_is_assumed_at_the_floor_and_said_once(pool_env, monke
 
 
 def test_an_api_key_codex_profile_is_budgeted_at_the_public_api_window(pool_env, monkeypatch):
-    save_pool(Pool(profiles=[_codex_profile(priority=1, auth_mode="api_key"), _oauth()]))
+    # Pinned to a 922K-public model: the default gpt-6.1 targets are 272K on
+    # the public API, which would budget the automatic profile at the floor.
+    save_pool(Pool(profiles=[_codex_profile(priority=1, auth_mode="api_key", codex_model="gpt-6-astra"), _oauth()]))
     served = _codex_recorder(monkeypatch)
     gw = Gateway(transport=_anthropic_ok)
     assert _drain(gw.handle("POST", "/v1/messages", {}, _big_body(tokens_over=400_000))).profile_id == "c"
@@ -1211,3 +1213,35 @@ def test_codex_body_between_32_and_50mb_is_forwarded(pool_env, monkeypatch):
     result = _drain(gw.handle("POST", "/v1/messages", {}, _padded_image_body(40_000_000)))
     assert result.error is None and result.profile_id == "c"
     assert served == ["c"]
+
+
+def test_a_402_codex_profile_is_cooled_for_an_hour_and_the_request_rotates(pool_env, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from claude_unlimited.upstream import UpstreamResponse
+
+    save_pool(Pool(profiles=[
+        _codex_profile(priority=1),
+        Profile(id="a", name="A", kind="oauth", priority=2, automatic=True, enabled=True),
+    ]))
+
+    def fake_run(profile, credential, body, timeout=120, parity=None, context=None):
+        return OpenAIBridgeResult(status=402, headers={}, body_chunks=iter([b'{"error":"pay"}']))
+
+    monkeypatch.setattr(gateway_module.openai_bridge, "run", fake_run)
+
+    class FakeConnection:
+        def close(self):
+            pass
+
+    def transport(req):
+        return UpstreamResponse(status=200, headers={"anthropic-ratelimit-unified-5h-utilization": "0.1",
+                                                       "anthropic-ratelimit-unified-5h-reset": "1787191800"},
+                                 body_chunks=iter([b"ok"]), connection=FakeConnection())
+
+    gw = Gateway(transport=transport)
+    result = gw.handle("POST", "/v1/messages", {}, b"{}")
+
+    assert result.status == 200 and result.profile_id == "a"
+    rt = gw.runtime_snapshot()["c"]
+    assert rt.budget_unavailable
+    assert rt.cooldown_until - datetime.now(timezone.utc) > timedelta(minutes=55)

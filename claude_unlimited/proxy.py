@@ -127,6 +127,9 @@ class UpstreamRequest:
     method: str
     headers: dict
     body: bytes
+    # Plain http may be used. Only an API profile's own Base URL qualifies
+    # (net_scope); an OAuth request always goes to Anthropic over https.
+    allow_http: bool = False
 
 
 def resolve_base_url(profile: Profile) -> str:
@@ -176,7 +179,8 @@ def build_upstream_request(
         headers["Content-Length"] = str(len(body))
 
     base_url = resolve_base_url(profile)
-    return UpstreamRequest(url=f"{base_url}{path}", method=method, headers=headers, body=body)
+    return UpstreamRequest(url=f"{base_url}{path}", method=method, headers=headers, body=body,
+                           allow_http=profile.kind == "api")
 
 
 def _inject_output_effort(body: bytes, effort: str) -> bytes:

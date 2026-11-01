@@ -101,3 +101,19 @@ def test_a_manual_check_never_installs_or_restarts(monkeypatch):
 
     daemon._run_update_check(settings=Settings(update_mode="manual"), respect_idle=True, mode_override="manual")
     assert restarted == []
+
+
+def test_a_client_hanging_up_mid_reply_is_not_logged_as_an_error(capsys):
+    # Dashboard, HUD and `curl | head` close early all the time; a traceback
+    # per hang-up buries the errors that matter. Anything else still logs.
+    from claude_unlimited.daemon import _DaemonHTTPServer
+
+    server = _DaemonHTTPServer.__new__(_DaemonHTTPServer)
+    for exc, logged in ((BrokenPipeError(32, "Broken pipe"), False),
+                        (ConnectionResetError(54, "reset"), False),
+                        (ValueError("real bug"), True)):
+        try:
+            raise exc
+        except Exception:
+            server.handle_error(None, ("127.0.0.1", 1))
+        assert ("real bug" in capsys.readouterr().err) is logged

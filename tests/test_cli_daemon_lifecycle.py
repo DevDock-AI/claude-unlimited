@@ -535,3 +535,23 @@ def test_is_our_daemon_matches_on_the_command_line(monkeypatch):
         stdout = "/usr/bin/some-other-server --port 4317"
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: Other())
     assert cli._is_our_daemon(1) is False
+
+
+@pytest.mark.parametrize("installed_by_script", [True, False])
+def test_purge_points_a_pip_install_at_pip_uninstall(monkeypatch, tmp_path, capsys, installed_by_script):
+    """Issue #11 (minor): install.sh's copy lives under the install root and
+    purge removes it; a pip install lives in site-packages, which it can't."""
+    from claude_unlimited import cli
+    from claude_unlimited.config import Pool
+
+    monkeypatch.setattr(cli, "load_pool", lambda: Pool(profiles=[]))
+    monkeypatch.setattr(cli.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(cli.shutil, "rmtree", lambda p, **k: None)
+    monkeypatch.setattr(cli.daemon_installer, "stop", lambda: None)
+    monkeypatch.setattr(cli.daemon_installer, "uninstall", lambda: None)
+    monkeypatch.setattr(cli, "_stop_running_daemon", lambda port: None)
+    root = tmp_path / ".local" / "share" / "claude-unlimited" if installed_by_script else tmp_path / "site-packages"
+    monkeypatch.setattr(cli, "__file__", str(root / "venv" / "claude_unlimited" / "cli.py"))
+
+    assert cli.purge(assume_yes=True) == 0
+    assert ("pip uninstall claude-unlimited" in capsys.readouterr().out) is not installed_by_script

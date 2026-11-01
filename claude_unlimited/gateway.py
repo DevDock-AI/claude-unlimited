@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 from urllib.parse import urlparse
 
-from . import activity, eco, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
+from . import activity, codex_cli, eco, refresh_backoff, gpt_windows, speech, connectors, notifications, oauth_credential, oauth_login, openai_bridge, openai_credential, openai_models, openai_observation, openai_translate, project_attribution, project_usage, runtime_state, secret_store, usage_history, usage_probe, usage_tracking
 from . import profiles as profile_repo
 from .config import Pool, Profile, load_pool
 from .observation import AuthInvalid, BudgetUnavailable, ModelWindow, ProviderUnavailable, QuotaExhausted, ShortRateLimit, Unknown, UsageSnapshot, classify
@@ -771,7 +771,7 @@ class Gateway:
     # Each further consecutive rate-limited refresh doubles the wait, up to
     # this ceiling. A flat interval never lets a persistently rate-limited
     # endpoint recover: it just keeps arriving at the same rate forever.
-    _RATE_LIMIT_BACKOFF_CEILING_SECONDS = 6 * 60 * 60.0
+    _RATE_LIMIT_BACKOFF_CEILING_SECONDS = refresh_backoff.SLOW_CEILING_SECONDS
     # After this many consecutive rate-limited refreshes, say so once — the
     # endpoint has been refusing for hours and a re-authentication is probably
     # needed. It does NOT stop trying.
@@ -818,6 +818,15 @@ class Gateway:
         # it is mutable cross-request state with a clock and a lock — exactly
         # what that module's purity contract excludes.
         self._branch_pins: dict[tuple, BranchPin] = {}
+        # The `codex` CLI path (handle_codex_cli) keeps its own routing state,
+        # never the shared pointer above: a codex session changing accounts
+        # must not move Claude Code's rotation, nor the other way round. Both
+        # read the same usage, so an account one of them used up is skipped by
+        # the other.
+        #   pins: codex thread id -> the account serving that conversation.
+        #   current: where a conversation with no pin starts.
+        self._codex_cli_pins: dict[str, str] = {}
+        self._codex_cli_current_id: Optional[str] = None
         self._branch_move_notified_at: dict[str, float] = {}
         # Epoch seconds of each Profile's last usage reading, from any source
         # (real traffic or usage_probe) — so a background check can skip an
@@ -896,6 +905,9 @@ class Gateway:
         # Consecutive rate-limited refreshes per Profile, driving the
         # escalating backoff and the give-up threshold above.
         self._refresh_rate_limited_streak: dict[str, int] = {}
+        # Consecutive non-429 refresh failures per Profile (a rejected grant,
+        # a 5xx, a network error). These escalate too — see refresh_backoff.
+        self._refresh_failure_streak: dict[str, int] = {}
         # Guards the check-then-act on the two dicts above, and marks which
         # Profiles have a refresh in flight. Its own lock, not self._lock:
         # _maybe_refresh_credential runs OUTSIDE self._lock (the request path)
@@ -955,7 +967,7 @@ class Gateway:
                 # check at the end of this branch, or a later recovery poll for
                 # an AUTH_INVALID Profile) — otherwise a rate-limited account
                 # re-pokes the token endpoint the instant the daemon comes back.
-                self._restore_refresh_backoff(p.id, persisted, now_utc)
+                self._restore_refresh_backoff(p.id, persisted, now_utc, kind=p.kind)
                 restored = {
                     **_restorable_usage_fields(persisted, now=now_utc),
                     **_restorable_state_fields(persisted, now=now_utc),
@@ -995,8 +1007,10 @@ class Gateway:
                     # re-authenticated Profile is retried immediately rather
                     # than waiting out a window earned by the old token.
                     self._refresh_rate_limited_streak.pop(p.id, None)
+                    self._refresh_failure_streak.pop(p.id, None)
                     self._refresh_check_not_before.pop(p.id, None)
                     self._credential_check_not_before.pop(p.id, None)
+                    openai_bridge.forget_refresh_backoff(p.id)
                 if not p.enabled:
                     new_state = ProfileState.DISABLED
                 elif rt.state == ProfileState.DISABLED and p.enabled:
@@ -1726,10 +1740,18 @@ class Gateway:
         try:
             refreshed = self._try_refresh(
                 p.id, cred.refresh_token,
-                cooldown=self._REAUTH_RECOVERY_COOLDOWN_SECONDS if was_auth_invalid else None)
+                cooldown=self._REAUTH_RECOVERY_COOLDOWN_SECONDS if was_auth_invalid else None,
+                profile_name=p.name,
+                # Already announced as needing re-auth when its 401 landed.
+                notify_on_rejection=not was_auth_invalid)
         except oauth_login.OAuthLoginError as exc:
-            if was_auth_invalid:
-                activity.record("error", f"{p.name} — automatic recovery attempt failed", meta=str(exc)[:200])
+            # _try_refresh has logged it and set the backoff. A refused grant
+            # on an access token that has ALREADY expired cannot serve again:
+            # say so now rather than on the next request's 401. One that still
+            # has time left keeps serving until it actually fails.
+            if (not was_auth_invalid and refresh_backoff.is_rejection(exc.status_code)
+                    and cred.expires_at is not None and time.time() * 1000 >= cred.expires_at):
+                return ProfileState.AUTH_INVALID
             return None
         if refreshed is None:
             return None  # still within the shared backoff window — not due yet
@@ -1782,13 +1804,21 @@ class Gateway:
         if not was_auth_invalid and not openai_credential.is_expiring_soon(cred.access_token):
             return None
         try:
-            refreshed = openai_bridge.refresh_now(p.id, cred)
+            refreshed = openai_bridge.refresh_now(
+                p.id, cred, profile_name=p.name,
+                cooldown=self._REAUTH_RECOVERY_COOLDOWN_SECONDS if was_auth_invalid else None)
         except Exception:
             refreshed = None
         if refreshed is None:
             # Throttled, or a genuinely dead refresh_token. Either way this
             # never fakes a recovery — a revoked grant correctly stays
-            # AUTH_INVALID until the person re-authenticates.
+            # AUTH_INVALID until the person re-authenticates. A refused grant
+            # on an access token already past its expiry is AUTH_INVALID now,
+            # exactly as on the oauth path; one with time left keeps serving.
+            expires_at = openai_credential.access_token_expires_at(cred.access_token)
+            if (not was_auth_invalid and openai_bridge.refresh_was_rejected(p.id)
+                    and expires_at is not None and time.time() >= expires_at):
+                return ProfileState.AUTH_INVALID
             return None
         if was_auth_invalid:
             activity.record("rotation", f"{p.name} — token refreshed automatically, back online")
@@ -1887,6 +1917,16 @@ class Gateway:
             elif not near_threshold:
                 self._warned_approaching.discard(profile.id)
 
+        if isinstance(observation, BudgetUnavailable):
+            # Same as the Anthropic path: one-hour billing cooldown, and an
+            # unpinned request moves to the next account.
+            activity.record("error", f"{profile.name} — provider requires funding (HTTP 402)",
+                            meta="billing cooldown for one hour")
+            if forced_profile_id is None:
+                with self._lock:
+                    self._mark_profile_idle(profile.id)
+                return None
+
         if isinstance(observation, QuotaExhausted):
             if forced_profile_id is not None:
                 activity.record("rotation", f"{profile.name} hit its quota",
@@ -1967,6 +2007,314 @@ class Gateway:
         return GatewayResult(status=result.status, headers=client_headers, body_chunks=body_chunks,
                               profile_id=profile.id)
 
+    # ---- the `codex` CLI, served from the pool (issue #7) -------------------
+
+    _CODEX_CLI_PIN_CAP = 512
+
+    @staticmethod
+    def _codex_cli_result(status: int, payload: bytes, headers: Optional[dict] = None) -> "GatewayResult":
+        return GatewayResult(status=status, headers={"content-type": "application/json", **(headers or {})},
+                              body_chunks=iter([payload]), profile_id=None)
+
+    @staticmethod
+    def _codex_cli_candidate_ids(pool: Pool) -> set:
+        """Only ChatGPT-subscription Codex accounts can serve the codex CLI
+        without translation: Claude accounts would need the reverse of the
+        bridge, and an OpenAI API key talks to a different backend."""
+        return {p.id for p in pool.profiles
+                if p.enabled and p.kind == "codex" and p.auth_mode == "chatgpt_subscription"}
+
+    def _codex_cli_decision(self, pool: Pool, snapshot: PoolSnapshot, now: datetime, thread: Optional[str],
+                            attempted: set, forced_profile_id: Optional[str]) -> RoutingDecision:
+        """Caller holds self._lock. A conversation stays on the account it is
+        pinned to while that account can serve; otherwise router.choose() over
+        the Codex accounts alone, sticky on this path's own pointer."""
+        candidates = self._codex_cli_candidate_ids(pool)
+        if forced_profile_id is not None:
+            if forced_profile_id not in candidates:
+                return RoutingDecision(profile_id=None, reason="forced_profile_not_chatgpt")
+            return self._forced_decision(pool, forced_profile_id, now)
+        runtimes = [rt for rt in snapshot.profiles if rt.profile_id in candidates and rt.profile_id not in attempted]
+        pinned = self._codex_cli_pins.get(thread) if thread else None
+        start = pinned if pinned in {rt.profile_id for rt in runtimes} else self._codex_cli_current_id
+        return choose(PoolSnapshot(profiles=runtimes, current_profile_id=start), now)
+
+    def _codex_cli_unavailable(self, pool: Pool, snapshot: PoolSnapshot, reason: str,
+                               forced_profile_id: Optional[str]) -> "GatewayResult":
+        """Why nothing can serve, in the shape codex acts on: out of capacity
+        is its own usage-limit error (it prints when to try again and does
+        not retry); anything the user has to fix is a 400, shown as is."""
+        if forced_profile_id is not None:
+            name = self._profile_name(pool, forced_profile_id)
+            why = {"forced_profile_not_chatgpt": "is not a ChatGPT-subscription account, so it cannot serve codex",
+                   "forced_profile_missing": "no longer exists",
+                   "forced_profile_disabled": "is disabled",
+                   "forced_profile_needs_reauth": "needs re-authentication — run `claude-unlimited add-codex-account`",
+                   "forced_profile_credential_unreadable": "has a stored credential that could not be read "
+                                                           "(is the OS keystore locked?)",
+                   }.get(reason, f"cannot serve right now ({reason})")
+            activity.record("error", "codex CLI: pinned profile unavailable — request rejected",
+                             meta=f"{name}: {reason}")
+            return self._codex_cli_result(400, codex_cli.error_body(f"The pinned profile {name} {why}."))
+        candidates = self._codex_cli_candidate_ids(pool)
+        if not candidates:
+            return self._codex_cli_result(400, codex_cli.error_body(
+                "No enabled ChatGPT-subscription account in the pool can serve codex. "
+                "Add one with `claude-unlimited add-codex-account`, or enable one in the Dashboard."))
+        ours = PoolSnapshot(profiles=[rt for rt in snapshot.profiles if rt.profile_id in candidates],
+                            current_profile_id=None)
+        exhausted, resets_at = _capacity_exhaustion(ours, pool)
+        if exhausted:
+            headers = {}
+            if resets_at is not None:
+                wait = int((resets_at - datetime.now(timezone.utc)).total_seconds())
+                if wait > 0:
+                    headers["retry-after"] = str(wait)
+            activity.record("error", "codex CLI: every ChatGPT account is out of capacity — request rejected")
+            return self._codex_cli_result(429, codex_cli.usage_limit_body(
+                resets_at, "Every ChatGPT account in the pool has reached its limit."), headers)
+        return self._codex_cli_result(400, codex_cli.error_body(
+            "No ChatGPT account in the pool can serve right now — check the Dashboard "
+            "(an account may need re-authentication: `claude-unlimited add-codex-account`)."))
+
+    def handle_codex_cli(self, headers: dict, body: bytes,
+                         forced_profile_id: Optional[str] = None) -> "GatewayResult":
+        """One request from the official `codex` CLI (POST /codex/v1/responses),
+        relayed to the ChatGPT Codex backend on a pool account — see
+        codex_cli.py for the wire rules.
+
+        All failover happens HERE, before the first byte goes back: codex
+        never retries a 429 itself, so an account running out has to be
+        absorbed by moving the same request to the next account. Once the
+        stream has started it is relayed as is; a failure after that is the
+        provider's, reported, never retried on another account.
+
+        None of the Claude Code path runs here — no ECO, speech, capacity
+        guard, model mapping or parity — the body is codex's own and goes
+        out unchanged, except that a conversation moving to a different
+        account loses the reasoning ciphertext the previous one minted."""
+        now = datetime.now(timezone.utc)
+        pool = load_pool()
+        if not pool.settings.codex_cli_serving:
+            return self._codex_cli_result(400, codex_cli.error_body(
+                "Serving the codex CLI is turned off. Turn it on in the Dashboard: "
+                "Settings → Routing → Codex CLI."))
+        encoding = {k.lower(): v for k, v in headers.items()}.get("content-encoding", "identity")
+        if encoding.lower() not in ("", "identity"):
+            return self._codex_cli_result(400, codex_cli.error_body(
+                f"Compressed request bodies ({encoding}) are not supported — start codex with "
+                "`claude-unlimited codex`."))
+        try:
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                raise ValueError
+        except ValueError:
+            return self._codex_cli_result(400, codex_cli.error_body("The request body is not a JSON object."))
+
+        thread = codex_cli.thread_key(parsed, headers)
+        requested_model = parsed.get("model") if isinstance(parsed.get("model"), str) else None
+        attempted: set = set()
+        for _ in range(MAX_ROTATION_ATTEMPTS):
+            with self._lock:
+                pool = load_pool()
+                snapshot = self._sync_snapshot(pool)
+                snapshot = recover_expired_cooldowns(snapshot, now)
+                self._runtime = {rt.profile_id: rt for rt in snapshot.profiles}
+                decision = self._codex_cli_decision(pool, snapshot, now, thread, attempted, forced_profile_id)
+                previous_for_thread = self._codex_cli_pins.get(thread) if thread else None
+            if decision.profile_id is None or decision.profile_id in attempted:
+                return self._codex_cli_unavailable(pool, snapshot, decision.reason, forced_profile_id)
+            profile = pool.get(decision.profile_id)
+            attempted.add(profile.id)
+            try:
+                check_request_size(profile, body)
+            except RequestTooLarge as exc:
+                # The request's own fault, the same on every account: 413, not
+                # a rotation and never a 5xx (codex retries those).
+                activity.record("error", "codex CLI: request too large — rejected", meta=str(exc))
+                return self._codex_cli_result(REQUEST_TOO_LARGE_STATUS, codex_cli.error_body(
+                    f"The request is too large for the Codex backend ({exc}).", error_type="request_too_large"))
+
+            try:
+                cred = openai_credential.decode(secret_store.get_token(profile.id))
+            except Exception:
+                with self._lock:   # a locked keystore is transient, not this account's quota
+                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                if forced_profile_id is not None:
+                    return self._codex_cli_unavailable(pool, snapshot, "forced_profile_credential_unreadable",
+                                                       forced_profile_id)
+                continue
+            cred = openai_bridge._refresh_if_needed(profile, cred)
+
+            moved = previous_for_thread is not None and previous_for_thread != profile.id
+            payload, dropped = (codex_cli.strip_account_bound(parsed) if moved else (body, 0))
+            with self._lock:
+                self._in_flight.add(profile.id)
+                self._in_flight_since.setdefault(profile.id, time.monotonic())
+            conn = None
+            raw = b""
+            try:
+                status, resp_headers, resp, conn = codex_cli.send(
+                    cred, payload, codex_cli.outbound_headers(headers, cred, len(payload), keep_turn_state=not moved))
+                if (status == 400 and not moved and codex_cli.has_account_bound_items(parsed)):
+                    # A conversation this daemon has not seen before (resumed
+                    # after a restart, or begun on the user's own login) may
+                    # carry another account's ciphertext. Retry once without it.
+                    text = resp.read().decode("utf-8", errors="replace")
+                    conn.close()
+                    if not codex_cli.looks_like_refused_ciphertext(status, text):
+                        return self._codex_cli_finish_error(profile, status, resp_headers, text.encode("utf-8"))
+                    payload, dropped = codex_cli.strip_account_bound(parsed)
+                    moved = True
+                    status, resp_headers, resp, conn = codex_cli.send(
+                        cred, payload, codex_cli.outbound_headers(headers, cred, len(payload), keep_turn_state=False))
+                if status >= 400:
+                    raw = resp.read()
+                    conn.close()
+            except (openai_bridge.OpenAIBridgeError, OSError, http.client.HTTPException) as exc:
+                # An error body cut short is as much a failed request as a
+                # failed connect: free the account and move on.
+                if conn is not None:
+                    conn.close()
+                with self._lock:
+                    self._mark_profile_idle(profile.id)
+                    self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                activity.record("error", f"codex CLI: {profile.name} — could not reach OpenAI", meta=str(exc)[:200])
+                if forced_profile_id is not None:
+                    # 400, not 503: codex retries any 5xx ~30 times in 24s,
+                    # each one another failing connect. A pinned session has
+                    # nowhere else to go, so say so once.
+                    return self._codex_cli_result(400, codex_cli.error_body(
+                        f"Could not reach OpenAI: {exc}", error_type="invalid_request_error"))
+                continue
+
+            filtered = _filter_openai_headers(resp_headers)
+            observation = openai_observation.classify(status, filtered, now)
+            if status == 429:
+                # The headers may not say when the window reopens; codex's own
+                # usage-limit body does.
+                resets_at = codex_cli.usage_limit_resets_at(raw)
+                if resets_at is not None and getattr(observation, "resets_at", None) is None:
+                    observation = QuotaExhausted(resets_at=resets_at)
+            credits = openai_observation.parse_credits(filtered)
+            old_state = self._runtime[profile.id].state if profile.id in self._runtime else None
+            with self._lock:
+                if credits is not None:
+                    self._record_credits(profile.id, credits)
+                self._observe(profile.id, observation, now)
+            self._maybe_request_usage_recheck(profile.id, observation)
+            self._persist()
+            if isinstance(observation, AuthInvalid) and old_state != ProfileState.AUTH_INVALID:
+                activity.record("error", f"{profile.name} needs re-authentication", meta="credential rejected")
+                notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
+                                                  f"{profile.name} needs re-authentication.", pool.settings)
+
+            if status >= 400:
+                if forced_profile_id is None and (status in (401, 402, 403, 429) or status >= 500):
+                    with self._lock:
+                        self._mark_profile_idle(profile.id)
+                    activity.record("rotation", f"codex CLI: {profile.name} answered {status}",
+                                     meta="moving the request to the next ChatGPT account")
+                    continue
+                return self._codex_cli_finish_error(profile, status, resp_headers, raw)
+
+            # Served. Pin the conversation, move this path's pointer, and say so
+            # when either one changed account.
+            with self._lock:
+                previous_current = self._codex_cli_current_id
+                if forced_profile_id is None:
+                    self._codex_cli_current_id = profile.id
+                if thread:
+                    self._codex_cli_pins.pop(thread, None)
+                    self._codex_cli_pins[thread] = profile.id
+                    while len(self._codex_cli_pins) > self._CODEX_CLI_PIN_CAP:
+                        self._codex_cli_pins.pop(next(iter(self._codex_cli_pins)))
+            if moved:
+                activity.record("rotation",
+                                f"codex CLI: conversation moved {self._profile_name(pool, previous_for_thread)}"
+                                f" → {profile.name}" if previous_for_thread else
+                                f"codex CLI: conversation continued on {profile.name}",
+                                meta=f"dropped {dropped} reasoning item(s) only the previous account can read")
+            elif (forced_profile_id is None and previous_current is not None
+                  and previous_current != profile.id and previous_for_thread is None):
+                activity.record("rotation", f"codex CLI: rotated {self._profile_name(pool, previous_current)}"
+                                            f" → {profile.name}")
+                notifications.notify_if_enabled("rotated", "Claude Unlimited",
+                                                  f"codex CLI rotated to {profile.name}.", pool.settings)
+
+            tee = codex_cli.UsageTee()
+            quota_5h = _codex_5h_percent(resp_headers)
+
+            def recorded(chunks, profile_id=profile.id):
+                try:
+                    yield from tee.wrap(chunks)
+                finally:
+                    if tee.usage:
+                        try:
+                            usage_history.record(profile_id, None, tee.model or requested_model, tee.usage,
+                                                 requested_model=requested_model,
+                                                 quota_5h_percent=quota_5h)
+                        except Exception:
+                            pass  # best-effort, never affects the response
+
+            chunks = self._wrap_with_in_flight_clear(recorded(codex_cli.relay(resp, conn)), profile.id)
+            return GatewayResult(status=status, headers=codex_cli.client_response_headers(resp_headers),
+                                  body_chunks=chunks, profile_id=profile.id)
+
+        with self._lock:
+            snapshot = PoolSnapshot(profiles=list(self._runtime.values()), current_profile_id=None)
+        return self._codex_cli_unavailable(load_pool(), snapshot, "rotation_attempts_exhausted", None)
+
+    def handle_codex_cli_models(self, headers: dict, query: str,
+                                forced_profile_id: Optional[str] = None) -> "GatewayResult":
+        """GET /codex/v1/models: codex refreshes its model catalogue from the
+        provider at startup (0.149 does it for a custom provider too). Relayed
+        from one ChatGPT account — the list is the plan's, not the account's —
+        so the picker and model metadata match what the user's own login sees.
+        Anything that goes wrong is a 404, on which codex keeps its bundled
+        list; this never affects routing state."""
+        not_found = self._codex_cli_result(404, codex_cli.error_body("No model catalogue available."))
+        pool = load_pool()
+        if not pool.settings.codex_cli_serving:
+            return not_found
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            snapshot = self._sync_snapshot(pool)
+            decision = self._codex_cli_decision(pool, snapshot, now, None, set(), forced_profile_id)
+        if decision.profile_id is None:
+            return not_found
+        profile = pool.get(decision.profile_id)
+        try:
+            cred = openai_bridge._refresh_if_needed(
+                profile, openai_credential.decode(secret_store.get_token(profile.id)))
+            status, resp_headers, resp, conn = codex_cli.send(
+                cred, None, codex_cli.outbound_headers(headers, cred, None, keep_turn_state=False),
+                timeout=15, method="GET", path="/models" + (f"?{query}" if query else ""))
+            raw = resp.read()
+            conn.close()
+        except Exception as exc:  # noqa: BLE001 - a catalogue is optional
+            activity.record("error", f"codex CLI: could not fetch the model list from {profile.name}",
+                             meta=str(exc)[:200])
+            return not_found
+        if status not in (200, 304):
+            return not_found
+        out = codex_cli.client_response_headers(resp_headers)
+        out["content-type"] = "application/json"
+        return GatewayResult(status=status, headers=out, body_chunks=iter([raw]), profile_id=profile.id)
+
+    def _codex_cli_finish_error(self, profile: Profile, status: int, resp_headers: dict,
+                                raw: bytes) -> "GatewayResult":
+        """An upstream error that is the request's own (a 400 for a bad body,
+        say): returned to codex exactly as the backend sent it."""
+        with self._lock:
+            self._mark_profile_idle(profile.id)
+        activity.record("error", f"codex CLI: {profile.name} answered {status}",
+                         meta=raw.decode("utf-8", errors="replace")[:200])
+        headers = codex_cli.client_response_headers(resp_headers)
+        headers["content-type"] = {k.lower(): v for k, v in resp_headers.items()}.get(
+            "content-type", "application/json")
+        return GatewayResult(status=status, headers=headers, body_chunks=iter([raw]), profile_id=profile.id)
+
     @staticmethod
     def _models_listing_response(profile: Profile, path: str, listing: list) -> "GatewayResult":
         """Anthropic's own /v1/models wire shape, answered locally for a
@@ -2022,7 +2370,7 @@ class Gateway:
                               body_chunks=iter([payload]), profile_id=profile.id)
 
     def _restore_refresh_backoff(self, profile_id: str, persisted: Optional[dict],
-                                  now_utc: datetime) -> None:
+                                  now_utc: datetime, kind: str = "oauth") -> None:
         """Carry a rate-limit refresh backoff across a restart. The needs-re-auth
         STATE already survives a restart (see _restorable_state_fields); the
         "backed off — don't re-poke the token endpoint until T" timer did not,
@@ -2038,12 +2386,31 @@ class Gateway:
         exactly like a first run."""
         if not persisted:
             return
+        if kind == "codex":
+            # A Codex Profile's clock lives in openai_bridge, not here; same
+            # fields, same wall-clock conversion, restored into that module.
+            rl = persisted.get("refresh_rate_limited_streak")
+            fl = persisted.get("refresh_failure_streak")
+            rl = rl if isinstance(rl, int) and not isinstance(rl, bool) and rl > 0 else 0
+            fl = fl if isinstance(fl, int) and not isinstance(fl, bool) and fl > 0 else 0
+            remaining = None
+            raw = persisted.get("refresh_backoff_until")
+            if isinstance(raw, str) and raw:
+                try:
+                    remaining = (datetime.fromisoformat(raw) - now_utc).total_seconds()
+                except (ValueError, TypeError):
+                    remaining = None
+            openai_bridge.restore_refresh_backoff(profile_id, remaining, rl, fl)
+            return
         streak = persisted.get("refresh_rate_limited_streak")
         if isinstance(streak, int) and streak > 0:
             # Restore the streak even when the deadline has already elapsed, so
             # the NEXT rate-limited refresh keeps escalating from where it left
             # off rather than restarting the backoff at its base interval.
             self._refresh_rate_limited_streak[profile_id] = streak
+        failures = persisted.get("refresh_failure_streak")   # absent in older state files
+        if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
+            self._refresh_failure_streak[profile_id] = failures
         raw = persisted.get("refresh_backoff_until")
         if isinstance(raw, str) and raw:
             try:
@@ -2066,7 +2433,9 @@ class Gateway:
         return not_before is None or time.monotonic() >= not_before
 
     def _try_refresh(self, profile_id: str, refresh_token: str, *,
-                      cooldown: Optional[float] = None) -> Optional["oauth_login.LoginTokens"]:
+                      cooldown: Optional[float] = None,
+                      profile_name: Optional[str] = None,
+                      notify_on_rejection: bool = True) -> Optional["oauth_login.LoginTokens"]:
         """The ONE place that actually calls oauth_login.refresh_access_token
         — shared by _maybe_refresh_credential (the per-request path, called
         from inside handle() for whichever Profile choose() just picked) and
@@ -2082,7 +2451,11 @@ class Gateway:
         backoff window — that is a normal, silent "not due yet" outcome,
         never logged as a failure by either caller. Raises
         oauth_login.OAuthLoginError, unchanged, for a real (non-throttled)
-        failure so each caller can decide how to log/react to that."""
+        failure — already logged here, and already backed off.
+
+        EVERY failure escalates the wait, not only a 429 (issue #10): a grant
+        that died while the account sat idle used to be retried on the plain
+        60s cooldown forever, silently. See refresh_backoff."""
         now = time.monotonic()
         # Claim the slot atomically. Anthropic ROTATES the refresh token on
         # use, so two threads refreshing the same Profile at once send the same
@@ -2125,12 +2498,40 @@ class Gateway:
                         meta=(f"{profile_id}: {streak} times in a row. Still retrying, now every "
                               f"{int(self._RATE_LIMIT_BACKOFF_CEILING_SECONDS // 3600)}h — "
                               "`claude-unlimited reauth` recovers it immediately."))
+            else:
+                self._note_refresh_failure(profile_id, exc, now, cooldown, profile_name,
+                                           notify_on_rejection)
             raise
         finally:
             with self._refresh_lock:
                 self._refresh_in_progress.discard(profile_id)
         self._refresh_rate_limited_streak.pop(profile_id, None)
+        self._refresh_failure_streak.pop(profile_id, None)
         return tokens
+
+    def _note_refresh_failure(self, profile_id: str, exc: "oauth_login.OAuthLoginError", now: float,
+                              cooldown: Optional[float], profile_name: Optional[str],
+                              notify_on_rejection: bool) -> None:
+        """A non-429 refresh failure: escalate the backoff, log it, and — the
+        first time the endpoint rejects the grant outright — tell the person,
+        since the access token will stop working when it expires."""
+        streak = self._refresh_failure_streak.get(profile_id, 0) + 1
+        self._refresh_failure_streak[profile_id] = streak
+        base = cooldown if cooldown is not None else self._REFRESH_CHECK_COOLDOWN_SECONDS
+        wait = refresh_backoff.failure_wait(exc.status_code, streak, base, self._RATE_LIMIT_BACKOFF_SECONDS)
+        self._refresh_check_not_before[profile_id] = now + wait
+        name = profile_name or profile_id
+        if refresh_backoff.worth_logging(streak):
+            activity.record("error", f"{name} — token refresh failed",
+                             meta=f"{refresh_backoff.describe(exc.status_code, streak, wait)} ({str(exc)[:160]})")
+        if streak == 1 and notify_on_rejection and refresh_backoff.is_rejection(exc.status_code):
+            try:
+                notifications.notify_if_enabled(
+                    "needs_attention", "Claude Unlimited",
+                    f"{name}: renewing its sign-in was refused — run `claude-unlimited reauth`.",
+                    load_pool().settings)
+            except Exception:
+                pass   # a notification must never break a refresh path
 
     def _maybe_refresh_credential(self, profile: Profile, stored: str) -> str:
         """Proactively refreshes an OAuth Profile's access token before it's
@@ -2159,15 +2560,10 @@ class Gateway:
         if not cred.refresh_token or not oauth_credential.is_expiring_soon(cred):
             return cred.access_token
         try:
-            refreshed = self._try_refresh(profile.id, cred.refresh_token)
-        except oauth_login.OAuthLoginError as exc:
-            # Previously silent — a Profile could sit here failing to
-            # refresh every single request with zero trace anywhere,
-            # indistinguishable from "nothing tried." Now visible in
-            # Activity so it is visible rather than inferred from
-            # request timing again.
-            activity.record("error", f"{profile.name} — proactive token refresh failed",
-                             meta=str(exc)[:200])
+            refreshed = self._try_refresh(profile.id, cred.refresh_token, profile_name=profile.name)
+        except oauth_login.OAuthLoginError:
+            # _try_refresh has already recorded it in Activity (it used to be
+            # silent here, indistinguishable from "nothing tried").
             return cred.access_token
         if refreshed is None:
             return cred.access_token  # still within the shared backoff window — not due yet
@@ -2466,12 +2862,18 @@ class Gateway:
             backoff: dict[str, tuple] = {}
             for pid in self._runtime:
                 streak = self._refresh_rate_limited_streak.get(pid, 0)
+                failures = self._refresh_failure_streak.get(pid, 0)
                 until = None
-                if streak > 0:
+                if streak > 0 or failures > 0:
                     not_before = self._refresh_check_not_before.get(pid)
                     if not_before is not None and not_before - now_monotonic > 0:
                         until = (now_utc + timedelta(seconds=not_before - now_monotonic)).isoformat()
-                backoff[pid] = (until, streak if streak > 0 else None)
+                if not (streak > 0 or failures > 0):
+                    # A Codex Profile keeps its clock in openai_bridge.
+                    remaining, streak, failures = openai_bridge.export_refresh_backoff(pid, now_monotonic)
+                    if remaining is not None:
+                        until = (now_utc + timedelta(seconds=remaining)).isoformat()
+                backoff[pid] = (until, streak if streak > 0 else None, failures if failures > 0 else None)
             profiles = {
                 pid: {
                     "last_usage_percent": rt.last_usage_percent,
@@ -2497,6 +2899,9 @@ class Gateway:
                     # restarts.
                     "refresh_backoff_until": backoff[pid][0],
                     "refresh_rate_limited_streak": backoff[pid][1],
+                    # A rejected grant's escalation (issue #10), so a restart
+                    # does not drop it back to the first step.
+                    "refresh_failure_streak": backoff[pid][2],
                     "credits_has": rt.credits_has,
                     "credits_balance": rt.credits_balance,
                 }
@@ -3116,6 +3521,20 @@ class Gateway:
                     recovered = self._maybe_check_codex_credential(p, rt)
             except Exception:
                 recovered = None   # a credential check must never break a poll
+            if recovered == ProfileState.AUTH_INVALID:
+                with self._lock:
+                    if p.id not in self._runtime:
+                        # The very first poll schedules this before it has
+                        # built the runtime; build it, or the mark is lost
+                        # behind the rejected grant's long backoff.
+                        self._runtime = {rt.profile_id: rt for rt in self._sync_snapshot(pool).profiles}
+                    current = self._runtime.get(p.id)
+                    if current is not None and current.state not in (ProfileState.AUTH_INVALID,
+                                                                      ProfileState.DISABLED):
+                        self._runtime[p.id] = _replace_runtime(current, state=ProfileState.AUTH_INVALID)
+                        activity.record("error", f"{p.name} needs re-authentication",
+                                         meta="its sign-in renewal was refused and the access token has expired")
+                continue
             if recovered != ProfileState.ELIGIBLE:
                 continue
             with self._lock:

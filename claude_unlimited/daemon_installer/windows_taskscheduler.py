@@ -87,11 +87,27 @@ def install(port: int) -> None:
 
 
 def uninstall() -> None:
+    """Raises DaemonInstallerError if the task is still registered afterwards.
+
+    Not being registered at all is fine and silent. A failed delete is not:
+    a task registered from an elevated shell refuses a non-elevated
+    `/delete` with "Access is denied", and ignoring that return code made
+    `purge` report the service deregistered while the task kept launching a
+    removed install at every logon (issue #11)."""
     try:
         stop()
     except DaemonInstallerError:
         pass
-    _run("schtasks", "/delete", "/tn", TASK_NAME, "/f")  # ignore failure: fine if it wasn't registered
+    if not is_installed():
+        return
+    result = _run("schtasks", "/delete", "/tn", TASK_NAME, "/f")
+    if result.returncode != 0 and is_installed():
+        detail = (result.stderr or result.stdout or "").strip()
+        raise DaemonInstallerError(
+            f"could not delete the scheduled task {TASK_NAME}"
+            + (f": {detail}" if detail else "")
+            + f". It was probably registered from an elevated shell — run this from an "
+              f"Administrator terminal: schtasks /delete /tn {TASK_NAME} /f")
 
 
 def is_installed() -> bool:

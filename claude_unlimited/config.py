@@ -76,7 +76,7 @@ class Profile:
     token_threshold: Optional[int] = None  # api kind only, optional: lifetime cumulative tokens at which Rotation stops picking this Profile. The api-kind analogue of switch_threshold, since an API key has no session-percentage window to measure against.
     tag_color: Optional[str] = None  # cosmetic only
     account_uuid: Optional[str] = None  # oauth kind only: the account identity Anthropic expects in the request body
-    plan: Optional[str] = None  # oauth kind only: "max" | "pro" | None (not yet detected), from anthropic_oauth.fetch_account_profile
+    plan: Optional[str] = None  # oauth kind only: "max" | "pro" | "ultra" (neither Max nor Pro flag set, see anthropic_oauth.plan_from_account) | None (not yet detected), from anthropic_oauth.fetch_account_profile
     credential_updated_at: Optional[str] = None  # ISO timestamp bumped by profiles.update_credential(), so the live Gateway can notice a re-auth and clear a stuck AUTH_INVALID state
     claude_config_dir: Optional[str] = None  # oauth kind only: an isolated CLAUDE_CONFIG_DIR this Profile was authenticated under via `claude-unlimited add-account`, so it can be re-authenticated without touching another account's session. None for a Profile added by paste or "Import current login".
     codex_home: Optional[str] = None  # codex kind only: an isolated CODEX_HOME holding this Profile's auth.json, the counterpart of claude_config_dir. Every Codex invocation is scoped to it, so it never touches another Codex login on this machine.
@@ -178,6 +178,13 @@ class Settings:
     # would move live agents — so the return only ever happens on a pool that
     # has been idle long enough for that to cost nothing.
     return_to_preferred: bool = False
+    # Serve the official `codex` CLI from the pool's ChatGPT accounts
+    # (`claude-unlimited codex`, issue #7). OFF by default, and the toggle
+    # carries the OpenAI terms warning: rotating accounts to keep going past
+    # one account's limit is close to what those terms forbid, so it has to be
+    # a deliberate choice. While off, /codex/v1/* answers 400 and nothing else
+    # changes.
+    codex_cli_serving: bool = False
     # Global override for Profile.leave_on_fable_limit: while on, every Profile
     # behaves as if its own switch were on — an account whose Fable weekly
     # limit is spent hands the whole session to another account. While off,
@@ -186,7 +193,7 @@ class Settings:
     # explicit `--profile` pin or a standing Take over.
     fable_limit_all_profiles: bool = False
     # 1M context for `cu code` sessions. Claude Code budgets a native-1M model
-    # (Sonnet 5, Opus 4.7/4.8/5/5.5, Fable 5/5.1, Mythos 5/5.1) at 200K whenever
+    # (Sonnet 5/5.5, Haiku 5.5, Opus 4.7/4.8/5/5.5, Fable 5/5.1, Mythos 5/5.1) at 200K whenever
     # ANTHROPIC_BASE_URL is not api.anthropic.com, because it cannot verify that
     # whatever sits on that URL really serves 1M. For an oauth or Anthropic-API
     # route through this daemon it does — see cli.py's ASSUME_FIRST_PARTY_ENV
@@ -299,6 +306,7 @@ def load_pool() -> Pool:
         # explicit true reads as off.
         codex_spend_credits=settings_data.get("codex_spend_credits") is True,
         return_to_preferred=bool(settings_data.get("return_to_preferred", False)),
+        codex_cli_serving=settings_data.get("codex_cli_serving") is True,
         # Off by default and strict: only an explicit true turns it on. The
         # older pool-wide per-model-divert key is deliberately NOT read — it
         # meant something else (divert one model's requests, not move the
@@ -374,7 +382,7 @@ _SETTINGS_FIELDS = {
     "update_mode", "language", "notifications_enabled", "notify_update_available",
     "notify_approaching_threshold", "notify_rotated", "notify_quota_reset", "notify_needs_attention",
     "distribute_sessions_default", "keep_usage_fresh", "model_parity",
-    "eco_tier", "speech_level", "codex_spend_credits", "return_to_preferred",
+    "eco_tier", "speech_level", "codex_spend_credits", "return_to_preferred", "codex_cli_serving",
     "fable_limit_all_profiles", "context_1m",
 }
 
@@ -486,6 +494,8 @@ def validated_settings_changes(changes: dict) -> dict:
         raise ValueError("codex_spend_credits must be true or false")
     if "return_to_preferred" in changes and not isinstance(changes["return_to_preferred"], bool):
         raise ValueError("return_to_preferred must be true or false")
+    if "codex_cli_serving" in changes and not isinstance(changes["codex_cli_serving"], bool):
+        raise ValueError("codex_cli_serving must be true or false")
     if "fable_limit_all_profiles" in changes and not isinstance(changes["fable_limit_all_profiles"], bool):
         raise ValueError("fable_limit_all_profiles must be true or false")
     if "context_1m" in changes and changes["context_1m"] not in CONTEXT_1M_MODES:

@@ -310,15 +310,14 @@ from claude_unlimited import net_scope, upstream
 from claude_unlimited.proxy import UpstreamRequest
 
 
-@pytest.mark.parametrize("url", [
-    "http://localhost:11434/v1/messages",
-    "http://127.0.0.1:5566/v1/messages",
-    "http://[::1]:8080/v1/messages",
-    "http://192.168.1.50:5566/v1/messages",
-    "http://10.1.2.3:8000/v1/messages",
-    "https://api.anthropic.com/v1/messages",
+@pytest.mark.parametrize("url,allow_http", [
+    ("http://localhost:11434/v1/messages", True),
+    ("http://192.168.1.50:5566/v1/messages", True),
+    ("http://mac-mini.local:8000/v1/messages", True),     # an mDNS name
+    ("http://api.example.com/v1/messages", True),         # any host: the user's call
+    ("https://api.anthropic.com/v1/messages", False),
 ])
-def test_local_and_https_upstreams_are_allowed(url, monkeypatch):
+def test_https_always_and_http_when_the_request_allows_it(url, allow_http, monkeypatch):
     opened = {}
 
     class _Conn:
@@ -341,24 +340,143 @@ def test_local_and_https_upstreams_are_allowed(url, monkeypatch):
 
     monkeypatch.setattr(upstream.http.client, "HTTPConnection", _Conn)
     monkeypatch.setattr(upstream.http.client, "HTTPSConnection", _Conn)
-    upstream.send(UpstreamRequest(method="POST", url=url, headers={}, body=b"{}"))
+    upstream.send(UpstreamRequest(method="POST", url=url, headers={}, body=b"{}", allow_http=allow_http))
     assert opened  # it got as far as opening a connection
 
 
-@pytest.mark.parametrize("url", [
-    "http://api.example.com/v1/messages",   # a name is never local
-    "http://8.8.8.8/v1/messages",           # public address
-])
-def test_plain_http_to_a_remote_upstream_is_refused(url):
+def test_plain_http_is_refused_unless_the_request_allows_it():
+    # Only an API profile's request carries allow_http; an OAuth token never
+    # goes over plain http, whatever a hand-edited config says.
     with pytest.raises(ValueError):
-        upstream.send(UpstreamRequest(method="POST", url=url, headers={}, body=b"{}"))
+        upstream.send(UpstreamRequest(method="POST", url="http://127.0.0.1/v1/messages",
+                                      headers={}, body=b"{}"))
 
 
-def test_the_send_path_and_the_save_path_agree():
-    for url in ("http://127.0.0.1:1234", "http://192.168.1.9:8000", "https://api.anthropic.com"):
-        net_scope.validate(url)                      # saving it is fine
-        assert net_scope.is_plaintext_allowed(url) or url.startswith("https")
-    for url in ("http://api.example.com", "http://1.1.1.1"):
-        with pytest.raises(net_scope.InvalidUpstreamURL):
-            net_scope.validate(url)
-        assert not net_scope.is_plaintext_allowed(url)
+def test_only_an_api_profile_request_may_use_http():
+    from claude_unlimited.config import Profile
+    from claude_unlimited.proxy import build_upstream_request
+    api = Profile(id="a", name="A", kind="api", base_url="http://mac-mini.local:8000")
+    oauth = Profile(id="o", name="O", kind="oauth")
+    assert build_upstream_request(api, "k", "POST", "/v1/messages", {}, b"{}").allow_http is True
+    assert build_upstream_request(oauth, "t", "POST", "/v1/messages", {}, b"{}").allow_http is False
+
+
+def test_the_save_rule_depends_on_the_profile_kind():
+    for url in ("http://127.0.0.1:1234", "http://mac-mini.local:8000", "http://1.1.1.1",
+                "https://api.anthropic.com"):
+        net_scope.validate(url)                                   # API profile
+    net_scope.validate("https://api.openai.com/v1", allow_http=False)
+    with pytest.raises(net_scope.InvalidUpstreamURL):
+        net_scope.validate("http://127.0.0.1:1234", allow_http=False)   # Codex
+
+
+def test_a_dead_address_is_skipped_quickly_instead_of_eating_the_request_timeout(monkeypatch):
+    # An address that never answers (IPv6 on a server listening on IPv4
+    # only) used to hold the connect for the whole request timeout.
+    import socket
+    tried = []
+
+    class _Sock:
+        def __init__(self, family, kind, proto):
+            self.family = family
+
+        def settimeout(self, t):
+            tried.append(("timeout", self.family, t))
+
+        def bind(self, a):
+            pass
+
+        def connect(self, addr):
+            if self.family == socket.AF_INET6:
+                raise socket.timeout("timed out")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(upstream.socket, "getaddrinfo", lambda *a, **k: [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 5566, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 5566)),
+    ])
+    monkeypatch.setattr(upstream.socket, "socket", _Sock)
+    sock = upstream._connect(("mac-mini.local", 5566), 120)
+    assert sock.family == socket.AF_INET
+    assert ("timeout", socket.AF_INET6, upstream.CONNECT_TIMEOUT_SECONDS) in tried
+    assert tried[-1] == ("timeout", socket.AF_INET, 120)   # the request keeps its full timeout
+
+
+def test_every_upstream_connection_uses_the_fast_connect():
+    conn = upstream.open_connection("http", "mac-mini.local", 5566, 120)
+    assert conn._create_connection is upstream._connect
+    assert upstream.open_connection("https", "api.anthropic.com", None, 120)._create_connection is upstream._connect
+
+
+def test_ipv6_link_local_is_tried_last(monkeypatch):
+    import socket
+    order = []
+
+    class _Sock:
+        def __init__(self, family, kind, proto):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            order.append(addr[0])
+            raise OSError("refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(upstream.socket, "getaddrinfo", lambda *a, **k: [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1", 5566, 0, 14)),
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 5566, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 5566)),
+    ])
+    monkeypatch.setattr(upstream.socket, "socket", _Sock)
+    with pytest.raises(OSError):
+        upstream._connect(("mac-mini.local", 5566), 120)
+    assert order == ["2001:db8::1", "192.0.2.10", "fe80::1"]
+
+
+def test_relay_passes_each_sse_event_on_as_it_arrives():
+    # Over a real chunked response: read(CHUNK_SIZE) would wait for 64 KB, so
+    # the first small event would only arrive when the stream ended. The
+    # server holds the stream open until the relay has yielded that event.
+    import http.server
+    import threading
+
+    first_seen = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for event, wait in ((b"data: one\n\n", True), (b"data: two\n\n", False)):
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(event), event))
+                self.wfile.flush()
+                if wait:
+                    first_seen.wait(5)
+            self.wfile.write(b"0\r\n\r\n")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.handle_request, daemon=True).start()
+    try:
+        resp = upstream.send(UpstreamRequest(method="POST", url=f"http://127.0.0.1:{server.server_port}/v1/messages",
+                                             headers={}, body=b"{}", allow_http=True), timeout=5)
+        stream = iter(resp.body_chunks)
+        assert next(stream) == b"data: one\n\n"
+        first_seen.set()
+        assert b"".join(stream) == b"data: two\n\n"
+        resp.connection.close()
+    finally:
+        first_seen.set()
+        server.server_close()

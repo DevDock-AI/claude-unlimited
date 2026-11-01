@@ -7,7 +7,7 @@ import pytest
 import claude_unlimited.openai_bridge as bridge_module
 import claude_unlimited.openai_login as login_module
 from claude_unlimited.config import Profile
-from claude_unlimited import codex_state
+from claude_unlimited import codex_state, openai_models
 from claude_unlimited.openai_bridge import ConversationContext, OpenAIBridgeError, run
 from claude_unlimited.openai_credential import StoredOpenAICredential, encode
 
@@ -30,6 +30,9 @@ class FakeHTTPResponse:
         chunk = self._body[self._pos:self._pos + n]
         self._pos += len(chunk)
         return chunk
+
+    def read1(self, n):  # what the relay calls; subclasses override read()
+        return self.read(n)
 
 
 class IncompleteChunkedHTTPResponse(FakeHTTPResponse):
@@ -94,10 +97,16 @@ def _sse_body(events: list[dict]) -> bytes:
 @pytest.fixture(autouse=True)
 def reset_backoff_state():
     bridge_module._refresh_not_before.clear()
+    bridge_module._refresh_rate_limited_streak.clear()
+    bridge_module._refresh_failure_streak.clear()
+    bridge_module._refresh_rejected.clear()
     bridge_module._MODEL_SUBSTITUTIONS.clear()
     bridge_module._EFFORT_SUBSTITUTIONS.clear()
     yield
     bridge_module._refresh_not_before.clear()
+    bridge_module._refresh_rate_limited_streak.clear()
+    bridge_module._refresh_failure_streak.clear()
+    bridge_module._refresh_rejected.clear()
     bridge_module._MODEL_SUBSTITUTIONS.clear()
     bridge_module._EFFORT_SUBSTITUTIONS.clear()
 
@@ -133,7 +142,7 @@ def _sent_model(conn) -> str:
 
 def test_a_rejected_model_falls_back_to_the_next_one(monkeypatch):
     conns = _install_fake_connections(monkeypatch, [
-        _model_error("The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."),
+        _model_error("The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."),
         _ok(),
     ])
     body = json.dumps({"model": "claude-fable-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
@@ -142,13 +151,13 @@ def test_a_rejected_model_falls_back_to_the_next_one(monkeypatch):
     list(result.body_chunks)
 
     assert result.status == 200
-    assert _sent_model(conns[0]) == "gpt-5.6-sol"       # Fable's default target
-    assert _sent_model(conns[1]) == "gpt-5.6-terra"     # first rung below it
+    assert _sent_model(conns[0]) == "gpt-6.1-sol"       # Fable's default target
+    assert _sent_model(conns[1]) == "gpt-6.1-terra"     # first rung below it
 
 
 def test_a_working_substitution_is_reused_on_the_next_request(monkeypatch):
     conns = _install_fake_connections(monkeypatch, [
-        _model_error("The model `gpt-5.6-sol` does not exist."), _ok(), _ok(),
+        _model_error("The model `gpt-6.1-sol` does not exist."), _ok(), _ok(),
     ])
     body = json.dumps({"model": "claude-fable-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
@@ -159,7 +168,7 @@ def test_a_working_substitution_is_reused_on_the_next_request(monkeypatch):
     # already known to be rejected (sol) rather than pay for that failure
     # again — going straight to the learned working substitute.
     assert len(conns) == 3
-    assert _sent_model(conns[2]) == "gpt-5.6-terra"
+    assert _sent_model(conns[2]) == "gpt-6.1-terra"
 
 
 def test_a_non_model_error_is_returned_without_retrying(monkeypatch):
@@ -178,15 +187,17 @@ def test_a_non_model_error_is_returned_without_retrying(monkeypatch):
 
 def test_when_every_model_is_rejected_the_last_error_is_returned(monkeypatch):
     rejection = "model is not supported"
-    # Opus maps to gpt-5.6-terra; its full walk is terra -> luna -> astra -> sol.
-    conns = _install_fake_connections(monkeypatch, [_model_error(rejection) for _ in range(4)])
+    # Opus maps to gpt-6.1-terra; its full walk is terra, then every other
+    # rung of the ladder (luna, then wrapping to astra .. 5.6-sol).
+    rungs = len(openai_models._MODEL_LADDER)
+    conns = _install_fake_connections(monkeypatch, [_model_error(rejection) for _ in range(rungs)])
     body = json.dumps({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
     result = run(_subscription_profile(), _cred(), body)
     chunks = b"".join(result.body_chunks)
 
     assert result.status == 400
-    assert len(conns) == 4
+    assert len(conns) == rungs
     assert b"not supported" in chunks
 
 
@@ -204,7 +215,7 @@ def test_a_retired_profile_override_still_falls_back(monkeypatch):
     assert result.status == 200
     assert _sent_model(conns[0]) == "gpt-4o-legacy"
     # An off-ladder override falls back to the whole ladder, top rung first.
-    assert _sent_model(conns[1]) in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+    assert _sent_model(conns[1]) in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna")
 
 
 def test_run_sends_the_real_confirmed_subscription_endpoint_and_headers(monkeypatch):
@@ -349,7 +360,7 @@ def test_run_refuses_a_plain_http_base_url(monkeypatch):
 
 def test_run_translates_a_full_sse_stream_to_anthropic_shaped_chunks(monkeypatch):
     events = [
-        {"type": "response.created", "response": {"model": "gpt-5.6-terra"}},
+        {"type": "response.created", "response": {"model": "gpt-6.1-terra"}},
         {"type": "response.output_item.added", "item": {"type": "message"}},
         {"type": "response.output_text.delta", "delta": "Hi"},
         {"type": "response.output_item.done", "item": {"type": "message"}},
@@ -529,13 +540,13 @@ def test_a_context_length_refusal_retries_once_without_replayed_reasoning(monkey
     for, so it is the first thing to drop when the model says the prompt is
     too long — not the conversation."""
     codex_state.clear()
-    codex_state.remember_reasoning("p1", "gpt-5.6-terra", ["call:toolu_1"],
+    codex_state.remember_reasoning("p1", "gpt-6.1-terra", ["call:toolu_1"],
                                    [{"type": "reasoning", "id": "rs_1", "encrypted_content": "x" * 64}])
     responses = [
         FakeHTTPResponse(400, {"content-type": "application/json"},
                          json.dumps({"error": {"message": "Your input exceeds the maximum context length"}}).encode()),
         FakeHTTPResponse(200, {"content-type": "text/event-stream"}, _sse_body([
-            {"type": "response.created", "response": {"id": "r1", "model": "gpt-5.6-terra"}},
+            {"type": "response.created", "response": {"id": "r1", "model": "gpt-6.1-terra"}},
             {"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}},
         ])),
     ]
@@ -862,3 +873,84 @@ def test_effort_replacement_picks_the_nearest(effort, supported, expected):
 def test_other_errors_are_not_effort_refusals():
     assert bridge_module._effort_replacement(400, "model gpt-x not found", "high") is None
     assert bridge_module._effort_replacement(429, _ASTRA_MINIMAL + " reasoning.effort", "minimal") is None
+
+
+def test_every_failed_codex_refresh_escalates_and_is_logged(monkeypatch, tmp_path):
+    """Issue #10, codex side: a non-429 failure used to re-arm only the 60s
+    cooldown, silently, and a 429 never escalated past 15 minutes."""
+    _codex_test_env(monkeypatch, tmp_path)
+    cred = StoredOpenAICredential(access_token=_expired_jwt(), refresh_token="ref-old",
+                                   account_id="acct-1", id_token=None)
+    calls, logged = [], []
+
+    def fake_refresh(refresh_token):
+        calls.append(1)
+        raise login_module.OpenAILoginError("invalid_grant", status_code=400)
+
+    monkeypatch.setattr(login_module, "refresh_access_token", fake_refresh)
+    monkeypatch.setattr(bridge_module.activity, "record",
+                        lambda category, text, meta=None: logged.append(meta))
+    now = [1000.0]
+    monkeypatch.setattr(bridge_module.time, "monotonic", lambda: now[0])
+
+    waits = []
+    for _ in range(8):
+        assert bridge_module.refresh_now("p", cred, profile_name="P") is None
+        waits.append(bridge_module._refresh_not_before["p"] - now[0])
+        now[0] = bridge_module._refresh_not_before["p"] + 1
+
+    assert waits == sorted(waits) and waits[0] < waits[-1]
+    assert waits[0] >= 600 and waits[-1] <= 6 * 3600
+    assert len(logged) == 4 and "HTTP 400" in logged[0]   # 1st, 2nd, 4th, 8th
+
+
+@pytest.mark.parametrize("status, expected", [(400, 1), (401, 1), (429, 0), (503, 0)])
+def test_a_rejected_codex_refresh_tells_the_person_once(monkeypatch, tmp_path, status, expected):
+    """A refused refresh means a new login is the only fix — say so once, not
+    on every retry; a rate limit or an outage is not that."""
+    import claude_unlimited.notifications as notifications
+    _codex_test_env(monkeypatch, tmp_path)
+    cred = StoredOpenAICredential(access_token=_expired_jwt(), refresh_token="r",
+                                   account_id="acct-1", id_token=None)
+    monkeypatch.setattr(login_module, "refresh_access_token",
+                        lambda t: (_ for _ in ()).throw(login_module.OpenAILoginError("x", status_code=status)))
+    monkeypatch.setattr(bridge_module.activity, "record", lambda *a, **k: None)
+    notified = []
+    monkeypatch.setattr(notifications, "notify_if_enabled", lambda *a, **k: notified.append(a))
+    now = [1000.0]
+    monkeypatch.setattr(bridge_module.time, "monotonic", lambda: now[0])
+
+    for _ in range(4):
+        bridge_module.refresh_now("p", cred, profile_name="P")
+        now[0] = bridge_module._refresh_not_before["p"] + 1
+
+    assert len(notified) == expected
+    if expected:
+        assert notified[0][0] == "needs_attention" and "add-codex-account" in notified[0][2]
+
+
+def test_a_codex_recovery_attempt_uses_the_callers_longer_cooldown(monkeypatch, tmp_path):
+    _codex_test_env(monkeypatch, tmp_path)
+    cred = StoredOpenAICredential(access_token=_expired_jwt(), refresh_token="r",
+                                   account_id="acct-1", id_token=None)
+    monkeypatch.setattr(login_module, "refresh_access_token",
+                        lambda t: (_ for _ in ()).throw(login_module.OpenAILoginError("x", status_code=500)))
+    monkeypatch.setattr(bridge_module.activity, "record", lambda *a, **k: None)
+    now = [1000.0]
+    monkeypatch.setattr(bridge_module.time, "monotonic", lambda: now[0])
+
+    bridge_module.refresh_now("p", cred, cooldown=600.0)
+    assert bridge_module._refresh_not_before["p"] - now[0] == 600.0
+
+
+def test_a_malformed_status_line_is_a_bridge_error_not_a_crash(monkeypatch):
+    # BadStatusLine / LineTooLong are HTTPException, not OSError.
+    class GarbledConnection(FakeHTTPSConnection):
+        def getresponse(self):
+            raise http.client.BadStatusLine("garbage")
+
+    monkeypatch.setattr(bridge_module.http.client, "HTTPSConnection", GarbledConnection)
+    body = json.dumps({"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}).encode()
+    with pytest.raises(bridge_module.OpenAIBridgeError):
+        result = run(_subscription_profile(), _cred(), body)
+        list(result.body_chunks)

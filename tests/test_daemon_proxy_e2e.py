@@ -238,6 +238,16 @@ def _post(base, body, token):
         return e.code, e.read()
 
 
+def _codex_post(base, path, token, method="POST"):
+    req = urllib.request.Request(f"{base}{path}", data=b'{"model":"gpt-5.5","input":[]}' if method == "POST" else None,
+                                 method=method, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
 def _json_body(size, stream=False):
     """A valid /v1/messages JSON body of about `size` bytes, padded with text
     (as a base64 image would be)."""
@@ -274,5 +284,39 @@ def test_body_over_every_providers_limit_is_drained_and_gets_413(running_proxy_s
     from claude_unlimited.proxy import MAX_REQUEST_BYTES
     token = placeholder_token.get_or_create()
     status, raw = _post(running_proxy_server, b"x" * (MAX_REQUEST_BYTES + 1), token)
+    assert status == 413
+    assert json.loads(raw)["error"]["type"] == "request_too_large"
+
+
+def test_the_codex_cli_path_never_reaches_the_claude_code_path(running_proxy_server):
+    """Issue #7: an OpenAI body under /codex/v1 that fell through to the
+    generic proxy would be relayed to whichever Claude account is current.
+    Off by default, it is a clear 400 in OpenAI's error shape instead."""
+    daemon._gateway._transport = lambda req: (_ for _ in ()).throw(AssertionError("reached the Claude path"))
+    token = placeholder_token.get_or_create()
+    status, body = _codex_post(running_proxy_server, "/codex/v1/responses", token)
+    assert status == 400
+    assert "turned off" in json.loads(body)["error"]["message"]
+    status, body = _codex_post(running_proxy_server, "/codex/v1/models", token, method="GET")
+    assert status == 404 and "error" in json.loads(body)
+
+
+def test_the_codex_cli_path_needs_the_local_credential(running_proxy_server):
+    status, body = _codex_post(running_proxy_server, "/codex/v1/responses", "wrong")
+    assert status == 401
+    assert json.loads(body)["error"]["code"] == "invalid_api_key"
+
+
+def test_codex_cli_body_over_every_providers_limit_is_drained_and_gets_openai_413(running_proxy_server):
+    from claude_unlimited.proxy import MAX_REQUEST_BYTES
+    token = placeholder_token.get_or_create()
+    daemon._gateway.handle_codex_cli = lambda *a, **k: (_ for _ in ()).throw(AssertionError("buffered"))
+    req = urllib.request.Request(f"{running_proxy_server}/codex/v1/responses", data=b"x" * (MAX_REQUEST_BYTES + 1),
+                                 method="POST", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
     assert status == 413
     assert json.loads(raw)["error"]["type"] == "request_too_large"
