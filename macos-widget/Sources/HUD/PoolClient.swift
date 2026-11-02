@@ -18,10 +18,14 @@ struct Profile: Decodable, Identifiable, Equatable {
     let statusWord: String?
     let plan: String?
     let switchThreshold: Double?
-    let usage5hPercent: Double?
-    let usage7dPercent: Double?
-    let usage5hResetsAt: String?
-    let usage7dResetsAt: String?
+    // The daemon's `usage_5h_*` / `usage_7d_*` are really its first and
+    // second windows; `usageWindowLabel` says what the first one is. Call
+    // sites read the normalised usage5h*/usage7d* below, never these.
+    let firstWindowPercent: Double?
+    let secondWindowPercent: Double?
+    let firstWindowResetsAt: String?
+    let secondWindowResetsAt: String?
+    var usageWindowLabel: String? = nil
     let inUseNow: Bool?
     let liveAgents: Int?
     let forcedForSubagents: Bool?
@@ -59,10 +63,11 @@ struct Profile: Decodable, Identifiable, Equatable {
         case authMode = "auth_mode"
         case statusWord = "status_word"
         case switchThreshold = "switch_threshold"
-        case usage5hPercent = "usage_5h_percent"
-        case usage7dPercent = "usage_7d_percent"
-        case usage5hResetsAt = "usage_5h_resets_at"
-        case usage7dResetsAt = "usage_7d_resets_at"
+        case firstWindowPercent = "usage_5h_percent"
+        case secondWindowPercent = "usage_7d_percent"
+        case firstWindowResetsAt = "usage_5h_resets_at"
+        case secondWindowResetsAt = "usage_7d_resets_at"
+        case usageWindowLabel = "usage_window_label"
         case inUseNow = "in_use_now"
         case liveAgents = "live_agents"
         case forcedForSubagents = "forced_for_subagents"
@@ -80,6 +85,17 @@ struct Profile: Decodable, Identifiable, Equatable {
         case tokensTotal = "tokens_total"
         case tokenThreshold = "token_threshold"
     }
+
+    /// A weekly-only plan (Codex, and Claude plans with no 5-hour window)
+    /// arrives with its weekly reading in the first slot and nothing in the
+    /// second; that reading is the weekly window, not a 5-hour one.
+    private var firstWindowIsWeekly: Bool {
+        usageWindowLabel == "weekly" && secondWindowPercent == nil
+    }
+    var usage5hPercent: Double? { firstWindowIsWeekly ? nil : firstWindowPercent }
+    var usage5hResetsAt: String? { firstWindowIsWeekly ? nil : firstWindowResetsAt }
+    var usage7dPercent: Double? { firstWindowIsWeekly ? firstWindowPercent : secondWindowPercent }
+    var usage7dResetsAt: String? { firstWindowIsWeekly ? firstWindowResetsAt : secondWindowResetsAt }
 
     /// The number the dock ring shows: the window that actually governs this
     /// profile. Codex subscriptions report a weekly window and often no 5h one.

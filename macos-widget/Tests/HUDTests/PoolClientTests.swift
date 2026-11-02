@@ -243,4 +243,20 @@ final class PoolClientTests: XCTestCase {
                       "the write did not re-poll")
         XCTAssertNotNil(client.lastUpdated)
     }
+
+    /// A weekly-only plan sends its weekly reading in the first slot,
+    /// labelled "weekly"; the dock must read it as the weekly window.
+    func testAWeeklyOnlyPlanIsReadAsTheWeeklyWindow() throws {
+        let json = """
+        {"id": "a", "name": "a", "kind": "oauth", "enabled": true, "state": "eligible",
+         "usage_5h_percent": 40, "usage_5h_resets_at": "2026-11-09T00:00:00Z",
+         "usage_window_label": "weekly", "usage_7d_percent": null}
+        """
+        let p = try JSONDecoder().decode(Profile.self, from: Data(json.utf8))
+        XCTAssertEqual(p.headlineWindow, .weekly)
+        XCTAssertFalse(p.reports(.fiveHour))
+        XCTAssertEqual(p.usage7dPercent, 40)
+        XCTAssertEqual(p.usage7dResetsAt, "2026-11-09T00:00:00Z")
+        XCTAssertNil(p.usage5hPercent)
+    }
 }
