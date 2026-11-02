@@ -174,7 +174,9 @@ def anthropic_usage_headers(body) -> Optional[dict]:
     observation.classify() already understands, so a reading here lands in
     exactly the pipeline a real response does. The endpoint reports
     utilization as a percentage (46.0 means 46%); the headers carry 0-1.
-    None when the 5-hour window is missing — there is nothing to show."""
+    None when there is no readable window — nothing to show. A plan with no
+    5-hour window (`five_hour` null or absent, issue #20) is read from its
+    weekly window; a `five_hour` that is present but unreadable is not."""
     if not isinstance(body, dict):
         return None
     headers: dict = {}
@@ -193,7 +195,11 @@ def anthropic_usage_headers(body) -> Optional[dict]:
                     int(datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()))
             except ValueError:
                 pass
-    return headers if "anthropic-ratelimit-unified-5h-utilization" in headers else None
+    if "anthropic-ratelimit-unified-5h-utilization" in headers:
+        return headers
+    if body.get("five_hour") is None and "anthropic-ratelimit-unified-7d-reset" in headers:
+        return headers
+    return None
 
 
 def anthropic_model_windows(body) -> tuple:

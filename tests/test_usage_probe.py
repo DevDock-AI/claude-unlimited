@@ -59,6 +59,7 @@ def test_codex_usage_becomes_the_same_snapshot_a_real_response_gives():
 
 
 @pytest.mark.parametrize("body", [None, [], {}, {"five_hour": None}, {"five_hour": {"utilization": "46"}},
+                                  {"five_hour": {"utilization": "46"}, "seven_day": {"utilization": 10.0, "resets_at": "2026-11-05T07:00:00+00:00"}},
                                   {"seven_day": {"utilization": 10.0}}])
 def test_unreadable_anthropic_shapes_yield_nothing(body):
     assert usage_probe.anthropic_usage_headers(body) is None
@@ -450,3 +451,36 @@ def test_an_idle_pool_reads_nothing_even_when_asked(tmp_path):
     # note_activity() never called -> never active.
     forced = usage_probe.Candidate("p3", usage_probe.PROVIDER_ANTHROPIC, None)
     assert sched.due([forced]) == []
+
+
+def test_weekly_only_plan_is_read_from_its_weekly_window():
+    # Issue #20: `five_hour: null`, only a weekly window -> that window drives Rotation.
+    from claude_unlimited import observation
+    body = {"five_hour": None, "seven_day": {"utilization": 100.0, "resets_at": "2026-11-05T07:00:00+00:00"}}
+    snap = observation._usage_snapshot_from_headers(usage_probe.anthropic_usage_headers(body))
+    assert snap.percent == 100.0 and snap.window_label == "weekly"
+    assert snap.resets_at is not None and snap.percent_7d is None
+
+
+def test_a_weekly_only_reading_without_a_reset_is_not_recorded():
+    assert usage_probe.anthropic_usage_headers({"five_hour": None, "seven_day": {"utilization": 50.0}}) is None
+
+
+def test_five_hour_still_drives_when_present():
+    from claude_unlimited import observation
+    headers = usage_probe.anthropic_usage_headers({"five_hour": {"utilization": 40.0},
+                                                   "seven_day": {"utilization": 90.0}})
+    snap = observation._usage_snapshot_from_headers(headers)
+    assert snap.percent == 40.0 and snap.percent_7d == 90.0 and snap.window_label is None
+
+
+def test_response_headers_with_only_a_weekly_window_are_a_weekly_reading():
+    from claude_unlimited import observation
+    snap = observation._usage_snapshot_from_headers({
+        "anthropic-ratelimit-unified-7d-utilization": "0.3",
+        "anthropic-ratelimit-unified-7d-reset": "1793862000"})
+    assert snap.percent == 30.0 and snap.window_label == "weekly"
+    assert observation._usage_snapshot_from_headers({
+        "anthropic-ratelimit-unified-5h-utilization": "bad",
+        "anthropic-ratelimit-unified-7d-utilization": "0.3",
+        "anthropic-ratelimit-unified-7d-reset": "1793862000"}) is None

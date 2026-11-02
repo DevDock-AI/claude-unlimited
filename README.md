@@ -409,7 +409,8 @@ The dashboard URL stays in Claude Code's status line while you work.
 
 1. Requests go to the enabled account with the **lowest priority number**.
 2. It stays on that account — *sticky* — until it crosses its **switch threshold**
-   (default 98%) or hits a real quota limit.
+   (default 98%) or hits a real quota limit. The threshold applies to the 5-hour window, or to
+   the weekly window on a plan that has no 5-hour window.
 3. The next account takes over **on the next request**. Your session continues
    uninterrupted; nothing is lost and nothing is restarted.
 4. When a quota window resets, that account rejoins the rotation automatically.

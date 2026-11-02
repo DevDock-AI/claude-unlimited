@@ -158,14 +158,26 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
 
 def _usage_snapshot_from_headers(headers: dict[str, str]) -> Optional[UsageSnapshot]:
     utilization = _parse_float(headers.get("anthropic-ratelimit-unified-5h-utilization"))
-    if utilization is None:
-        return None
-    percent = utilization * 100
     resets_at = _parse_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
 
     utilization_7d = _parse_float(headers.get("anthropic-ratelimit-unified-7d-utilization"))
     percent_7d = round(utilization_7d * 100, 2) if utilization_7d is not None else None
     resets_at_7d = _parse_reset(headers.get("anthropic-ratelimit-unified-7d-reset"))
+
+    if utilization is None:
+        # Some plans report no 5-hour window at all (`five_hour: null` from
+        # /api/oauth/usage, issue #20): the weekly window is then the only
+        # limit and drives Rotation, published as the one window labelled
+        # "weekly" (as openai_observation does for a weekly-only Codex plan).
+        # A 5h header that is PRESENT but unreadable is not an absent window,
+        # and a weekly reading with no reset could leave a profile DRAINING
+        # until the next probe: both give no reading.
+        if ("anthropic-ratelimit-unified-5h-utilization" in headers
+                or percent_7d is None or resets_at_7d is None):
+            return None
+        return UsageSnapshot(percent=percent_7d, resets_at=resets_at_7d, confidence="measured",
+                             window_label="weekly")
+    percent = utilization * 100
 
     return UsageSnapshot(percent=round(percent, 2), resets_at=resets_at, confidence="measured",
                           percent_7d=percent_7d, resets_at_7d=resets_at_7d)

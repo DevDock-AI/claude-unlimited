@@ -1521,8 +1521,9 @@ function renderTokenBudgetBar(label, tokensUsed, tokenThreshold, color) {
 
 // usage_5h_percent/usage_7d_percent are legacy field names kept for backend
 // compatibility; they really mean "first window" and "second window".
-// An oauth/api Profile always has Claude's 5h+7d shape (usage_window_label
-// null → the "5h session"/"7d weekly" strings). A codex Profile may report a
+// An oauth/api Profile normally has Claude's 5h+7d shape (usage_window_label
+// null → the "5h session"/"7d weekly" strings); a plan with no 5-hour window
+// reports one window labelled "weekly" (issue #20). A codex Profile may report a
 // real window duration instead, or expose only ONE window — in which case
 // usage_7d_percent is null and callers must skip the second bar entirely.
 const USAGE_WINDOW_LABEL_KEYS = {
