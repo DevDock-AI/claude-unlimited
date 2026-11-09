@@ -71,6 +71,10 @@ class ModelPrice:
 # Standard (non-batch) Claude API pricing, per model family. Retired models
 # are included since a long-lived local history may still reference them.
 MODEL_PRICES: tuple[ModelPrice, ...] = (
+    # Fable / Mythos 5.2: cheaper than 5.1 ($8/$40, cache reads $0.20 =
+    # 0.025x); must out-match the 5 prefix like 5.1.
+    ModelPrice("claude-fable-5-2", 8, 10, 16, 0.20, 40),
+    ModelPrice("claude-mythos-5-2", 8, 10, 16, 0.20, 40),
     # 5.1 point releases have their own cache-read rate (0.025x input) and
     # must out-match the 5 prefix, or every cache hit is billed at 4x.
     ModelPrice("claude-fable-5-1", 10, 12.50, 20, 0.25, 50),

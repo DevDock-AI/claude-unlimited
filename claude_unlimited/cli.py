@@ -374,13 +374,14 @@ def _prompt_profile_choice(profiles: list):
 # or our override lands as an EXTRA picker entry beside the native one instead
 # of replacing it (v2.1.263 showed both a relabelled Fable and a native "Fable
 # 5.1"). Read out of the binary's model table (2.1.280, where the opus tier
-# moved from claude-opus-5 to claude-opus-5-5): fable->claude-fable-5-1,
+# moved from claude-opus-5 to claude-opus-5-5): fable->claude-fable-5-1
+# (Fable 5.2 since its release, newest Fable claimed per owner decision),
 # opus->claude-opus-5-5, sonnet->claude-sonnet-5, haiku->claude-haiku-4-5; the Sonnet/Haiku tiers
 # now claim Sonnet 5.5 / Haiku 5.5 per owner decision). This
 # is upstream-coupled — see the "Claude Code upstream watch" note; a Claude
 # Code release that moves a tier default can reintroduce the duplicate.
 _MODEL_TIER_IDS = {
-    "FABLE": "claude-fable-5-1",
+    "FABLE": "claude-fable-5-2",
     "OPUS": "claude-opus-5-5",
     "SONNET": "claude-sonnet-5-5",
     "HAIKU": "claude-haiku-5-5",
@@ -472,7 +473,7 @@ def _relead_newer_tier(live: dict, tier_id: str, family: str, name: str) -> str:
 # Pinned to a codex Profile: every request this session makes is served by
 # OpenAI, so name the real backing model outright.
 _CODEX_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6.1 Sol", "Served by Codex · reasoning: high"),
+    "FABLE": ("Fable 5.2 | GPT-6.1 Sol", "Served by Codex · reasoning: high"),
     "OPUS": ("Opus 5.5 | GPT-6.1 Terra", "Served by Codex · reasoning: high"),
     "SONNET": ("Sonnet 5.5 | GPT-6.1 Terra", "Served by Codex · reasoning: medium"),
     "HAIKU": ("Haiku 5.5 | GPT-6 Luna", "Served by Codex · reasoning: low"),
@@ -484,7 +485,7 @@ _CODEX_MODEL_LABELS = {
 # to stays accurate whichever one serves, and still says what is being
 # picked; a provider-neutral tier word would name no model at all.
 _MIXED_MODEL_LABELS = {
-    "FABLE": ("Fable 5.1 | GPT-6.1 Sol", "Whichever account is active · Codex reasoning: high"),
+    "FABLE": ("Fable 5.2 | GPT-6.1 Sol", "Whichever account is active · Codex reasoning: high"),
     "OPUS": ("Opus 5.5 | GPT-6.1 Terra", "Whichever account is active · Codex reasoning: high"),
     "SONNET": ("Sonnet 5.5 | GPT-6.1 Terra", "Whichever account is active · Codex reasoning: medium"),
     "HAIKU": ("Haiku 5.5 | GPT-6 Luna", "Whichever account is active · Codex reasoning: low"),

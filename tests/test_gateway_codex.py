@@ -637,7 +637,7 @@ def test_a_codex_profile_counts_as_spent_when_fables_gpt_target_is_unavailable(p
         gw._runtime["c"].model_usage = _unavailable("gpt-6.1-sol", later)
     gw.runtime_snapshot()   # re-sync recomputes blocked_models
 
-    assert "claude-fable-5" in gw._runtime["c"].blocked_models
+    assert "claude-fable-5-2" in gw._runtime["c"].blocked_models
 
     from claude_unlimited.router import fable_spent, must_leave
     now = datetime.now(timezone.utc)
@@ -711,7 +711,7 @@ def test_a_per_profile_codex_model_override_is_respected(pool_env):
     gw.runtime_snapshot()
 
     blocked = gw._runtime["c"].blocked_models
-    assert "claude-fable-5" in blocked and "claude-opus-5-5" in blocked
+    assert "claude-fable-5-2" in blocked and "claude-opus-5-5" in blocked
     # ...and the model the parity list would otherwise have mapped is NOT the
     # thing being consulted.
     assert "gpt-6.1-sol" not in blocked
@@ -733,7 +733,7 @@ def test_blocked_models_survives_the_per_tick_runtime_rebuild(pool_env):
 
     for _ in range(3):        # several ticks, as an open dashboard would cause
         gw.runtime_snapshot()
-        assert "claude-fable-5" in gw._runtime["c"].blocked_models
+        assert "claude-fable-5-2" in gw._runtime["c"].blocked_models
 
 
 def test_a_non_codex_profile_never_gets_blocked_models(pool_env):

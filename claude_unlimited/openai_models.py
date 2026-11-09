@@ -119,6 +119,9 @@ class OpenAIModelTarget:
 
 # Ordered most-capable-first — used only for the substring-match fallback below.
 _MODEL_MAP: dict[str, OpenAIModelTarget] = {
+    # Fable 5.2 FIRST in its family: it is cli _MODEL_TIER_IDS' Fable id and
+    # the no-catalogue default_parity_rows seed.
+    "claude-fable-5-2": OpenAIModelTarget("gpt-6.1-sol", "medium"),
     "claude-fable-5": OpenAIModelTarget("gpt-6.1-sol", "medium"),
     "claude-opus-5-5": OpenAIModelTarget("gpt-6.1-terra", "high"),
     # Kept beside 5.5, not replaced by it: a saved parity row naming Opus 5
@@ -256,7 +259,7 @@ def default_parity_rows(catalogue: Optional[Catalogue] = None) -> list[dict]:
     """The parity list a fresh install (or a Reset) starts from: one row per
     family in _DEFAULT_FAMILIES, each the highest-ranked model of that family
     with its curated Codex target. With the vendored catalogue this is exactly
-    claude-fable-5-1 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5
+    claude-fable-5-2 / claude-opus-5-5 / claude-sonnet-5 / claude-haiku-4-5
     (the snapshot predates Sonnet/Haiku 5.5); a live catalogue listing them
     seeds claude-sonnet-5-5 / claude-haiku-5-5 — the ids cli.py's
     _MODEL_TIER_IDS use, so the /model picker relabels
@@ -457,6 +460,7 @@ def fallback_models(model: str, catalogue: Optional[Catalogue] = None) -> list[s
 
 
 _CLAUDE_DISPLAY_NAMES: dict[str, str] = {
+    "claude-fable-5-2": "Claude Fable 5.2",
     "claude-fable-5": "Claude Fable 5",
     "claude-opus-5-5": "Claude Opus 5.5",
     "claude-opus-5": "Claude Opus 5",

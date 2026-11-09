@@ -253,10 +253,23 @@ def test_haiku_5_5_pays_five_times_every_rate_over_100k_prompt_tokens(monkeypatc
 @pytest.mark.parametrize("model", ["claude-fable-5-5", "claude-fable-5-5-20261107", "claude-fable-5-5[1m]"])
 def test_an_unreleased_fable_prices_as_the_newest_known_fable(model):
     # Longest-prefix alone would land claude-fable-5-5 on claude-fable-5,
-    # whose cache reads cost 4x Fable 5.1's.
-    assert pricing.find_price(model, catalogue=None) == pricing.find_price("claude-fable-5-1", catalogue=None)
+    # whose cache reads cost 5x Fable 5.2's.
+    assert pricing.find_price(model, catalogue=None) == pricing.find_price("claude-fable-5-2", catalogue=None)
     vendored = mc.parse(json.loads(mc._VENDORED_FILE.read_text()), today=TODAY)
-    assert pricing.find_price(model, catalogue=vendored) == pricing.find_price("claude-fable-5-1", catalogue=vendored)
+    assert pricing.find_price(model, catalogue=vendored) == pricing.find_price("claude-fable-5-2", catalogue=vendored)
+
+
+@pytest.mark.parametrize("model", ["claude-fable-5-2", "claude-fable-5-2-20261101", "claude-fable-5-2[1m]",
+                                   "claude-mythos-5-2"])
+def test_fable_5_2_has_its_own_price(model):
+    # $8 / $40, 5m write $10, 1h write $16, cache read $0.20 - not 5.1's rates.
+    for cat in (None, mc.parse(json.loads(mc._VENDORED_FILE.read_text()), today=TODAY)):
+        if cat is not None and model.startswith("claude-mythos"):
+            continue
+        p = pricing.find_price(model, catalogue=cat)
+        assert (p.input_per_mtok, p.cache_write_5m_per_mtok, p.cache_write_1h_per_mtok,
+                p.cache_read_per_mtok, p.output_per_mtok) == pytest.approx((8, 10, 16, 0.20, 40))
+    assert pricing.find_price("claude-fable-5-1", catalogue=None).input_per_mtok == 10
 
 
 def test_a_known_older_model_keeps_its_own_price():
