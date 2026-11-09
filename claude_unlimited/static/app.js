@@ -1364,6 +1364,20 @@ function statusLabel(statusWord) {
   return key ? t(key) : statusWord;
 }
 
+// A Profile added from a `claude setup-token` token cannot be refreshed, so
+// its card says when it runs out: amber in the last 30 days, red after.
+function tokenExpiryTag(p) {
+  if (p.kind !== 'oauth' || !p.token_expires_at) return '';
+  const msLeft = p.token_expires_at - Date.now();
+  const expired = msLeft <= 0;
+  const soon = msLeft < 30 * 24 * 3600 * 1000;
+  const color = expired ? 'var(--bad)' : soon ? 'var(--warn)' : 'var(--text-dim)';
+  const bg = expired ? 'var(--bad-soft)' : soon ? 'var(--warn-soft)' : 'transparent';
+  const date = new Date(p.token_expires_at).toLocaleDateString();
+  const label = expired ? t('profiles.long_lived_expired') : t('profiles.long_lived_tag').replace('{date}', date);
+  return `<span class="p-status-word" title="${esc(t('profiles.long_lived_tooltip'))}" style="color:${color};background:${bg}">${esc(label)}</span>`;
+}
+
 // Provider funding failures have a different recovery path from quota resets.
 function paymentRequiredBadge(p) {
   if (!p.enabled || !p.budget_unavailable) return '';
@@ -1608,7 +1622,7 @@ function renderProfileCard(p) {
       <div class="p-top">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
-        ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}
+        ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}
         ${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}
         ${creditsPill(p)}
         ${kindLabel ? `<span class="p-kind">${kindLabel}</span>` : ''}
@@ -1750,7 +1764,7 @@ function renderProfileTableRow(p) {
       <div class="row-name-cell">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
-          <div class="p-name">${esc(p.name)} ${planBadge(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}${paymentRequiredBadge(p)}</div>
+          <div class="p-name">${esc(p.name)} ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}${paymentRequiredBadge(p)}</div>
           <div class="p-kind">${kindLabel}</div>${modelUsageChips(p)}
         </div>
       </div>
@@ -3511,6 +3525,10 @@ let _selectedAuthMode = 'api_key';
 // are wired independently.
 let _selectedCodexAuthMode = 'chatgpt_subscription';
 let _selectedTagColor = null;
+// The Claude subscription card's two ways in: 'login' (cu add-account, CLI
+// only) or 'token' (paste a `claude setup-token` token here).
+let _selectedOauthMethod = 'login';
+let _selectedLtPlan = '';
 
 // Shared by the Add Profile form (f_tag_row) and the Profile Detail modal
 // (pd_tag_row). Each keeps its own selected-color state and passes it in,
@@ -3544,6 +3562,9 @@ function selectType(type) {
   document.querySelectorAll('.type-card').forEach((card) => card.classList.toggle('sel', card.dataset.typeCard === type));
   document.getElementById('importPane').style.display = type === 'import' ? '' : 'none';
   document.getElementById('oauthAddAccountPane').style.display = type === 'oauth' ? '' : 'none';
+  const oauthToken = type === 'oauth' && _selectedOauthMethod === 'token';
+  document.getElementById('oauthTokenForm').style.display = oauthToken ? '' : 'none';
+  document.getElementById('oauthLoginForm').style.display = oauthToken ? 'none' : '';
 
   document.getElementById('f_codex_authmode_wrap').style.display = type === 'codex' ? '' : 'none';
   const codexChatgpt = type === 'codex' && _selectedCodexAuthMode === 'chatgpt_subscription';
@@ -3578,7 +3599,7 @@ function selectType(type) {
   // An API key reports no Fable limit, so "leave when it is spent" has
   // nothing to act on there.
   document.getElementById('f_leave_fable_wrap').style.display = type === 'api' ? 'none' : '';
-  document.getElementById('saveBtn').style.display = (type === 'import' || type === 'oauth' || codexChatgpt) ? 'none' : '';
+  document.getElementById('saveBtn').style.display = (type === 'import' || (type === 'oauth' && !oauthToken) || codexChatgpt) ? 'none' : '';
 }
 
 // Closes a modal on a genuine backdrop click, but not when the click is the
@@ -3621,6 +3642,11 @@ document.addEventListener('keydown', (e) => {
 function openModal() {
   cancelLivePoll();
   document.getElementById('scrim').classList.add('open');
+  _selectedOauthMethod = 'login';
+  document.querySelectorAll('.seg-btn[data-oauth-method]').forEach((b) => b.classList.toggle('on', b.dataset.oauthMethod === 'login'));
+  _selectedLtPlan = '';
+  document.querySelectorAll('.seg-btn[data-lt-plan]').forEach((b) => b.classList.toggle('on', b.dataset.ltPlan === ''));
+  ['f_lt_name', 'f_lt_token', 'f_lt_uuid'].forEach((id) => { document.getElementById(id).value = ''; });
   selectType('oauth');
   document.getElementById('f_name').value = '';
   document.getElementById('f_base_url').value = '';
@@ -3666,6 +3692,10 @@ async function submitProfile() {
     await importCurrentLogin();
     return;
   }
+  if (_selectedType === 'oauth') {
+    await submitLongLivedToken();
+    return;
+  }
   // codex's chatgpt_subscription sub-choice never reaches here: saveBtn is
   // hidden for it (see selectType) because that account is CLI-only.
   const kind = _selectedType === 'api' ? 'api' : _selectedType === 'codex' ? 'codex' : 'oauth';
@@ -3706,6 +3736,33 @@ async function submitProfile() {
   const errEl = document.getElementById('f_error');
   try {
     await api('/api/profiles', { method: 'POST', body: JSON.stringify(payload) });
+    closeModal();
+    await loadProfiles();
+    await loadProfilesTable();
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.style.display = '';
+  }
+}
+
+// A `claude setup-token` token: no refresh token and no profile scope, so
+// the daemon stores it with a one-year expiry and takes the account UUID
+// from here (see POST /api/profiles, long_lived).
+async function submitLongLivedToken() {
+  const payload = {
+    name: document.getElementById('f_lt_name').value,
+    kind: 'oauth',
+    long_lived: true,
+    credential: document.getElementById('f_lt_token').value.trim(),
+    account_uuid: document.getElementById('f_lt_uuid').value.trim(),
+    switch_threshold: Number(document.getElementById('f_threshold_val').textContent),
+    priority: Number(document.getElementById('f_priority_val').textContent),
+  };
+  if (_selectedLtPlan) payload.plan = _selectedLtPlan;
+  const errEl = document.getElementById('f_error');
+  try {
+    await api('/api/profiles', { method: 'POST', body: JSON.stringify(payload) });
+    document.getElementById('f_lt_token').value = '';
     closeModal();
     await loadProfiles();
     await loadProfilesTable();
@@ -4384,6 +4441,20 @@ document.querySelectorAll('.seg-btn[data-auth-mode]').forEach((btn) => {
   btn.addEventListener('click', () => {
     _selectedAuthMode = btn.dataset.authMode;
     document.querySelectorAll('.seg-btn[data-auth-mode]').forEach((b) => b.classList.toggle('on', b === btn));
+  });
+});
+document.querySelectorAll('.seg-btn[data-oauth-method]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    _selectedOauthMethod = btn.dataset.oauthMethod;
+    document.querySelectorAll('.seg-btn[data-oauth-method]').forEach((b) => b.classList.toggle('on', b === btn));
+    document.getElementById('f_error').style.display = 'none';
+    selectType('oauth');
+  });
+});
+document.querySelectorAll('.seg-btn[data-lt-plan]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    _selectedLtPlan = btn.dataset.ltPlan;
+    document.querySelectorAll('.seg-btn[data-lt-plan]').forEach((b) => b.classList.toggle('on', b === btn));
   });
 });
 // Separate selector and state from the api-kind api_key/bearer toggle above

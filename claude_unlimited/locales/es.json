@@ -694,5 +694,17 @@
   "toast.dismiss": "Descartar",
   "activity.filter_since": "Mostrar eventos desde",
   "activity.filter_until": "Mostrar eventos hasta",
-  "modal.confirm.input_label": "Escribe el texto de confirmación"
+  "modal.confirm.input_label": "Escribe el texto de confirmación",
+  "modal.add_profile.oauth_method_login": "Inicio de sesión en el navegador",
+  "modal.add_profile.oauth_method_token": "Pegar un token de larga duración (claude setup-token)",
+  "modal.add_profile.lt_desc": "Ejecuta claude setup-token en una terminal y pega el token que muestra (sk-ant-oat01-…). Es válido durante aproximadamente un año y no se puede renovar automáticamente, así que añade uno nuevo antes de que caduque.",
+  "modal.add_profile.lt_token_label": "Token",
+  "modal.add_profile.lt_uuid_label": "UUID de la cuenta",
+  "modal.add_profile.lt_uuid_desc": "Necesario para estos tokens, que no pueden consultar su propia cuenta. Copia oauthAccount.accountUuid de ~/.claude.json en el equipo donde ejecutaste claude setup-token.",
+  "modal.add_profile.lt_plan_label": "Plan",
+  "modal.add_profile.lt_plan_auto": "Automático",
+  "profiles.long_lived_tag": "Token de larga duración · caduca el {date}",
+  "profiles.long_lived_expired": "Token de larga duración caducado",
+  "profiles.long_lived_tooltip": "Añadido con claude setup-token. No se puede renovar: pega un token nuevo antes de que caduque.",
+  "help.cmd.add_account_token": "¿No hay navegador en ese equipo? Ejecuta allí claude setup-token y pega el token en Añadir perfil → Suscripción de Claude → Pegar un token de larga duración, junto con el UUID de la cuenta de ~/.claude.json. Dura aproximadamente un año y no se puede renovar automáticamente; la tarjeta muestra cuándo caduca."
 }

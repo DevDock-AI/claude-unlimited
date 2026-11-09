@@ -694,5 +694,17 @@
   "toast.dismiss": "Închide",
   "activity.filter_since": "Arată evenimente de la",
   "activity.filter_until": "Arată evenimente până la",
-  "modal.confirm.input_label": "Scrie textul de confirmare"
+  "modal.confirm.input_label": "Scrie textul de confirmare",
+  "modal.add_profile.oauth_method_login": "Autentificare în browser",
+  "modal.add_profile.oauth_method_token": "Lipește un token de lungă durată (claude setup-token)",
+  "modal.add_profile.lt_desc": "Rulează claude setup-token într-un terminal și lipește tokenul afișat (sk-ant-oat01-…). Este valabil aproximativ un an și nu poate fi reînnoit automat, așa că adaugă unul nou înainte să expire.",
+  "modal.add_profile.lt_token_label": "Token",
+  "modal.add_profile.lt_uuid_label": "UUID-ul contului",
+  "modal.add_profile.lt_uuid_desc": "Necesar pentru aceste tokenuri, care nu își pot căuta propriul cont. Copiază oauthAccount.accountUuid din ~/.claude.json de pe calculatorul unde ai rulat claude setup-token.",
+  "modal.add_profile.lt_plan_label": "Plan",
+  "modal.add_profile.lt_plan_auto": "Automat",
+  "profiles.long_lived_tag": "Token de lungă durată · expiră pe {date}",
+  "profiles.long_lived_expired": "Token de lungă durată expirat",
+  "profiles.long_lived_tooltip": "Adăugat cu claude setup-token. Nu poate fi reînnoit: lipește un token nou înainte să expire.",
+  "help.cmd.add_account_token": "Nu ai browser pe acel calculator? Rulează acolo claude setup-token și lipește tokenul în Adaugă profil → Abonament Claude → Lipește un token de lungă durată, împreună cu UUID-ul contului din ~/.claude.json. Durează aproximativ un an și nu poate fi reînnoit automat; cardul arată când expiră."
 }

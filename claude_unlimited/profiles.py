@@ -124,6 +124,7 @@ def _validate_field_types(**changes) -> None:
     _num("switch_threshold", kind=(int, float), minimum=0, maximum=100)
     _num("token_threshold", kind=int, minimum=0, allow_none=True)
     _num("monthly_budget_cap", kind=(int, float), minimum=0, allow_none=True)
+    _num("token_expires_at", kind=int, minimum=0, allow_none=True)
 
     for key in ("enabled", "automatic", "forced_for_subagents", "leave_on_fable_limit"):
         if key in changes and not isinstance(changes[key], bool):
@@ -240,6 +241,7 @@ def create_profile(
     codex_reasoning_effort: Optional[str] = None,
     forced_for_subagents: bool = False,
     leave_on_fable_limit: bool = False,
+    token_expires_at: Optional[int] = None,
     credential_already_encoded: bool = False,
 ) -> Profile:
     _validate(name, kind, base_url, auth_mode, tag_color)
@@ -295,6 +297,7 @@ def create_profile(
         codex_reasoning_effort=codex_reasoning_effort,
         forced_for_subagents=forced_for_subagents,
         leave_on_fable_limit=leave_on_fable_limit,
+        token_expires_at=token_expires_at if kind == "oauth" else None,
     )
 
     if credential_already_encoded:
@@ -355,6 +358,9 @@ def upsert_oauth_profile(*, name: str, account_uuid: str, credential: str, plan:
     if existing is not None:
         update_credential(existing.id, credential, refresh_token=refresh_token, expires_at=expires_at)
         changes = {k: v for k, v in {"plan": plan, "claude_config_dir": claude_config_dir}.items() if v is not None}
+        if existing.token_expires_at is not None:
+            # A full login replaced a long-lived setup-token token.
+            changes["token_expires_at"] = None
         updated = update_profile(existing.id, **changes) if changes else existing
         _retire_replaced_login_dirs(existing, updated)
         return updated, True
@@ -420,7 +426,7 @@ def update_profile(profile_id: str, **changes) -> Profile:
         "name", "priority", "switch_threshold", "enabled", "automatic",
         "default_model", "force_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
         "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
-        "forced_for_subagents", "leave_on_fable_limit",
+        "forced_for_subagents", "leave_on_fable_limit", "token_expires_at",
     }
     unknown = set(changes) - allowed
     if unknown:

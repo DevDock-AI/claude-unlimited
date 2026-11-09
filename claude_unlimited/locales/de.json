@@ -694,5 +694,17 @@
   "toast.dismiss": "Schließen",
   "activity.filter_since": "Ereignisse anzeigen ab",
   "activity.filter_until": "Ereignisse anzeigen bis",
-  "modal.confirm.input_label": "Bestätigungstext eingeben"
+  "modal.confirm.input_label": "Bestätigungstext eingeben",
+  "modal.add_profile.oauth_method_login": "Browser-Anmeldung",
+  "modal.add_profile.oauth_method_token": "Langlebiges Token einfügen (claude setup-token)",
+  "modal.add_profile.lt_desc": "Führe claude setup-token in einem Terminal aus und füge das ausgegebene Token ein (sk-ant-oat01-…). Es gilt etwa ein Jahr und kann nicht automatisch erneuert werden – füge vor Ablauf ein neues hinzu.",
+  "modal.add_profile.lt_token_label": "Token",
+  "modal.add_profile.lt_uuid_label": "Konto-UUID",
+  "modal.add_profile.lt_uuid_desc": "Für diese Tokens erforderlich, da sie ihr eigenes Konto nicht abfragen können. Kopiere oauthAccount.accountUuid aus ~/.claude.json auf dem Rechner, auf dem du claude setup-token ausgeführt hast.",
+  "modal.add_profile.lt_plan_label": "Tarif",
+  "modal.add_profile.lt_plan_auto": "Automatisch",
+  "profiles.long_lived_tag": "Langlebiges Token · läuft ab am {date}",
+  "profiles.long_lived_expired": "Langlebiges Token abgelaufen",
+  "profiles.long_lived_tooltip": "Über claude setup-token hinzugefügt. Es kann nicht erneuert werden: füge vor Ablauf ein neues Token ein.",
+  "help.cmd.add_account_token": "Kein Browser auf dem Rechner? Führe dort stattdessen claude setup-token aus und füge das Token unter Profil hinzufügen → Claude-Abo → Langlebiges Token einfügen ein, zusammen mit der Konto-UUID aus ~/.claude.json. Es gilt etwa ein Jahr und kann nicht automatisch erneuert werden; die Karte zeigt das Ablaufdatum."
 }

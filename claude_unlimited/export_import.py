@@ -77,6 +77,8 @@ class ExportedProfile:
     forced_for_subagents: bool = False
     # "Leave when Fable is spent". Same reason for the default.
     leave_on_fable_limit: bool = False
+    # Expiry of a `claude setup-token` token (epoch ms); None otherwise.
+    token_expires_at: Optional[int] = None
 
 
 def build_export_bundle(
@@ -109,6 +111,7 @@ def build_export_bundle(
                 plan=p.plan, codex_model=p.codex_model, codex_reasoning_effort=p.codex_reasoning_effort,
                 forced_for_subagents=p.forced_for_subagents,
                 leave_on_fable_limit=p.leave_on_fable_limit,
+                token_expires_at=p.token_expires_at,
             )))
         payload["profiles"] = exported
 
@@ -225,6 +228,7 @@ def apply_import(
                         codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                         forced_for_subagents=bool(item.get("forced_for_subagents", False)),
                         leave_on_fable_limit=item.get("leave_on_fable_limit") is True,
+                        token_expires_at=item.get("token_expires_at") if isinstance(item.get("token_expires_at"), int) else None,
                     )
                     pool.profiles = [updated if p.id == existing.id else p for p in pool.profiles]
                     result["profiles_updated"] += 1
@@ -244,6 +248,7 @@ def apply_import(
                     codex_model=item.get("codex_model"), codex_reasoning_effort=item.get("codex_reasoning_effort"),
                     forced_for_subagents=bool(item.get("forced_for_subagents", False)),
                     leave_on_fable_limit=item.get("leave_on_fable_limit") is True,
+                        token_expires_at=item.get("token_expires_at") if isinstance(item.get("token_expires_at"), int) else None,
                 )
                 secret_store.set_token(new_profile.id, item["credential"])
                 pool.profiles.append(new_profile)

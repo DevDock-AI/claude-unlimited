@@ -269,6 +269,21 @@ or paste.
 It logs in through an **isolated session**, so whatever is already signed into `claude` on
 your machine is never touched. Run it again for each additional account.
 
+### Or paste a long-lived token
+
+For a machine without a browser, run `claude setup-token` (on any machine logged into that
+account) and paste the `sk-ant-oat01-…` token it prints in the dashboard: **Add profile →
+Claude subscription → Paste a long-lived token**.
+
+These tokens are scoped for inference only, so they cannot look up their own account. Fill
+in the **Account UUID** too: it is `oauthAccount.accountUuid` in `~/.claude.json` on the
+machine where you ran `claude setup-token`. Pick the plan, or leave it on Auto.
+
+A setup-token token is valid for about a year and has no refresh token, so nothing can
+renew it. The profile card shows **Long-lived token · expires <date>**, turning amber in
+the last 30 days; paste a new token over it (same Account UUID) before then. Usage is
+learned from the account's own responses as it serves requests.
+
 ---
 
 ## Add a ChatGPT / Codex subscription

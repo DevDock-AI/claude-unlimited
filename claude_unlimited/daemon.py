@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import platform
 import secrets
 import signal
@@ -314,6 +315,12 @@ def _context_1m_preview(pool) -> dict:
     return preview
 
 
+# A `claude setup-token` token is valid for about a year and cannot be
+# refreshed; stored with this expiry so the card can say when it runs out.
+LONG_LIVED_TOKEN_TTL_MS = 365 * 24 * 60 * 60 * 1000
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
 def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> dict:
     """The wire shape sent to the browser. Explicit allowlist, not asdict(),
     so a future field added to Profile can't accidentally leak by default.
@@ -350,6 +357,9 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "tag_color": p.tag_color,
         "account_uuid": p.account_uuid,
         "plan": p.plan,
+        # Set only for a `claude setup-token` token (epoch ms): it cannot be
+        # refreshed, so the card shows when it runs out.
+        "token_expires_at": getattr(p, "token_expires_at", None),
         "codex_home": p.codex_home,
         "codex_model": p.codex_model,
         "codex_reasoning_effort": p.codex_reasoning_effort,
@@ -1092,28 +1102,59 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_json_body()
                 credential = body.pop("credential", "")
+                # A `claude setup-token` token: valid about a year, no
+                # refresh token, inference scope only (no profile lookup).
+                long_lived = body.pop("long_lived", False) is True and body.get("kind") == "oauth"
+                long_lived_expires_at = None
+                if long_lived:
+                    if body.get("plan") in ("", "auto"):
+                        body.pop("plan")
+                    uuid_in = (body.get("account_uuid") or "").strip()
+                    if uuid_in:
+                        if not _UUID_RE.match(uuid_in):
+                            self._send_json(400, {"error": "validation", "message":
+                                "Account UUID doesn't look right — copy oauthAccount.accountUuid from ~/.claude.json "
+                                "(it looks like 1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f)."})
+                            return
+                        body["account_uuid"] = uuid_in.lower()
+                    else:
+                        body.pop("account_uuid", None)
+                    long_lived_expires_at = int(time.time() * 1000) + LONG_LIVED_TOKEN_TTL_MS
                 if body.get("kind") == "oauth" and not body.get("account_uuid"):
                     # Resolve the account uuid from Anthropic directly
                     # rather than asking for a value nobody can look up.
                     try:
                         account = anthropic_oauth.fetch_account_profile(credential)
                     except anthropic_oauth.ProfileLookupError as exc:
+                        if long_lived and exc.scope_limited:
+                            msg = ("Tokens from `claude setup-token` can't look up their own account, so the "
+                                   "Account UUID is required: copy oauthAccount.accountUuid from ~/.claude.json "
+                                   "on the machine where you ran it.")
+                            activity.record("error", "Add Profile failed — account UUID needed", meta=msg)
+                            self._send_json(400, {"error": "account_uuid_required", "message": msg})
+                            return
                         # Recorded server-side too, so the failure leaves a
                         # trace beyond the browser toast that shows it.
                         activity.record("error", "Add Profile failed — could not resolve account", meta=str(exc)[:200])
                         self._send_json(400, {"error": "profile_lookup", "message": str(exc)})
                         return
                     body["account_uuid"] = account.account_uuid
-                    body["plan"] = anthropic_oauth.plan_from_account(account)
+                    body["plan"] = body.get("plan") or anthropic_oauth.plan_from_account(account)
 
                 existing = profile_repo.find_by_account_uuid(body["account_uuid"]) if body.get("kind") == "oauth" and body.get("account_uuid") else None
                 if existing is not None:
-                    profile_repo.update_credential(existing.id, credential)
-                    if "plan" in body:
-                        existing = profile_repo.update_profile(existing.id, plan=body["plan"])
+                    profile_repo.update_credential(existing.id, credential, expires_at=long_lived_expires_at)
+                    changes = {"plan": body["plan"]} if "plan" in body else {}
+                    # Replacing the credential replaces what kind of token it
+                    # is too: clear the marker when a normal token comes in.
+                    changes["token_expires_at"] = long_lived_expires_at
+                    existing = profile_repo.update_profile(existing.id, **changes)
                     self._send_json(200, {"profile": _profile_to_public_dict(existing), "reused_existing": True})
                     return
 
+                if long_lived:
+                    body["expires_at"] = long_lived_expires_at
+                    body["token_expires_at"] = long_lived_expires_at
                 p = profile_repo.create_profile(credential=credential, **body)
                 self._send_json(201, {"profile": _profile_to_public_dict(p)})
                 # Populate usage now rather than leaving the card blank until

@@ -102,6 +102,10 @@ class Profile:
     # it on for every Profile at once. Meaningless for an api-kind Profile
     # (an API key reports no Fable limit) but kept so it round-trips.
     leave_on_fable_limit: bool = False
+    # Epoch ms. Set only for an oauth Profile added from a `claude
+    # setup-token` token: valid about a year, no refresh token, so nothing
+    # can renew it and the Dashboard shows when it runs out. None otherwise.
+    token_expires_at: Optional[int] = None
 
 
 UPDATE_MODES = ("auto_install", "auto_download", "manual")
@@ -280,6 +284,7 @@ def load_pool() -> Pool:
             codex_reasoning_effort=upgrade_reasoning_effort(p.get("codex_reasoning_effort")),
             forced_for_subagents=bool(p.get("forced_for_subagents", False)),
             leave_on_fable_limit=p.get("leave_on_fable_limit") is True,
+            token_expires_at=p.get("token_expires_at") if isinstance(p.get("token_expires_at"), int) else None,
         )
         for p in data.get("profiles", [])
     ]

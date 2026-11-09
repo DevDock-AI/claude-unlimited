@@ -1949,6 +1949,7 @@
             </div>
           </div>
           <div class="field-sub" data-i18n="help.cmd.add_account">Opens your browser, logs into a Claude account through an isolated Claude Code session, and adds it as a Profile — the account UUID is always resolved automatically. Never affects any account already signed into `claude` on this machine, so it's safe to run again for each additional account.</div>
+          <div class="field-sub" data-i18n="help.cmd.add_account_token">No browser on that machine? Run claude setup-token there instead and paste the token in Add profile → Claude subscription → Paste a long-lived token, with the Account UUID from ~/.claude.json. It lasts about a year and cannot be renewed automatically; the card shows when it expires.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -2360,6 +2361,39 @@
 
       <div id="oauthAddAccountPane" style="display:none;">
         <div class="field-group">
+          <div class="seg-row">
+            <div class="seg-btn on" data-oauth-method="login" data-i18n="modal.add_profile.oauth_method_login">Browser login</div>
+            <div class="seg-btn" data-oauth-method="token" data-i18n="modal.add_profile.oauth_method_token">Paste a long-lived token (claude setup-token)</div>
+          </div>
+        </div>
+        <div id="oauthTokenForm" style="display:none;">
+          <div class="field-group">
+            <div class="field-sub" data-i18n="modal.add_profile.lt_desc">Run claude setup-token in a terminal and paste the token it prints (sk-ant-oat01-…). It is valid for about a year and cannot be renewed automatically, so add a new one before it expires.</div>
+          </div>
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.name_label">Name</div>
+            <input class="text-input" id="f_lt_name" data-i18n-placeholder="modal.add_profile.name_placeholder" placeholder="Personal Max">
+          </div>
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.lt_token_label">Token</div>
+            <input class="text-input mono" id="f_lt_token" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-oat01-…">
+          </div>
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.lt_uuid_label">Account UUID</div>
+            <input class="text-input mono" id="f_lt_uuid" autocomplete="off" spellcheck="false" placeholder="1a2b3c4d-…">
+            <div class="field-sub" data-i18n="modal.add_profile.lt_uuid_desc">Needed for these tokens, which cannot look up their own account. Copy oauthAccount.accountUuid from ~/.claude.json on the machine where you ran claude setup-token.</div>
+          </div>
+          <div class="field-group">
+            <div class="field-label" data-i18n="modal.add_profile.lt_plan_label">Plan</div>
+            <div class="seg-row">
+              <div class="seg-btn on" data-lt-plan="" data-i18n="modal.add_profile.lt_plan_auto">Auto</div>
+              <div class="seg-btn" data-lt-plan="pro">Pro</div>
+              <div class="seg-btn" data-lt-plan="max">Max</div>
+              <div class="seg-btn" data-lt-plan="ultra">Ultra</div>
+            </div>
+          </div>
+        </div>
+        <div class="field-group" id="oauthLoginForm">
           <div class="field-label" data-i18n="modal.add_profile.oauth_pane_label">Add a Claude subscription account</div>
           <div class="cmd-row">
             <div class="code-row">

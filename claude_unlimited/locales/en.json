@@ -694,5 +694,17 @@
   "toast.dismiss": "Dismiss",
   "activity.filter_since": "Show events from",
   "activity.filter_until": "Show events until",
-  "modal.confirm.input_label": "Type the confirmation text"
+  "modal.confirm.input_label": "Type the confirmation text",
+  "modal.add_profile.oauth_method_login": "Browser login",
+  "modal.add_profile.oauth_method_token": "Paste a long-lived token (claude setup-token)",
+  "modal.add_profile.lt_desc": "Run claude setup-token in a terminal and paste the token it prints (sk-ant-oat01-…). It is valid for about a year and cannot be renewed automatically, so add a new one before it expires.",
+  "modal.add_profile.lt_token_label": "Token",
+  "modal.add_profile.lt_uuid_label": "Account UUID",
+  "modal.add_profile.lt_uuid_desc": "Needed for these tokens, which cannot look up their own account. Copy oauthAccount.accountUuid from ~/.claude.json on the machine where you ran claude setup-token.",
+  "modal.add_profile.lt_plan_label": "Plan",
+  "modal.add_profile.lt_plan_auto": "Auto",
+  "profiles.long_lived_tag": "Long-lived token · expires {date}",
+  "profiles.long_lived_expired": "Long-lived token expired",
+  "profiles.long_lived_tooltip": "Added from claude setup-token. It cannot be refreshed: paste a new token before it expires.",
+  "help.cmd.add_account_token": "No browser on that machine? Run claude setup-token there instead and paste the token in Add profile → Claude subscription → Paste a long-lived token, with the Account UUID from ~/.claude.json. It lasts about a year and cannot be renewed automatically; the card shows when it expires."
 }

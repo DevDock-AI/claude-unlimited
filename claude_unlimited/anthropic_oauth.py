@@ -34,7 +34,12 @@ class CredentialImportError(RuntimeError):
 
 
 class ProfileLookupError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, scope_limited: bool = False):
+        super().__init__(message)
+        # True when the token is valid but lacks the user:profile scope
+        # (a `claude setup-token` token), so the caller can ask for the
+        # account UUID instead of failing outright.
+        self.scope_limited = scope_limited
 
 
 @dataclass(frozen=True)
@@ -360,8 +365,10 @@ def fetch_account_profile(access_token: str, timeout: float = 15.0) -> AccountPr
         if exc.code == 403 and "scope requirement" in detail:
             raise ProfileLookupError(
                 "This token doesn't have permission to look up account details — this happens with "
-                "tokens from `claude setup-token`, which are scoped for headless use only. Use "
-                "\"Import current login\" instead, or run `claude-unlimited add-account` from a terminal."
+                "tokens from `claude setup-token`, which are scoped for headless use only. Add it with "
+                "\"Paste a long-lived token\" and fill in the Account UUID (oauthAccount.accountUuid in "
+                "~/.claude.json), or use \"Import current login\" / `claude-unlimited add-account`.",
+                scope_limited=True,
             ) from exc
         raise ProfileLookupError(f"Anthropic rejected this token (HTTP {exc.code}): {detail}") from exc
     except urllib.error.URLError as exc:
