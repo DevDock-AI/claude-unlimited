@@ -144,9 +144,12 @@ Precedence for one request, first match wins:
 2. **Live branch pin** — this branch already has a warm account. (`branch_pinned`)
 3. **Forced-for-subagents Profile** — if a subagent sent this and some Profile carries
    `forced_for_subagents`, and it is eligible. (`subagent_forced`)
-4. **New branch assignment** — `router.choose_for_new_branch()` picks the least-loaded
-   eligible Profile and the choice is remembered as this branch's pin. Only in distribute
-   mode, or for a subagent when a forced Profile exists but is not currently eligible.
+4. **New branch assignment** — `router.choose_for_new_branch()` picks the eligible Profile
+   with the lowest load per unit of weight, where the weight is its unused weekly quota per
+   hour to the reset (`_branch_weights`: capped against the pool median, scaled by 5h
+   headroom, a small floor for accounts without a weekly window), and the choice is
+   remembered as this branch's pin. Only in distribute mode, or for a subagent when a forced
+   Profile exists but is not currently eligible.
    (`branch_assigned`)
 5. **Normal rotation** — `router.choose()`, sticky-until-threshold.
 

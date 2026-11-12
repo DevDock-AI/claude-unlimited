@@ -525,6 +525,7 @@ class BranchPin:
     created_at: float
     agent_id: str
     parent_agent_id: Optional[str] = None
+    distributed: bool = False  # placed by distribute mode (choose_for_new_branch)
 
 
 def _blocked_models_for(profile: Profile, model_usage, settings, now: datetime) -> frozenset:
@@ -980,7 +981,7 @@ class Gateway:
                 restored_state = restored.pop("state", state)
                 self._runtime[p.id] = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
-                    automatic=p.automatic,
+                    automatic=p.automatic, kind=p.kind,
                     state=restored_state,
                     credential_seen=p.credential_updated_at,
                     may_spend_credits=_may_spend_credits(p, pool.settings),
@@ -1074,7 +1075,7 @@ class Gateway:
                     new_state = ProfileState.EXHAUSTED
                 self._runtime[p.id] = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
-                    automatic=p.automatic, state=new_state,
+                    automatic=p.automatic, kind=p.kind, state=new_state,
                     last_usage_percent=rt.last_usage_percent, cooldown_until=rt.cooldown_until,
                     resets_at=rt.resets_at,
                     last_usage_percent_7d=rt.last_usage_percent_7d, resets_at_7d=rt.resets_at_7d,
@@ -3020,7 +3021,8 @@ class Gateway:
         pin.last_touch = _pin_clock()
         return pin.profile_id
 
-    def _remember_pin(self, key: tuple, profile_id: str, parent_agent_id: Optional[str]) -> None:
+    def _remember_pin(self, key: tuple, profile_id: str, parent_agent_id: Optional[str],
+                      distributed: bool = False) -> None:
         now = _pin_clock()
         existing = self._branch_pins.get(key)
         if existing is not None:
@@ -3030,17 +3032,19 @@ class Gateway:
                 existing.created_at = now
             existing.profile_id = profile_id
             existing.last_touch = now
+            existing.distributed = distributed
             return
         if len(self._branch_pins) >= BRANCH_PIN_CAP:
             oldest = min(self._branch_pins, key=lambda k: self._branch_pins[k].last_touch)
             del self._branch_pins[oldest]
         self._branch_pins[key] = BranchPin(profile_id=profile_id, last_touch=now, created_at=now,
-                                            agent_id=key[1], parent_agent_id=parent_agent_id)
+                                            agent_id=key[1], parent_agent_id=parent_agent_id,
+                                            distributed=distributed)
 
     def _branch_counts(self) -> dict:
-        """Live pins per Profile — the selector's least-loaded tie-break, so
-        two equally-utilized accounts alternate instead of both taking every
-        branch."""
+        """Live pins per Profile — the load half of choose_for_new_branch's
+        (pinned + 1) / weight, so branches keep spreading instead of all
+        landing on the heaviest account."""
         counts: dict = {}
         cutoff = _pin_clock() - BRANCH_PIN_TTL_SECONDS
         for pin in self._branch_pins.values():
@@ -3239,7 +3243,7 @@ class Gateway:
                                           exclude=frozenset(attempted), fit=fit)
         _note_move(decision.profile_id)
         if decision.profile_id is not None and may_create_pin:
-            self._remember_pin(key, decision.profile_id, parent_agent_id)
+            self._remember_pin(key, decision.profile_id, parent_agent_id, distributed=True)
         return decision
 
     # Polling gives up to ~10 minutes of staleness, during
@@ -3313,6 +3317,14 @@ class Gateway:
         """Profile id -> epoch seconds of its last usage reading."""
         with self._lock:
             return dict(self._usage_observed_at)
+
+    def distribute_active(self) -> bool:
+        """Whether any live agent was placed by distribute mode, which is
+        also how a `code --distribute` session shows up while the setting
+        itself is off."""
+        cutoff = _pin_clock() - BRANCH_PIN_TTL_SECONDS
+        with self._lock:
+            return any(pin.distributed and pin.last_touch > cutoff for pin in self._branch_pins.values())
 
     def live_agent_counts(self) -> dict:
         """Live branch pins per Profile id, for the Dashboard: how many agents
@@ -3516,7 +3528,7 @@ class Gateway:
                 # unconditional recovery one.
                 rt = ProfileRuntime(profile_id=p.id, priority=p.priority,
                                     switch_threshold=p.switch_threshold, automatic=p.automatic,
-                                    state=ProfileState.ELIGIBLE)
+                                    kind=p.kind, state=ProfileState.ELIGIBLE)
             if rt.state == ProfileState.DISABLED or not p.enabled:
                 continue
             recovered = None

@@ -788,3 +788,13 @@ def test_the_pinned_session_note_is_repeated_for_the_next_spent_week(pool_env):
     notes = [e for e in activity_module.list_events(limit=50)
              if e.text == "A has spent its Fable weekly limit"]
     assert len(notes) == 2
+
+
+def test_distribute_active_reflects_live_distribute_sessions_only(pool_env):
+    save_pool(Pool(profiles=[prof("a", priority=1), prof("b", priority=2),
+                             prof("subs", priority=9, forced_for_subagents=True)]))
+    gw = healthy_gateway()
+    serve(gw, hdrs(agent="forced_sub"))           # a forced-subagent pin is not distribute
+    assert gw.distribute_active() is False
+    serve(gw, hdrs(session="s2"), distribute=True)  # a `code --distribute` session is
+    assert gw.distribute_active() is True

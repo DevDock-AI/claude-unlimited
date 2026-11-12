@@ -35,7 +35,7 @@ class UsageSnapshot:
     percent: float
     resets_at: Optional[datetime]
     confidence: str  # "measured" | "estimated"
-    percent_7d: Optional[float] = None  # the unified-7d sibling of `percent`; display-only, never drives Rotation
+    percent_7d: Optional[float] = None  # the unified-7d sibling of `percent`; weights distribute placement, never a switch threshold
     resets_at_7d: Optional[datetime] = None
     # What the two window slots above represent. Anthropic always reports
     # both a 5h and a 7d window, but a codex-kind Profile may report a

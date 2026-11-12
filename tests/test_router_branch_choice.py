@@ -231,3 +231,92 @@ def test_branch_shares_sum_to_one_and_follow_weekly_pressure():
     assert set(shares) == {"tomorrow", "later"}
     assert abs(sum(shares.values()) - 1.0) < 1e-9
     assert abs(shares["tomorrow"] - 0.75) < 0.01
+
+
+def _rt(pid, **kw):
+    kw.setdefault("priority", 1)
+    kw.setdefault("switch_threshold", 98.0)
+    kw.setdefault("automatic", True)
+    return ProfileRuntime(profile_id=pid, **kw)
+
+
+def _place(snapshot, n):
+    counts = {}
+    for _ in range(n):
+        pid = choose_for_new_branch(snapshot, NOW, branch_counts=dict(counts)).profile_id
+        counts[pid] = counts.get(pid, 0) + 1
+    return counts
+
+
+def test_accounts_without_a_weekly_window_take_only_a_small_share():
+    # A metered API key, and a Codex plan whose only window is 5h, must not
+    # out-draw a part-spent subscription: nothing of theirs expires weekly.
+    from claude_unlimited.router import branch_shares
+    snapshot = pool(
+        _rt("sub", kind="oauth", last_usage_percent_7d=40.0, resets_at_7d=NOW + timedelta(days=4)),
+        _rt("key", kind="api"),
+        _rt("codex_5h", kind="codex", last_usage_percent=20.0, window_label="5h",
+            resets_at=NOW + timedelta(hours=3)),
+    )
+    shares = branch_shares(snapshot, NOW)
+    assert shares["sub"] > 0.6
+    assert shares["key"] < 0.2 and shares["codex_5h"] < 0.2
+    counts = _place(snapshot, 10)
+    assert counts["sub"] > counts.get("key", 0) + counts.get("codex_5h", 0)
+
+
+def test_an_unobserved_subscription_counts_as_a_fresh_week():
+    shares = __import__("claude_unlimited.router", fromlist=["branch_shares"]).branch_shares(
+        pool(_rt("new_sub", kind="oauth"), _rt("key", kind="api")), NOW)
+    assert shares["new_sub"] > shares["key"]
+
+
+def test_a_reset_within_the_hour_cannot_take_the_whole_fan_out():
+    # Uncapped, 50% left in 1h weighs ~50 %/h against ~0.4: every subagent
+    # would land on it and move again once its 5h window drains.
+    snapshot = pool(
+        weekly("imminent", 50.0, 1),
+        weekly("b", 40.0, 140), weekly("c", 40.0, 150), weekly("d", 45.0, 130),
+    )
+    counts = _place(snapshot, 12)
+    assert counts["imminent"] <= 7
+    assert all(counts.get(pid, 0) >= 1 for pid in ("b", "c", "d"))
+
+
+def test_readings_past_their_reset_count_as_refilled():
+    # Both stale: the 5h reading and the weekly one already reset, so this
+    # account weighs like a fresh one, not a nearly-spent one.
+    stale = _rt("stale", last_usage_percent=96.0, resets_at=NOW - timedelta(minutes=5),
+                last_usage_percent_7d=97.0, resets_at_7d=NOW - timedelta(hours=1))
+    fresh = _rt("fresh")
+    from claude_unlimited.router import branch_shares
+    shares = branch_shares(pool(stale, fresh), NOW)
+    assert abs(shares["stale"] - shares["fresh"]) < 1e-9
+
+
+def test_non_finite_usage_never_reaches_the_shares():
+    import json
+    import math
+    from claude_unlimited.router import branch_shares
+    odd = _rt("odd", last_usage_percent=float("nan"), last_usage_percent_7d=float("inf"),
+              resets_at_7d=NOW + timedelta(days=2))
+    shares = branch_shares(pool(odd, _rt("ok")), NOW)
+    assert all(math.isfinite(v) for v in shares.values())
+    json.dumps(shares, allow_nan=False)
+
+
+def test_a_weekly_only_account_uses_its_switch_threshold_as_the_ceiling():
+    from claude_unlimited.router import _weekly_spend_rate
+    acct = _rt("w", switch_threshold=90.0, last_usage_percent=60.0, window_label="weekly",
+               resets_at=NOW + timedelta(hours=30))
+    assert abs(_weekly_spend_rate(acct, NOW) - 1.0) < 1e-9  # (90 - 60) / 30h
+
+
+def test_5h_scaling_skips_daily_and_monthly_primary_windows():
+    from claude_unlimited.router import _five_hour_room
+    daily = _rt("d", kind="codex", last_usage_percent=90.0, window_label="daily",
+                resets_at=NOW + timedelta(hours=10))
+    five = _rt("f", kind="codex", last_usage_percent=90.0, window_label="5h",
+               resets_at=NOW + timedelta(hours=2))
+    assert _five_hour_room(daily, NOW) == 1.0
+    assert _five_hour_room(five, NOW) < 0.1

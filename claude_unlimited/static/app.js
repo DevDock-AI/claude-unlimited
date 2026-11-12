@@ -1290,8 +1290,6 @@ function fableLeaveTag(p) {
   return `<span class="subagent-tag" title="${esc(t('profiles.leave_fable_tag_title'))}">${FABLE_TAG_ICON}<span>${esc(t('profiles.leave_fable_tag'))}</span></span>`;
 }
 
-// How many Claude Code agents (main agents and subagents) are pinned to this
-// Profile right now. The live counterpart of "active" for per-branch routing.
 // Distribute mode only: the share of new agents this account takes (see
 // router.branch_shares). Hidden when distribute is off, where priority, not
 // share, decides.
@@ -1302,6 +1300,8 @@ function loadSharePill(p) {
   return `<span class="load-share-pill" title="${esc(t('profile.load_share_tooltip'))}">${esc(t('profile.load_share').replace('{pct}', String(pct)))}</span>`;
 }
 
+// How many Claude Code agents (main agents and subagents) are pinned to this
+// Profile right now. The live counterpart of "active" for per-branch routing.
 function liveAgentsPill(p) {
   if (!(p.live_agents > 0)) return '';
   return `<span class="live-agents-pill" title="${esc(t('profiles.live_agents_title'))}">${esc(t('profiles.live_agents_tag').replace('{n}', String(p.live_agents)))}</span>`;
@@ -1481,7 +1481,7 @@ function renderUsageBar(label, pct, has, threshold, color, resetsAt) {
   const thresholdText = (threshold !== null && threshold !== undefined) ? `${threshold}%` : '';
   return `
     <div class="bar-group">
-      <div class="bar-label-row"><span>${esc(label)}</span>${has ? resetsInLabel(resetsAt) : ''}</div>
+      <div class="bar-label-row"><span>${esc(label)}</span>${resetsInLabel(resetsAt)}</div>
       ${_renderBarVisual(has ? pct : 0, threshold, has, color, usageText, thresholdText)}
     </div>`;
 }
@@ -1698,14 +1698,10 @@ async function loadProfiles(opts = {}) {
       setLiveHtml(el, `<div class="empty">${esc(t('empty.no_profiles_hint'))}</div>`);
       return;
     }
-    // Ordered the way the router actually uses them: by priority normally,
-    // and by share of new agents in distribute mode, so the accounts taking
-    // most of the load lead. Rendering the API's own order left the cards
-    // sitting where they were before a reorder, showing a sequence the
-    // router does not use.
-    const ordered = profiles.slice().sort(_distributeOn
-      ? (a, b) => (b.load_share ?? -1) - (a.load_share ?? -1) || a.priority - b.priority
-      : (a, b) => a.priority - b.priority);
+    // Ordered by priority, which is the order rotation actually tries them
+    // in. Rendering the API's own order left the cards sitting where they
+    // were before a reorder, showing a sequence the router does not use.
+    const ordered = profiles.slice().sort((a, b) => a.priority - b.priority);
     setLiveHtml(el, ordered.map((p) => renderProfileCard(p)).join(''));
   } catch (e) {
     if (e.name === 'AbortError') return;
@@ -1752,12 +1748,13 @@ function renderProfileTableRow(p) {
     // duration) — the column header already says "5h"/"7d" for oauth, and
     // this column is narrow.
     const labelSpan = rawLabel ? `<span style="color:var(--text-faint);font-size:10px;">${esc(rawLabel)}</span>` : '';
+    const resetRow = resetsAt ? `<div class="bar-label-row" style="margin:3px 0 0;font-size:10px;color:var(--text-faint);">${resetsInLabel(resetsAt)}</div>` : '';
     return has
       ? `<div class="bar-cell"><div class="bar-label-row">${labelSpan}<span class="mono-num" style="color:${fillColor}">${pct}%</span></div>
           <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, pct)}%;background:${fillColor}"></div>
-          ${marker}</div>${resetsAt ? `<div class="bar-label-row" style="margin:3px 0 0;font-size:10px;color:var(--text-faint);">${resetsInLabel(resetsAt)}</div>` : ''}</div>`
+          ${marker}</div>${resetRow}</div>`
       : `<div class="bar-cell"><div class="bar-label-row">${labelSpan}<span class="mono-num" style="color:var(--text-faint);font-size:10px;">${esc(t('profile.not_observed'))}</span></div>
-          <div class="bar-track">${marker}</div></div>`;
+          <div class="bar-track">${marker}</div>${resetRow}</div>`;
   };
 
   // API keys have no session-based rate-limit window, so tokens and
@@ -2226,7 +2223,8 @@ function openProfileDetailModal(profileId) {
     const barGroup = (label, pct, has, showThreshold, resetsAt) =>
       renderUsageBar(label, pct, has, showThreshold ? p.switch_threshold : null,
         showThreshold ? barColor(p.status_word, pct, p.switch_threshold) : weeklyBarColor(p.status_word, pct), resetsAt);
-    const anyReset = p.usage_5h_resets_at || p.usage_7d_resets_at;
+    // Only the bars actually drawn: a 7d reset with no 7d reading has no bar.
+    const anyReset = p.usage_5h_resets_at || (has7d && p.usage_7d_resets_at);
     // No second window (codex accounts, typically) — render nothing rather
     // than an empty "7d" bar-group. See usageWindowLabel.
     document.getElementById('pd_bars').innerHTML =

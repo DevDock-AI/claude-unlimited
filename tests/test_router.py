@@ -449,18 +449,14 @@ def test_a_new_branch_prefers_a_fitting_account_over_a_leaving_one_that_fits():
     assert choose_for_new_branch(pool, NOW, {}, fit=_over("c")).profile_id == "b"
 
 
-def test_rotation_prefers_the_account_whose_week_resets_sooner_at_equal_usage():
+def test_rotation_ignores_weekly_pressure_within_a_priority_band():
+    # Distribute-off routing is unchanged: weekly resets only weight
+    # distribute-mode placement, so equal priorities still fall to the 5h reset.
     pool = PoolSnapshot(profiles=[
         rt("spent", state=ProfileState.EXHAUSTED),
-        rt("later", last_usage_percent_7d=50.0, resets_at_7d=NOW + timedelta(days=3)),
-        rt("tomorrow", last_usage_percent_7d=50.0, resets_at_7d=NOW + timedelta(days=1)),
+        rt("urgent_week", last_usage_percent_7d=50.0, resets_at_7d=NOW + timedelta(hours=20),
+           resets_at=NOW + timedelta(hours=4)),
+        rt("sooner_5h", last_usage_percent_7d=10.0, resets_at_7d=NOW + timedelta(days=6),
+           resets_at=NOW + timedelta(hours=1)),
     ], current_profile_id="spent")
-    assert choose(pool, NOW).profile_id == "tomorrow"
-
-
-def test_weekly_pressure_never_overrides_the_sticky_current_account():
-    pool = PoolSnapshot(profiles=[
-        rt("current", last_usage_percent_7d=10.0, resets_at_7d=NOW + timedelta(days=6)),
-        rt("urgent", last_usage_percent_7d=50.0, resets_at_7d=NOW + timedelta(hours=10)),
-    ], current_profile_id="current")
-    assert choose(pool, NOW).profile_id == "current"
+    assert choose(pool, NOW).profile_id == "sooner_5h"

@@ -1656,7 +1656,7 @@ def code(port: int, claude_args: list[str], profile_arg: Optional[str] = None,
               f"— launching claude…\n")
     elif distribute:
         print(f"Routing through Claude Unlimited at {LOOPBACK_HOST}:{port}, balancing across accounts "
-              f"(each new agent starts on the least-busy one) — launching claude…\n")
+              f"(each new agent starts where weekly quota would otherwise go to waste) — launching claude…\n")
     else:
         print(f"Routing through Claude Unlimited at {LOOPBACK_HOST}:{port} — launching claude…\n")
     # execvp replaces this process image outright: it never returns and
@@ -2233,7 +2233,8 @@ def main(argv=None) -> int:
                            help="pin this session to one Profile by name or id, skipping the interactive picker")
     code_pin.add_argument("--distribute", action="store_true",
                            help="balance this session across accounts: the main agent and each subagent start "
-                                "on the least-busy Profile and stay there, each keeping its own prompt cache warm")
+                                "on the Profile whose unused weekly quota would otherwise go to waste soonest, "
+                                "and stay there, each keeping its own prompt cache warm")
     # Deliberately no positional for claude's own args: nargs=REMAINDER
     # fails as soon as the first passthrough token looks like a flag (e.g.
     # `claude-unlimited code --model opus`, where argparse matches --model

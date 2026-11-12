@@ -572,8 +572,9 @@ separately.
 **`code --distribute`** balances the session across your pool. Each new agent — the main
 agent when the session starts, and each subagent when it's spawned — is placed by **where
 quota would otherwise go to waste**. Each account takes a share of new agents in proportion
-to its unused weekly quota per hour left before its week resets, scaled down as its 5-hour
-window fills. Two accounts at 50% weekly: the one resetting tomorrow takes about three new
+to its unused weekly quota per hour left before its week resets (capped at three times the
+pool's median, so one account never takes everything), scaled down as its 5-hour window
+fills. API keys and accounts without a weekly window take only a small share. Two accounts at 50% weekly: the one resetting tomorrow takes about three new
 agents for every one the account resetting in three days takes, and an account nearly out
 for the week takes few. Agents are counted across all your sessions, so the shares hold
 pool-wide; with no usage data yet it is plain round-robin, and your priority order only
@@ -585,9 +586,9 @@ paying a cache miss on every rotation.
 > off, cooling down, needs re-auth), or the agent sits idle for an hour. It places agents,
 > not tokens, so the shares hold over many agents rather than exactly.
 
-While distribute is on, the Overview ranks accounts by their share and each card shows it
-(**38% of new agents**), next to how many agents it is serving (**Agents: N**). Every agent
-moved off an unavailable account is logged in Activity.
+While distribute is on (the setting, or any live `code --distribute` session), each profile on
+the dashboard shows its share (**38% of new agents**) next to how many agents it is serving
+(**Agents: N**). Every agent moved off an unavailable account is logged in Activity.
 
 **Settings → Session routing → "Balance sessions and subagents across accounts"** makes that
 the default for every session, with no flag to remember. **Off by default**, because it changes how your
@@ -615,7 +616,7 @@ Which one wins, in order:
 |---|---|
 | `cu code --profile <name>` | That terminal's main agent uses that account, never rotated. Its subagents do too — unless a profile is marked "Force in subagents", in which case they go there, just as strictly. |
 | "Force in subagents" on a profile | Every subagent goes there; the main agent rotates normally (or stays pinned, with `--profile`). |
-| `cu code --distribute` | Main agent and each subagent start on the least-busy account and stay there, that session. |
+| `cu code --distribute` | Main agent and each subagent start on the account whose unused weekly quota would otherwise go to waste soonest, and stay there, that session. |
 | Settings → "Balance sessions and subagents across accounts" | Same as above, for every session, no flag needed. |
 | *nothing set (default)* | Normal rotation — everyone shares one account until it's spent. |
 
@@ -1052,7 +1053,7 @@ Every command below also works under the short alias **`cu`** — e.g. `cu code`
 |---|---|
 | `claude-unlimited code` | **The one you'll use.** Launches `claude` routed through your pool. |
 | `claude-unlimited code --profile <name>` | Pin the session to one account instead of rotating. |
-| `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. |
+| `claude-unlimited code --distribute` | Balance the session across accounts — the main agent and each subagent start on the account whose unused weekly quota would otherwise go to waste soonest, and stay there, each keeping its own prompt cache warm. |
 | `claude-unlimited codex` | Launch OpenAI's `codex` CLI served from the pool's ChatGPT accounts. Turn it on in Settings first; `--profile <name>` pins one account, other arguments go to codex. |
 | `claude-unlimited desktop` | Route the Claude **desktop app** through your pool, then launch it. `--revert` undoes it. |
 | `claude-unlimited status` | Is the daemon installed and running, and its pid. |
