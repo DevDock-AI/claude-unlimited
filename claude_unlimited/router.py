@@ -55,7 +55,7 @@ class ProfileRuntime:
     last_usage_percent: Optional[float] = None
     cooldown_until: Optional[datetime] = None
     resets_at: Optional[datetime] = None
-    last_usage_percent_7d: Optional[float] = None  # display-only, never drives Rotation
+    last_usage_percent_7d: Optional[float] = None  # orders candidates (see _weekly_spend_rate); never a switch threshold
     resets_at_7d: Optional[datetime] = None
     window_label: Optional[str] = None  # None means "assume 5h"; see observation.UsageSnapshot
     window_label_7d: Optional[str] = None  # None means "assume 7d" (Anthropic) or "no second window" (codex); the Dashboard tells them apart by whether last_usage_percent_7d is also None
@@ -212,10 +212,10 @@ def choose(pool: PoolSnapshot, now: datetime, fit: Optional[RequestFit] = None) 
             return RoutingDecision(profile_id=current.profile_id, reason="fable_limit_no_alternative")
         if not candidates:
             return RoutingDecision(profile_id=None, reason="no_eligible_profile")
-        candidates.sort(key=lambda p: (p.priority, _reset_sort_key(p)))
+        candidates.sort(key=lambda p: (p.priority, -_weekly_spend_rate(p, now), _reset_sort_key(p)))
         return RoutingDecision(profile_id=candidates[0].profile_id, reason="fable_limit_no_alternative")
 
-    staying.sort(key=lambda p: (p.priority, _reset_sort_key(p)))
+    staying.sort(key=lambda p: (p.priority, -_weekly_spend_rate(p, now), _reset_sort_key(p)))
     # Naming the reason matters: "rotated" reads as "the account ran out", and
     # this account has not — its Fable week has and it asked to leave, or the
     # conversation outgrew its backend's window.
@@ -243,13 +243,18 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
          its own account" would quietly become "all of them share one".
          Count-first makes the assignment round-robin: each account takes a
          branch before any account takes a second.
-      2. priority band — decides the order WITHIN a round, so the user's
-         preference still says who is used first, second, third.
-      3. least-utilized first (`last_usage_percent`) — accounts are limited
-         by usage windows, not request count. A profile with no observation
-         yet sorts as 0.0, so a fresh account is preferred over a part-spent
-         one at the same priority.
-      4. `_reset_sort_key` — the same last resort choose() uses.
+      2. use-it-or-lose-it (`_weekly_spend_rate`) — the account whose unused
+         weekly quota would go to waste soonest. Two accounts at 50% weekly:
+         the one resetting tomorrow goes first, the one resetting in three
+         days can wait. An account nearly out for the week sorts last.
+         Distribute mode exists to spend the pool evenly, so this outranks
+         priority here; choose() (distribute off) stays priority-first.
+      3. least-utilized 5h window first (`last_usage_percent`). A profile
+         with no observation yet sorts as 0.0, so a fresh account is
+         preferred over a part-spent one.
+      4. priority band — only between accounts the usage keys can't tell
+         apart (e.g. a fresh pool with no observations yet).
+      5. `_reset_sort_key` — the same last resort choose() uses.
 
     A depleted account can't be pulled in by this: candidates are ELIGIBLE
     only, so exhausted, draining and cooling-down accounts are already out.
@@ -285,8 +290,9 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
         candidates = staying
     candidates.sort(key=lambda p: (
         counts.get(p.profile_id, 0),
-        p.priority,
+        -_weekly_spend_rate(p, now),
         p.last_usage_percent if p.last_usage_percent is not None else 0.0,
+        p.priority,
         _reset_sort_key(p),
         p.profile_id,  # final tie-break so equal candidates order deterministically
     ))
@@ -428,6 +434,36 @@ def _find(pool: PoolSnapshot, profile_id: Optional[str]) -> Optional[ProfileRunt
     if profile_id is None:
         return None
     return next((p for p in pool.profiles if p.profile_id == profile_id), None)
+
+
+_WEEK_HOURS = 7 * 24
+_SPEND_RATE_STEP = 0.25  # %/h; finer differences fall through to the next key
+
+
+def _weekly_spend_rate(p: ProfileRuntime, now: datetime) -> float:
+    """Unused weekly quota per hour left before the week resets: how fast
+    this account would have to be used for none of its week to go to waste.
+    Higher means "use me first". 50% left resetting in 24h is ~2.1 %/h; the
+    same 50% resetting in 72h is ~0.7 %/h; 5% left in four days is ~0.05.
+
+    The weekly window is the binding budget — 5h windows only pace it — so it
+    is the one whose leftovers are worth chasing. An account reporting only a
+    weekly window (window_label "weekly") carries it in the primary fields.
+    Unknown usage counts as unused and an unknown or already-passed reset as
+    a full week away, so a fresh account ranks like one at 0% with a week
+    left. Rounded to _SPEND_RATE_STEP so near-equal accounts fall through to
+    the next key instead of being split by noise."""
+    if p.last_usage_percent_7d is not None or p.resets_at_7d is not None:
+        percent, resets_at = p.last_usage_percent_7d, p.resets_at_7d
+    elif p.window_label == "weekly":
+        percent, resets_at = p.last_usage_percent, p.resets_at
+    else:
+        percent, resets_at = None, None
+    headroom = max(0.0, 100.0 - (percent or 0.0))
+    hours = _WEEK_HOURS
+    if resets_at is not None and resets_at > now:
+        hours = max(1.0, (resets_at - now).total_seconds() / 3600)
+    return round(headroom / hours / _SPEND_RATE_STEP) * _SPEND_RATE_STEP
 
 
 def _reset_sort_key(p: ProfileRuntime) -> tuple:

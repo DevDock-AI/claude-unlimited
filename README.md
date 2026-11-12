@@ -571,9 +571,11 @@ separately.
 
 **`code --distribute`** balances the session across your pool. Each new agent — the main
 agent when the session starts, and each subagent when it's spawned — goes to the account
-with the **fewest agents already working on it**, counted across all your sessions (ties go
-to your priority order, then to the least-used account). It then *stays* there, so it keeps
-its own prompt cache warm instead of paying a cache miss on every rotation.
+with the **fewest agents already working on it**, counted across all your sessions. Ties go
+to the account whose **unused weekly quota would go to waste soonest**: two accounts at 50%
+weekly, the one resetting tomorrow goes first, and one nearly out for the week goes last.
+Then to the least-used 5-hour window, and only then to your priority order. It then *stays*
+there, so it keeps its own prompt cache warm instead of paying a cache miss on every rotation.
 
 > **Balancing happens only when an agent starts — never mid-session.** An agent moves only
 > if its account reaches its switch threshold or a usage limit, becomes unavailable (turned

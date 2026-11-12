@@ -37,13 +37,17 @@ def test_picks_the_least_utilized_account():
     assert decision.reason == "branch_assigned"
 
 
-def test_priority_decides_who_goes_first_when_nothing_is_pinned_yet():
-    # With no branches assigned, the counts are all 0 and the user's
-    # preference order picks the opener: priority 1 at 90% still opens ahead
-    # of priority 2 at 0%.
+def test_usage_not_priority_picks_the_opener_in_distribute_mode():
+    # Distribute mode is for spending the pool evenly: priority 2 at 0% opens
+    # ahead of priority 1 at 90%.
     decision = choose_for_new_branch(pool(p("hi", priority=1, usage=90.0),
                                           p("lo", priority=2, usage=0.0)), NOW)
-    assert decision.profile_id == "hi"
+    assert decision.profile_id == "lo"
+
+
+def test_priority_still_breaks_a_tie_between_accounts_usage_cannot_tell_apart():
+    decision = choose_for_new_branch(pool(p("second", priority=2), p("first", priority=1)), NOW)
+    assert decision.profile_id == "first"
 
 
 def test_branch_count_outranks_priority_so_branches_actually_spread():
@@ -160,3 +164,48 @@ def test_spreading_two_branches_across_two_equal_accounts():
     counts[first] = counts.get(first, 0) + 1
     second = choose_for_new_branch(snapshot, NOW, counts).profile_id
     assert first != second
+
+
+def weekly(pid, percent_7d, resets_in_hours, *, usage=None, priority=1):
+    return ProfileRuntime(
+        profile_id=pid, priority=priority, switch_threshold=98.0, automatic=True,
+        last_usage_percent=usage, last_usage_percent_7d=percent_7d,
+        resets_at_7d=NOW + timedelta(hours=resets_in_hours),
+    )
+
+
+def test_same_weekly_usage_prefers_the_week_that_resets_sooner():
+    # Both half spent: the one resetting tomorrow would waste its leftover,
+    # the one resetting in three days can wait.
+    decision = choose_for_new_branch(pool(weekly("later", 50.0, 72), weekly("tomorrow", 50.0, 24)), NOW)
+    assert decision.profile_id == "tomorrow"
+
+
+def test_an_account_nearly_out_for_the_week_goes_last_despite_a_quiet_5h_window():
+    decision = choose_for_new_branch(pool(
+        weekly("almost_out", 95.0, 96, usage=5.0),
+        weekly("roomy", 40.0, 96, usage=60.0),
+    ), NOW)
+    assert decision.profile_id == "roomy"
+
+
+def test_weekly_only_accounts_are_ranked_by_their_primary_window():
+    soon = ProfileRuntime(profile_id="soon", priority=1, switch_threshold=98.0, automatic=True,
+                          last_usage_percent=50.0, resets_at=NOW + timedelta(hours=24), window_label="weekly")
+    later = ProfileRuntime(profile_id="later", priority=1, switch_threshold=98.0, automatic=True,
+                           last_usage_percent=50.0, resets_at=NOW + timedelta(hours=120), window_label="weekly")
+    assert choose_for_new_branch(pool(later, soon), NOW).profile_id == "soon"
+
+
+def test_near_equal_weekly_pressure_falls_through_to_the_5h_window():
+    decision = choose_for_new_branch(pool(
+        weekly("busy_5h", 50.0, 100, usage=70.0),
+        weekly("quiet_5h", 50.0, 101, usage=10.0),
+    ), NOW)
+    assert decision.profile_id == "quiet_5h"
+
+
+def test_weekly_pressure_outranks_priority_but_spreading_comes_first():
+    profiles = pool(weekly("urgent", 50.0, 12, priority=2), weekly("calm", 10.0, 160, priority=1))
+    assert choose_for_new_branch(profiles, NOW).profile_id == "urgent"
+    assert choose_for_new_branch(profiles, NOW, branch_counts={"urgent": 1}).profile_id == "calm"
