@@ -320,3 +320,20 @@ def test_5h_scaling_skips_daily_and_monthly_primary_windows():
                resets_at=NOW + timedelta(hours=2))
     assert _five_hour_room(daily, NOW) == 1.0
     assert _five_hour_room(five, NOW) < 0.1
+
+
+def test_an_api_key_never_outweighs_a_subscription_low_on_5h_room():
+    from claude_unlimited.router import _branch_weights
+    sub = _rt("sub", kind="oauth", last_usage_percent=95.0, window_label="5h",
+              resets_at=NOW + timedelta(hours=2),
+              last_usage_percent_7d=40.0, resets_at_7d=NOW + timedelta(days=4))
+    key = _rt("key", kind="api")
+    weights = _branch_weights([sub, key], NOW)
+    assert weights["key"] <= weights["sub"]
+
+
+def test_a_two_account_pool_is_capped():
+    from claude_unlimited.router import branch_shares
+    shares = branch_shares(pool(weekly("imminent", 50.0, 1), weekly("b", 40.0, 140)), NOW)
+    assert abs(shares["imminent"] - 0.75) < 0.01
+    assert abs(shares["b"] - 0.25) < 0.01

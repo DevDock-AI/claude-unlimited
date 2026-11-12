@@ -2224,7 +2224,9 @@ function openProfileDetailModal(profileId) {
       renderUsageBar(label, pct, has, showThreshold ? p.switch_threshold : null,
         showThreshold ? barColor(p.status_word, pct, p.switch_threshold) : weeklyBarColor(p.status_word, pct), resetsAt);
     // Only the bars actually drawn: a 7d reset with no 7d reading has no bar.
-    const anyReset = p.usage_5h_resets_at || (has7d && p.usage_7d_resets_at);
+    // A reset already in the past is no reset data either.
+    const isFuture = (iso) => !!iso && formatFutureRelative(iso) !== '< 1m';
+    const anyReset = isFuture(p.usage_5h_resets_at) || (has7d && isFuture(p.usage_7d_resets_at));
     // No second window (codex accounts, typically) — render nothing rather
     // than an empty "7d" bar-group. See usageWindowLabel.
     document.getElementById('pd_bars').innerHTML =

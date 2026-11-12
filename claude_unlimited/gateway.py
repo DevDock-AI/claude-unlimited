@@ -3243,7 +3243,7 @@ class Gateway:
                                           exclude=frozenset(attempted), fit=fit)
         _note_move(decision.profile_id)
         if decision.profile_id is not None and may_create_pin:
-            self._remember_pin(key, decision.profile_id, parent_agent_id, distributed=True)
+            self._remember_pin(key, decision.profile_id, parent_agent_id, distributed=distribute)
         return decision
 
     # Polling gives up to ~10 minutes of staleness, during

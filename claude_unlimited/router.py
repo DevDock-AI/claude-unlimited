@@ -523,10 +523,12 @@ def _branch_weights(candidates: list, now: datetime) -> dict[str, float]:
     """Distribute mode's weight per candidate: the weekly spend rate, capped
     at _MAX_WEIGHT_VS_MEDIAN times the candidates' median and floored at
     _MIN_BRANCH_WEIGHT, times `_five_hour_room`. An account with no weekly
-    window gets the floor. Always positive and finite."""
+    window gets the floor, clamped to the lowest weight of any account that
+    has one, so an API key never outweighs a subscription. The cap uses the
+    low median so a 2-account pool is capped too. Always positive and finite."""
     rates = {p.profile_id: _weekly_spend_rate(p, now) for p in candidates}
     known = [r for r in rates.values() if r is not None]
-    cap = max(_MIN_BRANCH_WEIGHT, statistics.median(known)) * _MAX_WEIGHT_VS_MEDIAN if known else None
+    cap = max(_MIN_BRANCH_WEIGHT, statistics.median_low(known)) * _MAX_WEIGHT_VS_MEDIAN if known else None
     weights = {}
     for p in candidates:
         rate = rates[p.profile_id]
@@ -534,6 +536,12 @@ def _branch_weights(candidates: list, now: datetime) -> dict[str, float]:
         if cap is not None:
             base = min(base, cap)
         weights[p.profile_id] = base * _five_hour_room(p, now)
+    rated = [weights[pid] for pid, r in rates.items() if r is not None]
+    if rated:
+        no_weekly_cap = min(_MIN_BRANCH_WEIGHT, min(rated))
+        for pid, r in rates.items():
+            if r is None:
+                weights[pid] = min(weights[pid], no_weekly_cap)
     return weights
 
 
