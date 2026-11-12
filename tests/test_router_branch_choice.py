@@ -86,12 +86,16 @@ def test_a_never_observed_account_is_used_before_a_part_spent_one():
     assert decision.profile_id == "fresh"
 
 
-def test_the_least_loaded_account_wins_however_lopsided_the_pool_is():
-    # Two accounts must ALTERNATE, not both take every branch — and that has to
-    # hold when they differ in usage and priority, not only when they're twins.
-    snapshot = pool(p("a", priority=1, usage=20.0), p("b", priority=2, usage=80.0))
-    assert choose_for_new_branch(snapshot, NOW, {"a": 2, "b": 0}).profile_id == "b"
-    assert choose_for_new_branch(snapshot, NOW, {"a": 0, "b": 2}).profile_id == "a"
+def test_twins_alternate_and_a_lopsided_pool_still_never_starves_an_account():
+    # Two identical accounts must ALTERNATE, not both take every branch.
+    twins = pool(p("a", usage=20.0), p("b", usage=20.0))
+    assert choose_for_new_branch(twins, NOW, {"a": 1, "b": 0}).profile_id == "b"
+    assert choose_for_new_branch(twins, NOW, {"a": 0, "b": 1}).profile_id == "a"
+    # A busier one takes fewer, but load keeps growing on the winner, so the
+    # other is picked once its share is used up.
+    lopsided = pool(p("a", priority=1, usage=20.0), p("b", priority=2, usage=80.0))
+    assert choose_for_new_branch(lopsided, NOW, {"a": 2, "b": 0}).profile_id == "a"
+    assert choose_for_new_branch(lopsided, NOW, {"a": 5, "b": 0}).profile_id == "b"
 
 
 def test_excluded_accounts_are_skipped_so_failover_moves_on():
@@ -205,7 +209,25 @@ def test_near_equal_weekly_pressure_falls_through_to_the_5h_window():
     assert decision.profile_id == "quiet_5h"
 
 
-def test_weekly_pressure_outranks_priority_but_spreading_comes_first():
-    profiles = pool(weekly("urgent", 50.0, 12, priority=2), weekly("calm", 10.0, 160, priority=1))
-    assert choose_for_new_branch(profiles, NOW).profile_id == "urgent"
-    assert choose_for_new_branch(profiles, NOW, branch_counts={"urgent": 1}).profile_id == "calm"
+def test_load_follows_weekly_pressure_in_proportion():
+    # Half the week left, resetting in 24h (~2.1 %/h) vs 72h (~0.7 %/h): the
+    # urgent account takes about three branches for every one the other does.
+    profiles = pool(weekly("tomorrow", 50.0, 24, priority=2), weekly("later", 50.0, 72, priority=1))
+    counts = {"tomorrow": 0, "later": 0}
+    for _ in range(12):
+        counts[choose_for_new_branch(profiles, NOW, branch_counts=counts).profile_id] += 1
+    assert counts == {"tomorrow": 9, "later": 3}
+
+
+def test_an_account_about_to_hit_its_5h_limit_takes_less_however_urgent_its_week():
+    profiles = pool(weekly("urgent_but_5h_full", 50.0, 24, usage=95.0), weekly("calm", 30.0, 120, usage=10.0))
+    assert choose_for_new_branch(profiles, NOW).profile_id == "calm"
+
+
+def test_branch_shares_sum_to_one_and_follow_weekly_pressure():
+    from claude_unlimited.router import branch_shares
+    shares = branch_shares(pool(weekly("tomorrow", 50.0, 24), weekly("later", 50.0, 72),
+                                p("off", state=ProfileState.EXHAUSTED)), NOW)
+    assert set(shares) == {"tomorrow", "later"}
+    assert abs(sum(shares.values()) - 1.0) < 1e-9
+    assert abs(shares["tomorrow"] - 0.75) < 0.01

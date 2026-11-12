@@ -212,10 +212,10 @@ def choose(pool: PoolSnapshot, now: datetime, fit: Optional[RequestFit] = None) 
             return RoutingDecision(profile_id=current.profile_id, reason="fable_limit_no_alternative")
         if not candidates:
             return RoutingDecision(profile_id=None, reason="no_eligible_profile")
-        candidates.sort(key=lambda p: (p.priority, -_weekly_spend_rate(p, now), _reset_sort_key(p)))
+        candidates.sort(key=lambda p: (p.priority, -_spend_rate_key(p, now), _reset_sort_key(p)))
         return RoutingDecision(profile_id=candidates[0].profile_id, reason="fable_limit_no_alternative")
 
-    staying.sort(key=lambda p: (p.priority, -_weekly_spend_rate(p, now), _reset_sort_key(p)))
+    staying.sort(key=lambda p: (p.priority, -_spend_rate_key(p, now), _reset_sort_key(p)))
     # Naming the reason matters: "rotated" reads as "the account ran out", and
     # this account has not — its Fable week has and it asked to leave, or the
     # conversation outgrew its backend's window.
@@ -233,28 +233,27 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
     or one of its subagents) — used only by distribute-mode routing.
 
     Unlike choose(), this is deliberately NOT sticky and NOT "first by
-    priority": its job is to spread branches so one account isn't drained
-    while another sits idle. Ordering, in force:
+    priority": its job is to spend the pool well, so one account isn't
+    drained while another sits idle and no account's week goes to waste.
 
-      1. fewest branches currently pinned to it (`branch_counts`) — the
-         spreading rule, and it has to come FIRST. Any other leading key
-         (priority, utilization) is the same for every branch of a session,
-         so every branch would pick the same winner and "each subagent gets
-         its own account" would quietly become "all of them share one".
-         Count-first makes the assignment round-robin: each account takes a
-         branch before any account takes a second.
-      2. use-it-or-lose-it (`_weekly_spend_rate`) — the account whose unused
-         weekly quota would go to waste soonest. Two accounts at 50% weekly:
-         the one resetting tomorrow goes first, the one resetting in three
-         days can wait. An account nearly out for the week sorts last.
-         Distribute mode exists to spend the pool evenly, so this outranks
-         priority here; choose() (distribute off) stays priority-first.
-      3. least-utilized 5h window first (`last_usage_percent`). A profile
-         with no observation yet sorts as 0.0, so a fresh account is
-         preferred over a part-spent one.
-      4. priority band — only between accounts the usage keys can't tell
-         apart (e.g. a fresh pool with no observations yet).
-      5. `_reset_sort_key` — the same last resort choose() uses.
+    Each account gets a share of branches proportional to its weight
+    (`_branch_weight`): how urgently its unused weekly quota needs spending
+    (`_weekly_spend_rate`), scaled down as its 5h window fills. The next
+    branch goes to the account with the lowest load per unit of weight,
+    (pinned branches + 1) / weight — weighted round-robin. An account whose
+    week resets tomorrow with half its quota left takes several branches for
+    every one a barely-used account with a week to go takes; one nearly out
+    for the week takes few. With equal weights (a fresh pool) this is plain
+    round-robin: each account takes a branch before any takes a second.
+
+    Load has to come first. Any key that is the same for every branch of a
+    session (priority, utilization) would, as the leading key, send every
+    branch to the same winner, and "each subagent gets its own account"
+    would quietly become "all of them share one". Load grows with each
+    branch placed, so the winner changes.
+
+    Ties then go to the least-used 5h window, then priority, then
+    `_reset_sort_key`, then profile id.
 
     A depleted account can't be pulled in by this: candidates are ELIGIBLE
     only, so exhausted, draining and cooling-down accounts are already out.
@@ -289,14 +288,25 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
     if staying:
         candidates = staying
     candidates.sort(key=lambda p: (
-        counts.get(p.profile_id, 0),
-        -_weekly_spend_rate(p, now),
+        round((counts.get(p.profile_id, 0) + 1) / _branch_weight(p, now), 6),
         p.last_usage_percent if p.last_usage_percent is not None else 0.0,
         p.priority,
         _reset_sort_key(p),
         p.profile_id,  # final tie-break so equal candidates order deterministically
     ))
     return RoutingDecision(profile_id=candidates[0].profile_id, reason="branch_assigned")
+
+
+def branch_shares(pool: PoolSnapshot, now: datetime) -> dict[str, float]:
+    """Each account's long-run share (0..1) of NEW branches in distribute
+    mode: its `_branch_weight` over the pool's total, among the accounts
+    choose_for_new_branch would consider. For the Dashboard, so the accounts
+    taking most of the load are visible at a glance; routing never reads it."""
+    eligible = [p for p in pool.profiles if p.state == ProfileState.ELIGIBLE and p.automatic]
+    candidates = [p for p in eligible if not must_leave(p, now)] or eligible
+    weights = {p.profile_id: _branch_weight(p, now) for p in candidates}
+    total = sum(weights.values())
+    return {pid: w / total for pid, w in weights.items()} if total > 0 else {}
 
 
 def observe(pool: PoolSnapshot, profile_id: str, observation: Observation, now: datetime) -> PoolSnapshot:
@@ -451,8 +461,7 @@ def _weekly_spend_rate(p: ProfileRuntime, now: datetime) -> float:
     weekly window (window_label "weekly") carries it in the primary fields.
     Unknown usage counts as unused and an unknown or already-passed reset as
     a full week away, so a fresh account ranks like one at 0% with a week
-    left. Rounded to _SPEND_RATE_STEP so near-equal accounts fall through to
-    the next key instead of being split by noise."""
+    left."""
     if p.last_usage_percent_7d is not None or p.resets_at_7d is not None:
         percent, resets_at = p.last_usage_percent_7d, p.resets_at_7d
     elif p.window_label == "weekly":
@@ -463,7 +472,32 @@ def _weekly_spend_rate(p: ProfileRuntime, now: datetime) -> float:
     hours = _WEEK_HOURS
     if resets_at is not None and resets_at > now:
         hours = max(1.0, (resets_at - now).total_seconds() / 3600)
-    return round(headroom / hours / _SPEND_RATE_STEP) * _SPEND_RATE_STEP
+    return headroom / hours
+
+
+def _spend_rate_key(p: ProfileRuntime, now: datetime) -> float:
+    """_weekly_spend_rate rounded to _SPEND_RATE_STEP, for sorting: near-equal
+    accounts fall through to the next key instead of being split by noise."""
+    return round(_weekly_spend_rate(p, now) / _SPEND_RATE_STEP) * _SPEND_RATE_STEP
+
+
+_MIN_BRANCH_WEIGHT = 0.1  # %/h; keeps a nearly-spent account in the rotation, rarely
+
+
+def _branch_weight(p: ProfileRuntime, now: datetime) -> float:
+    """Distribute mode's share of new branches for this account.
+
+    The weekly spend rate, scaled by how much of the 5h window is left
+    before the switch threshold: piling branches onto an account that is
+    about to hit its 5h limit only moves them again shortly (each move is a
+    prompt-cache miss), however urgent its week. Floored so no eligible
+    account is starved outright; a weekly-only account has no 5h window to
+    scale by."""
+    weight = max(_MIN_BRANCH_WEIGHT, _weekly_spend_rate(p, now))
+    if p.window_label != "weekly" and p.last_usage_percent is not None and p.switch_threshold > 0:
+        room = (p.switch_threshold - p.last_usage_percent) / p.switch_threshold
+        weight *= min(1.0, max(0.05, room))
+    return weight
 
 
 def _reset_sort_key(p: ProfileRuntime) -> tuple:

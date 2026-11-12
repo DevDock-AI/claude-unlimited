@@ -1292,6 +1292,16 @@ function fableLeaveTag(p) {
 
 // How many Claude Code agents (main agents and subagents) are pinned to this
 // Profile right now. The live counterpart of "active" for per-branch routing.
+// Distribute mode only: the share of new agents this account takes (see
+// router.branch_shares). Hidden when distribute is off, where priority, not
+// share, decides.
+let _distributeOn = false;
+function loadSharePill(p) {
+  if (!_distributeOn || p.load_share === null || p.load_share === undefined) return '';
+  const pct = Math.round(p.load_share * 100);
+  return `<span class="load-share-pill" title="${esc(t('profile.load_share_tooltip'))}">${esc(t('profile.load_share').replace('{pct}', String(pct)))}</span>`;
+}
+
 function liveAgentsPill(p) {
   if (!(p.live_agents > 0)) return '';
   return `<span class="live-agents-pill" title="${esc(t('profiles.live_agents_title'))}">${esc(t('profiles.live_agents_tag').replace('{n}', String(p.live_agents)))}</span>`;
@@ -1628,7 +1638,7 @@ function renderProfileCard(p) {
       <div class="p-top">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
-        ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}
+        ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${loadSharePill(p)}${liveAgentsPill(p)}
         ${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}
         ${creditsPill(p)}
         ${kindLabel ? `<span class="p-kind">${kindLabel}</span>` : ''}
@@ -1679,7 +1689,8 @@ let _lastProfiles = [];
 async function loadProfiles(opts = {}) {
   const el = document.getElementById('profiles');
   try {
-    const { profiles } = await api('/api/profiles', opts);
+    const { profiles, distribute } = await api('/api/profiles', opts);
+    _distributeOn = Boolean(distribute);
     _lastProfiles = profiles;
     refreshCodexCreditsVisibility(opts);
     renderStatStrip(profiles);
@@ -1687,10 +1698,14 @@ async function loadProfiles(opts = {}) {
       setLiveHtml(el, `<div class="empty">${esc(t('empty.no_profiles_hint'))}</div>`);
       return;
     }
-    // Ordered by priority, which is the order rotation actually tries them
-    // in. Rendering the API's own order left the cards sitting where they
-    // were before a reorder, showing a sequence the router does not use.
-    const ordered = profiles.slice().sort((a, b) => a.priority - b.priority);
+    // Ordered the way the router actually uses them: by priority normally,
+    // and by share of new agents in distribute mode, so the accounts taking
+    // most of the load lead. Rendering the API's own order left the cards
+    // sitting where they were before a reorder, showing a sequence the
+    // router does not use.
+    const ordered = profiles.slice().sort(_distributeOn
+      ? (a, b) => (b.load_share ?? -1) - (a.load_share ?? -1) || a.priority - b.priority
+      : (a, b) => a.priority - b.priority);
     setLiveHtml(el, ordered.map((p) => renderProfileCard(p)).join(''));
   } catch (e) {
     if (e.name === 'AbortError') return;
@@ -1769,7 +1784,7 @@ function renderProfileTableRow(p) {
       <div class="row-name-cell">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
-          <div class="p-name">${esc(p.name)} ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}${paymentRequiredBadge(p)}</div>
+          <div class="p-name">${esc(p.name)} ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${loadSharePill(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}${paymentRequiredBadge(p)}</div>
           <div class="p-kind">${kindLabel}</div>${modelUsageChips(p)}
         </div>
       </div>
@@ -1811,7 +1826,8 @@ async function loadProfilesTable(opts = {}) {
   const el = document.getElementById('profilesTableBody');
   const sub = document.getElementById('profilesSub');
   try {
-    const { profiles } = await api('/api/profiles', opts);
+    const { profiles, distribute } = await api('/api/profiles', opts);
+    _distributeOn = Boolean(distribute);
     _lastProfiles = profiles;
     if (sub) {
       const enabledCount = profiles.filter((p) => p.enabled).length;

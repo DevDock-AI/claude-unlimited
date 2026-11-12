@@ -97,6 +97,8 @@ def test_full_crud_roundtrip_with_valid_csrf(running_server):
 
     status, body = _request(f"{base}/api/profiles")
     assert len(body["profiles"]) == 1
+    assert body["distribute"] is False
+    assert body["profiles"][0]["load_share"] == 1.0  # the only account takes every new agent
 
     status, body = _request(f"{base}/api/profiles/{profile_id}", "PATCH", {"priority": 2}, headers=headers)
     assert status == 200

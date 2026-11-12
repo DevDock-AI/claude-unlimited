@@ -540,6 +540,9 @@
   .model-usage-line { display: flex; flex-wrap: wrap; gap: 0 10px; min-width: 0; margin-top: 1px; }
   .model-usage-chip { font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums;
     min-width: 0; overflow-wrap: anywhere; }   /* wraps inside a narrow name cell, never over the next column */
+  .load-share-pill { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px;
+    border: 1px solid var(--accent-border); background: var(--accent-soft); color: var(--accent);
+    font-size: var(--fs-micro); font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .live-agents-pill { display: inline-flex; align-items: center; padding: 2px 7px;
     border: 1px solid var(--border); border-radius: 999px; background: var(--bg-panel-alt);
     color: var(--text-dim); font-size: var(--fs-micro); font-weight: 600; white-space: nowrap;
@@ -1476,7 +1479,7 @@
         <div class="field-row">
           <div class="field-text">
             <div class="field-title" data-i18n="settings.routing.distribute_label">Balance sessions and subagents across accounts</div>
-            <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the least-busy account. Same as launching every session with --distribute. Off by default.</div>
+            <div class="field-sub" data-i18n="settings.routing.distribute_sub">New agents go mostly to accounts whose unused weekly quota resets soonest, less to ones near a limit. Same as launching every session with --distribute. Off by default.</div>
           </div>
           <div class="toggle off" id="distributeDefaultToggle" data-field="distribute_sessions_default"><div class="toggle-knob"></div></div>
         </div>

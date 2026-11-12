@@ -570,21 +570,24 @@ their own requests, and Claude Code labels each one. Claude Unlimited can route 
 separately.
 
 **`code --distribute`** balances the session across your pool. Each new agent — the main
-agent when the session starts, and each subagent when it's spawned — goes to the account
-with the **fewest agents already working on it**, counted across all your sessions. Ties go
-to the account whose **unused weekly quota would go to waste soonest**: two accounts at 50%
-weekly, the one resetting tomorrow goes first, and one nearly out for the week goes last.
-Then to the least-used 5-hour window, and only then to your priority order. It then *stays*
-there, so it keeps its own prompt cache warm instead of paying a cache miss on every rotation.
+agent when the session starts, and each subagent when it's spawned — is placed by **where
+quota would otherwise go to waste**. Each account takes a share of new agents in proportion
+to its unused weekly quota per hour left before its week resets, scaled down as its 5-hour
+window fills. Two accounts at 50% weekly: the one resetting tomorrow takes about three new
+agents for every one the account resetting in three days takes, and an account nearly out
+for the week takes few. Agents are counted across all your sessions, so the shares hold
+pool-wide; with no usage data yet it is plain round-robin, and your priority order only
+breaks ties. Each agent then *stays* put, so it keeps its own prompt cache warm instead of
+paying a cache miss on every rotation.
 
 > **Balancing happens only when an agent starts — never mid-session.** An agent moves only
 > if its account reaches its switch threshold or a usage limit, becomes unavailable (turned
-> off, cooling down, needs re-auth), or the agent sits idle for an hour. It balances by how
-> many agents each account is serving, not by usage percentage, so usage evens out roughly
-> over many sessions rather than exactly.
+> off, cooling down, needs re-auth), or the agent sits idle for an hour. It places agents,
+> not tokens, so the shares hold over many agents rather than exactly.
 
-While agents are spread out, each profile on the dashboard shows how many it is serving
-(**Agents: N**), and every agent moved off an unavailable account is logged in Activity.
+While distribute is on, the Overview ranks accounts by their share and each card shows it
+(**38% of new agents**), next to how many agents it is serving (**Agents: N**). Every agent
+moved off an unavailable account is logged in Activity.
 
 **Settings → Session routing → "Balance sessions and subagents across accounts"** makes that
 the default for every session, with no flag to remember. **Off by default**, because it changes how your
