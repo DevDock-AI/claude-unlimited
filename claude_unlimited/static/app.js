@@ -1290,6 +1290,16 @@ function fableLeaveTag(p) {
   return `<span class="subagent-tag" title="${esc(t('profiles.leave_fable_tag_title'))}">${FABLE_TAG_ICON}<span>${esc(t('profiles.leave_fable_tag'))}</span></span>`;
 }
 
+// Distribute mode only: the share of new agents this account takes (see
+// router.branch_shares). Hidden when distribute is off, where priority, not
+// share, decides.
+let _distributeOn = false;
+function loadSharePill(p) {
+  if (!_distributeOn || p.load_share === null || p.load_share === undefined) return '';
+  const pct = Math.round(p.load_share * 100);
+  return `<span class="load-share-pill" title="${esc(t('profile.load_share_tooltip'))}">${esc(t('profile.load_share').replace('{pct}', String(pct)))}</span>`;
+}
+
 // How many Claude Code agents (main agents and subagents) are pinned to this
 // Profile right now. The live counterpart of "active" for per-branch routing.
 function liveAgentsPill(p) {
@@ -1457,12 +1467,21 @@ function _renderBarVisual(pct, thresholdPct, has, color, usageText, thresholdTex
       </div>`;
 }
 
-function renderUsageBar(label, pct, has, threshold, color) {
+// Each window resets on its own clock (5h vs weekly), so each bar names its
+// own reset; hovering shows the exact local time.
+function resetsInLabel(resetsAt) {
+  const resetIn = formatFutureRelative(resetsAt);
+  if (!resetIn) return '';
+  const exact = new Date(resetsAt).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `<span title="${esc(exact)}">${esc(t('profile.resets_in'))} <span class="mono-num">${esc(resetIn)}</span></span>`;
+}
+
+function renderUsageBar(label, pct, has, threshold, color, resetsAt) {
   const usageText = has ? `${pct}%` : esc(t('profile.not_observed'));
   const thresholdText = (threshold !== null && threshold !== undefined) ? `${threshold}%` : '';
   return `
     <div class="bar-group">
-      <div class="bar-label-row"><span>${esc(label)}</span></div>
+      <div class="bar-label-row"><span>${esc(label)}</span>${resetsInLabel(resetsAt)}</div>
       ${_renderBarVisual(has ? pct : 0, threshold, has, color, usageText, thresholdText)}
     </div>`;
 }
@@ -1473,7 +1492,7 @@ function renderUsageBar(label, pct, has, threshold, color) {
 function modelUsageBars(p) {
   return (p.model_usage || []).map((w) =>
     renderUsageBar(t('profile.model_window').replace('{model}', w.name), w.percent, true, null,
-      weeklyBarColor(p.status_word, w.percent))).join('');
+      weeklyBarColor(p.status_word, w.percent), w.resets_at)).join('');
 }
 
 // Shown only while requests are actually being charged to prepaid credits
@@ -1588,10 +1607,10 @@ function renderProfileCard(p) {
   const fillColor5h = barColor(p.status_word, p.usage_5h_percent, p.switch_threshold);
   const fillColor7d = weeklyBarColor(p.status_word, p.usage_7d_percent);
 
-  const bar5h = renderUsageBar(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, p.switch_threshold, fillColor5h);
+  const bar5h = renderUsageBar(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, p.switch_threshold, fillColor5h, p.usage_5h_resets_at);
   // No second window (codex accounts, typically) — render nothing rather
   // than an empty "7d" bar for a window that doesn't exist.
-  const bar7d = has7d ? renderUsageBar(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, null, fillColor7d) : '';
+  const bar7d = has7d ? renderUsageBar(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, null, fillColor7d, p.usage_7d_resets_at) : '';
 
   // API keys have no session-based rate-limit window, so tokens and
   // estimated cost are the meaningful figures for a metered key. With a
@@ -1611,9 +1630,6 @@ function renderProfileCard(p) {
       <div class="bar-label-row"><span>${esc(t('profile.cost_estimated'))}</span><span class="mono-num">${p.cost_usd_total !== null ? '$' + p.cost_usd_total.toFixed(2) : '—'}</span></div>
     </div>`;
 
-  const resetIn = formatFutureRelative(p.usage_5h_resets_at);
-  const footResets = resetIn ? `<span>${esc(t('profile.resets_in'))} <span class="mono-num">${esc(resetIn)}</span></span>` : '';
-
   const tagStyle = p.tag_color ? ` style="--tag-color:${esc(p.tag_color)}"` : '';
   const tagClass = p.tag_color ? ' has-tag' : '';
 
@@ -1622,7 +1638,7 @@ function renderProfileCard(p) {
       <div class="p-top">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <span class="p-name">${esc(p.name)}</span>
-        ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}
+        ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${loadSharePill(p)}${liveAgentsPill(p)}
         ${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}
         ${creditsPill(p)}
         ${kindLabel ? `<span class="p-kind">${kindLabel}</span>` : ''}
@@ -1636,7 +1652,6 @@ function renderProfileCard(p) {
       </div>
       <div class="p-bars">${usageBlock}</div>
       <div class="p-foot">
-        ${footResets}
         <div class="p-foot-spacer"></div>
         <span>${p.automatic ? esc(t('profile.auto_rotation_on')) : esc(t('profile.manual_only'))}</span>
         <div class="toggle ${p.enabled ? '' : 'off'} toggle-enabled"><div class="toggle-knob"></div></div>
@@ -1674,7 +1689,8 @@ let _lastProfiles = [];
 async function loadProfiles(opts = {}) {
   const el = document.getElementById('profiles');
   try {
-    const { profiles } = await api('/api/profiles', opts);
+    const { profiles, distribute } = await api('/api/profiles', opts);
+    _distributeOn = Boolean(distribute);
     _lastProfiles = profiles;
     refreshCodexCreditsVisibility(opts);
     renderStatStrip(profiles);
@@ -1721,7 +1737,7 @@ function renderProfileTableRow(p) {
   const has5h = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
   const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
 
-  const barCell = (rawLabel, pct, has, isWeekly) => {
+  const barCell = (rawLabel, pct, has, isWeekly, resetsAt) => {
     // The 7d/weekly column has no switch_threshold concept (same as the
     // card and Detail modal) — no marker to draw, and its own fixed-band
     // color rule (weeklyBarColor) instead of the 5h column's
@@ -1732,12 +1748,13 @@ function renderProfileTableRow(p) {
     // duration) — the column header already says "5h"/"7d" for oauth, and
     // this column is narrow.
     const labelSpan = rawLabel ? `<span style="color:var(--text-faint);font-size:10px;">${esc(rawLabel)}</span>` : '';
+    const resetRow = resetsAt ? `<div class="bar-label-row" style="margin:3px 0 0;font-size:10px;color:var(--text-faint);">${resetsInLabel(resetsAt)}</div>` : '';
     return has
       ? `<div class="bar-cell"><div class="bar-label-row">${labelSpan}<span class="mono-num" style="color:${fillColor}">${pct}%</span></div>
           <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, pct)}%;background:${fillColor}"></div>
-          ${marker}</div></div>`
+          ${marker}</div>${resetRow}</div>`
       : `<div class="bar-cell"><div class="bar-label-row">${labelSpan}<span class="mono-num" style="color:var(--text-faint);font-size:10px;">${esc(t('profile.not_observed'))}</span></div>
-          <div class="bar-track">${marker}</div></div>`;
+          <div class="bar-track">${marker}</div>${resetRow}</div>`;
   };
 
   // API keys have no session-based rate-limit window, so tokens and
@@ -1750,7 +1767,7 @@ function renderProfileTableRow(p) {
   // row is a CSS grid with a fixed column template, so an omitted child
   // would shift every column after it.
   const usageCells = p.kind !== 'api'
-    ? `${barCell(usageWindowLabelOrBlank(p.usage_window_label), p.usage_5h_percent, has5h, false)}${has7d ? barCell(usageWindowLabelOrBlank(p.usage_window_label_7d), p.usage_7d_percent, has7d, true) : '<div class="bar-cell"></div>'}`
+    ? `${barCell(usageWindowLabelOrBlank(p.usage_window_label), p.usage_5h_percent, has5h, false, p.usage_5h_resets_at)}${has7d ? barCell(usageWindowLabelOrBlank(p.usage_window_label_7d), p.usage_7d_percent, has7d, true, p.usage_7d_resets_at) : '<div class="bar-cell"></div>'}`
     : `${usageCell(t('profile.tokens_used'), formatTokenCount(p.tokens_total))}${usageCell(t('profile.cost_estimated'), p.cost_usd_total !== null ? '$' + p.cost_usd_total.toFixed(2) : '—')}`;
 
   const tagStyle = p.tag_color ? ` style="--tag-color:${esc(p.tag_color)}"` : '';
@@ -1764,7 +1781,7 @@ function renderProfileTableRow(p) {
       <div class="row-name-cell">
         <div class="p-icon${tagClass}${p.kind === 'codex' ? ' kind-codex' : ''}">${kindIcon(p)}</div>
         <div class="row-name-text">
-          <div class="p-name">${esc(p.name)} ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}${paymentRequiredBadge(p)}</div>
+          <div class="p-name">${esc(p.name)} ${planBadge(p)}${tokenExpiryTag(p)}${subagentTag(p)}${fableLeaveTag(p)}${loadSharePill(p)}${liveAgentsPill(p)}${p.in_use_now ? `<span class="used-now-pill"><span class="used-now-dot"></span>${esc(t('profiles.used_now_tag'))}</span>` : ''}${creditsPill(p)}${paymentRequiredBadge(p)}</div>
           <div class="p-kind">${kindLabel}</div>${modelUsageChips(p)}
         </div>
       </div>
@@ -1806,7 +1823,8 @@ async function loadProfilesTable(opts = {}) {
   const el = document.getElementById('profilesTableBody');
   const sub = document.getElementById('profilesSub');
   try {
-    const { profiles } = await api('/api/profiles', opts);
+    const { profiles, distribute } = await api('/api/profiles', opts);
+    _distributeOn = Boolean(distribute);
     _lastProfiles = profiles;
     if (sub) {
       const enabledCount = profiles.filter((p) => p.enabled).length;
@@ -2202,17 +2220,18 @@ function openProfileDetailModal(profileId) {
   } else {
     const has5h = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
     const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
-    const barGroup = (label, pct, has, showThreshold) =>
+    const barGroup = (label, pct, has, showThreshold, resetsAt) =>
       renderUsageBar(label, pct, has, showThreshold ? p.switch_threshold : null,
-        showThreshold ? barColor(p.status_word, pct, p.switch_threshold) : weeklyBarColor(p.status_word, pct));
-    const resetIn = formatFutureRelative(p.usage_5h_resets_at);
+        showThreshold ? barColor(p.status_word, pct, p.switch_threshold) : weeklyBarColor(p.status_word, pct), resetsAt);
+    // Only the bars actually drawn: a 7d reset with no 7d reading has no bar.
+    const anyReset = p.usage_5h_resets_at || (has7d && p.usage_7d_resets_at);
     // No second window (codex accounts, typically) — render nothing rather
     // than an empty "7d" bar-group. See usageWindowLabel.
     document.getElementById('pd_bars').innerHTML =
-      barGroup(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, true) +
-      (has7d ? barGroup(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, false) : '') +
+      barGroup(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, true, p.usage_5h_resets_at) +
+      (has7d ? barGroup(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, false, p.usage_7d_resets_at) : '') +
       modelUsageBars(p) +
-      `<div class="field-sub">${resetIn ? `${t('profile.resets_in')} ${resetIn}` : t('profiles.no_reset_data')}</div>` +
+      (anyReset ? '' : `<div class="field-sub">${esc(t('profiles.no_reset_data'))}</div>`) +
       ((p.model_usage || []).length ? `<div class="field-sub">${esc(t('profile.model_window_note'))}</div>` : '') +
       creditsDetailLine(p);
     document.getElementById('pd_threshold_val').textContent = String(p.switch_threshold);

@@ -16,6 +16,8 @@ Rotation rules:
 
 from __future__ import annotations
 
+import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -55,9 +57,10 @@ class ProfileRuntime:
     last_usage_percent: Optional[float] = None
     cooldown_until: Optional[datetime] = None
     resets_at: Optional[datetime] = None
-    last_usage_percent_7d: Optional[float] = None  # display-only, never drives Rotation
+    last_usage_percent_7d: Optional[float] = None  # weights distribute-mode placement (_branch_weights); never a switch threshold
     resets_at_7d: Optional[datetime] = None
     window_label: Optional[str] = None  # None means "assume 5h"; see observation.UsageSnapshot
+    kind: Optional[str] = None  # the Profile's kind (oauth/api/codex); None reads as oauth
     window_label_7d: Optional[str] = None  # None means "assume 7d" (Anthropic) or "no second window" (codex); the Dashboard tells them apart by whether last_usage_percent_7d is also None
     # Per-model weekly windows (e.g. Fable), from usage reads only. The Fable
     # one drives fable_spent(); the rest are display-only.
@@ -233,23 +236,28 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
     or one of its subagents) — used only by distribute-mode routing.
 
     Unlike choose(), this is deliberately NOT sticky and NOT "first by
-    priority": its job is to spread branches so one account isn't drained
-    while another sits idle. Ordering, in force:
+    priority": its job is to spend the pool well, so one account isn't
+    drained while another sits idle and no account's week goes to waste.
 
-      1. fewest branches currently pinned to it (`branch_counts`) — the
-         spreading rule, and it has to come FIRST. Any other leading key
-         (priority, utilization) is the same for every branch of a session,
-         so every branch would pick the same winner and "each subagent gets
-         its own account" would quietly become "all of them share one".
-         Count-first makes the assignment round-robin: each account takes a
-         branch before any account takes a second.
-      2. priority band — decides the order WITHIN a round, so the user's
-         preference still says who is used first, second, third.
-      3. least-utilized first (`last_usage_percent`) — accounts are limited
-         by usage windows, not request count. A profile with no observation
-         yet sorts as 0.0, so a fresh account is preferred over a part-spent
-         one at the same priority.
-      4. `_reset_sort_key` — the same last resort choose() uses.
+    Each account gets a share of branches proportional to its weight
+    (`_branch_weights`): how urgently its unused weekly quota needs spending
+    (`_weekly_spend_rate`), capped against the pool and scaled down as its 5h
+    window fills. The next
+    branch goes to the account with the lowest load per unit of weight,
+    (pinned branches + 1) / weight — weighted round-robin. An account whose
+    week resets tomorrow with half its quota left takes several branches for
+    every one a barely-used account with a week to go takes; one nearly out
+    for the week takes few. With equal weights (a fresh pool) this is plain
+    round-robin: each account takes a branch before any takes a second.
+
+    Load has to come first. Any key that is the same for every branch of a
+    session (priority, utilization) would, as the leading key, send every
+    branch to the same winner, and "each subagent gets its own account"
+    would quietly become "all of them share one". Load grows with each
+    branch placed, so the winner changes.
+
+    Ties then go to the least-used 5h window, then priority, then
+    `_reset_sort_key`, then profile id.
 
     A depleted account can't be pulled in by this: candidates are ELIGIBLE
     only, so exhausted, draining and cooling-down accounts are already out.
@@ -283,14 +291,27 @@ def choose_for_new_branch(pool: PoolSnapshot, now: datetime,
     staying = [p for p in candidates if not must_leave(p, now)]
     if staying:
         candidates = staying
+    weights = _branch_weights(candidates, now)
     candidates.sort(key=lambda p: (
-        counts.get(p.profile_id, 0),
-        p.priority,
+        round((counts.get(p.profile_id, 0) + 1) / weights[p.profile_id], 6),
         p.last_usage_percent if p.last_usage_percent is not None else 0.0,
+        p.priority,
         _reset_sort_key(p),
         p.profile_id,  # final tie-break so equal candidates order deterministically
     ))
     return RoutingDecision(profile_id=candidates[0].profile_id, reason="branch_assigned")
+
+
+def branch_shares(pool: PoolSnapshot, now: datetime) -> dict[str, float]:
+    """Each account's long-run share (0..1) of NEW branches in distribute
+    mode: its `_branch_weights` entry over the pool's total, among the accounts
+    choose_for_new_branch would consider. For the Dashboard, so the accounts
+    taking most of the load are visible at a glance; routing never reads it."""
+    eligible = [p for p in pool.profiles if p.state == ProfileState.ELIGIBLE and p.automatic]
+    candidates = [p for p in eligible if not must_leave(p, now)] or eligible
+    weights = _branch_weights(candidates, now)
+    total = sum(weights.values())
+    return {pid: w / total for pid, w in weights.items()} if total > 0 else {}
 
 
 def observe(pool: PoolSnapshot, profile_id: str, observation: Observation, now: datetime) -> PoolSnapshot:
@@ -428,6 +449,92 @@ def _find(pool: PoolSnapshot, profile_id: Optional[str]) -> Optional[ProfileRunt
     if profile_id is None:
         return None
     return next((p for p in pool.profiles if p.profile_id == profile_id), None)
+
+
+_WEEK_HOURS = 7 * 24
+# A reset hours away is not a reason to pile everything onto one account: the
+# rate is computed as if at least this long were left.
+_MIN_HOURS_TO_RESET = 12.0
+# No account weighs more than this many times the pool's median, so a
+# subagent fan-out spreads instead of draining one account's 5h window.
+_MAX_WEIGHT_VS_MEDIAN = 3.0
+# Accounts without a weekly window (API keys, Codex plans whose only window is
+# 5h/daily/monthly) get this; so does the floor for a nearly-spent week.
+_MIN_BRANCH_WEIGHT = 0.1
+
+
+def _clean_percent(value: Optional[float]) -> Optional[float]:
+    """A usage percent clamped to 0..100; None for a missing or non-finite one."""
+    if value is None or not math.isfinite(value):
+        return None
+    return min(100.0, max(0.0, value))
+
+
+def _weekly_spend_rate(p: ProfileRuntime, now: datetime) -> Optional[float]:
+    """Unused weekly quota per hour left before the week resets: how fast
+    this account would have to be used for none of its week to go to waste.
+    50% left resetting in 24h is ~2.1 %/h; in 72h, ~0.7 %/h. None when the
+    account has no weekly window at all.
+
+      * A Claude subscription's weekly window is the 7d one. A subscription
+        (Claude or Codex) not observed yet counts as unused with a full week
+        left, until its first reading says otherwise.
+      * An account whose only window is weekly (window_label "weekly") uses
+        that, with switch_threshold as the ceiling, since rotation leaves it
+        there.
+      * API keys, and Codex plans observed to have only a 5h/daily/monthly
+        window, have no weekly window: nothing of theirs expires weekly.
+      * A reading whose reset has passed is stale: the window refilled, so it
+        counts as unused with a full week ahead.
+    Hours are floored at _MIN_HOURS_TO_RESET."""
+    if p.last_usage_percent_7d is not None or p.resets_at_7d is not None:
+        percent, resets_at, ceiling = p.last_usage_percent_7d, p.resets_at_7d, 100.0
+    elif p.window_label == "weekly":
+        percent, resets_at, ceiling = p.last_usage_percent, p.resets_at, p.switch_threshold
+    elif p.kind == "api" or (p.kind == "codex" and (p.window_label is not None
+                                                     or p.last_usage_percent is not None)):
+        return None
+    else:
+        percent, resets_at, ceiling = None, None, 100.0
+    if resets_at is not None and resets_at <= now:
+        percent, resets_at = None, None
+    headroom = max(0.0, ceiling - (_clean_percent(percent) or 0.0))
+    hours = _WEEK_HOURS
+    if resets_at is not None:
+        hours = max(_MIN_HOURS_TO_RESET, (resets_at - now).total_seconds() / 3600)
+    return headroom / hours
+
+
+def _five_hour_room(p: ProfileRuntime, now: datetime) -> float:
+    """How much of the 5h window is left before the switch threshold, as a
+    0.05..1 multiplier: piling branches onto an account about to hit its 5h
+    limit only moves them again shortly, each move a prompt-cache miss.
+    1.0 when the primary window isn't 5h, is unread, or has already reset."""
+    if p.window_label not in (None, "5h"):
+        return 1.0
+    percent = _clean_percent(p.last_usage_percent)
+    if percent is None or (p.resets_at is not None and p.resets_at <= now):
+        return 1.0
+    threshold = p.switch_threshold if p.switch_threshold > 0 else 100.0
+    return min(1.0, max(0.05, (threshold - percent) / threshold))
+
+
+def _branch_weights(candidates: list, now: datetime) -> dict[str, float]:
+    """Distribute mode's weight per candidate: the weekly spend rate, capped
+    at _MAX_WEIGHT_VS_MEDIAN times the candidates' median and floored at
+    _MIN_BRANCH_WEIGHT, times `_five_hour_room`. An account with no weekly
+    window gets the floor. Always positive and finite."""
+    rates = {p.profile_id: _weekly_spend_rate(p, now) for p in candidates}
+    known = [r for r in rates.values() if r is not None]
+    cap = max(_MIN_BRANCH_WEIGHT, statistics.median(known)) * _MAX_WEIGHT_VS_MEDIAN if known else None
+    weights = {}
+    for p in candidates:
+        rate = rates[p.profile_id]
+        base = _MIN_BRANCH_WEIGHT if rate is None else max(_MIN_BRANCH_WEIGHT, rate)
+        if cap is not None:
+            base = min(base, cap)
+        weights[p.profile_id] = base * _five_hour_room(p, now)
+    return weights
 
 
 def _reset_sort_key(p: ProfileRuntime) -> tuple:

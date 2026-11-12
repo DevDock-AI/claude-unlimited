@@ -134,7 +134,8 @@ class Settings:
     notify_needs_attention: bool = True
     # Make `code --distribute` the default for every session (UI: "Balance
     # sessions and subagents across accounts"): each new agent starts on the
-    # least-busy account and stays there. OFF by default — it changes how
+    # account whose unused weekly quota would otherwise go to waste soonest
+    # (router.choose_for_new_branch) and stays there. OFF by default — it changes how
     # accounts are consumed, so it must be chosen, never inherited. The flag
     # stays available per-session either way; the two are OR-ed, so this
     # setting can only ever turn distribution ON, never override a `--profile`

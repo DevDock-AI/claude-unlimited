@@ -68,7 +68,7 @@ from . import usage_history
 from .config import APP_DIR, DEFAULT_SWITCH_THRESHOLD, ensure_app_dir, load_pool, update_settings
 from .gateway import Gateway, GatewayResult
 from .proxy import MAX_REQUEST_BYTES, REQUEST_TOO_LARGE_BODY, REQUEST_TOO_LARGE_STATUS
-from .router import spending_on_credits
+from .router import PoolSnapshot, branch_shares, spending_on_credits
 
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 4317
@@ -737,8 +737,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             # this once a second and the table grows forever.
             usage_map = usage_history.totals_by_profile()
             in_flight = _gateway.in_flight_ids()
+            pool = load_pool()
             items = [_profile_to_public_dict(p, runtime_map.get(p.id), usage_map.get(p.id), p.id in in_flight)
-                     for p in profile_repo.list_profiles()]
+                     for p in pool.profiles]
             live_agents = _gateway.live_agent_counts()
             on_account = _gateway.agents_on_account_seconds()
             last_use = usage_history.latest_by_profile()
@@ -757,7 +758,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 seconds = on_account.get(item["id"])
                 item["agents_since"] = ((now_utc - timedelta(seconds=seconds)).isoformat()
                                         if seconds is not None else None)
-            self._send_json(200, {"profiles": items})
+            # Share of new agents each account takes in distribute mode, so
+            # the Dashboard can show where the load is going. `distribute` is
+            # on with the setting, or while any `code --distribute` agent is live.
+            shares = branch_shares(PoolSnapshot(profiles=list(runtime_map.values())), now_utc)
+            for item in items:
+                share = shares.get(item["id"])
+                item["load_share"] = round(share, 4) if share is not None else None
+            self._send_json(200, {"profiles": items,
+                                  "distribute": bool(pool.settings.distribute_sessions_default
+                                                     or _gateway.distribute_active())})
             return
 
         if path == "/api/codex/model-map":

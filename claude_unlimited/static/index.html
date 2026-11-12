@@ -540,6 +540,9 @@
   .model-usage-line { display: flex; flex-wrap: wrap; gap: 0 10px; min-width: 0; margin-top: 1px; }
   .model-usage-chip { font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums;
     min-width: 0; overflow-wrap: anywhere; }   /* wraps inside a narrow name cell, never over the next column */
+  .load-share-pill { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px;
+    border: 1px solid var(--accent-border); background: var(--accent-soft); color: var(--accent);
+    font-size: var(--fs-micro); font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .live-agents-pill { display: inline-flex; align-items: center; padding: 2px 7px;
     border: 1px solid var(--border); border-radius: 999px; background: var(--bg-panel-alt);
     color: var(--text-dim); font-size: var(--fs-micro); font-weight: 600; white-space: nowrap;
@@ -1476,7 +1479,7 @@
         <div class="field-row">
           <div class="field-text">
             <div class="field-title" data-i18n="settings.routing.distribute_label">Balance sessions and subagents across accounts</div>
-            <div class="field-sub" data-i18n="settings.routing.distribute_sub">Each new agent starts on the least-busy account. Same as launching every session with --distribute. Off by default.</div>
+            <div class="field-sub" data-i18n="settings.routing.distribute_sub">New agents go mostly to accounts whose unused weekly quota resets soonest, less to ones near a limit. Same as launching every session with --distribute. Off by default.</div>
           </div>
           <div class="toggle off" id="distributeDefaultToggle" data-field="distribute_sessions_default"><div class="toggle-knob"></div></div>
         </div>
@@ -1497,7 +1500,7 @@
           <div class="toggle off" id="fableLimitAllToggle" data-field="fable_limit_all_profiles"><div class="toggle-knob"></div></div>
         </div>
         <div class="routing-explainer">
-          <div data-i18n="settings.routing.explainer">A Claude Code session is not one caller: the agent you type at (the "main agent") and every subagent it spawns send their own requests. Normally they all share one account, chosen by rotation. Turn this on and each new agent goes to the account with the fewest agents already working on it, across all your sessions — ties go to your priority order, then to the least-used account. Over time this spreads your usage across accounts instead of draining one first.</div>
+          <div data-i18n="settings.routing.explainer">A Claude Code session is not one caller: the agent you type at (the "main agent") and every subagent it spawns send their own requests. Normally they all share one account, chosen by rotation. Turn this on and each new agent goes where quota would otherwise go to waste: every account takes a share of new agents in proportion to its unused weekly quota per hour left before its week resets, and less as its 5-hour window fills. API keys and accounts without a weekly window take only a small share. Agents are counted across all your sessions, and your priority order only breaks ties.</div>
           <div class="routing-when" data-i18n="settings.routing.when">Balancing happens only when an agent starts — a new session, or a new subagent. It never rebalances mid-session: once an agent is on an account it stays there, so its prompt cache stays warm. It moves only if that account reaches its switch threshold or a usage limit, becomes unavailable, or the agent sits idle for an hour. It spreads by how many agents each account is serving, not by usage percentage, so usage evens out roughly rather than exactly.</div>
           <div class="routing-example">
             <div class="routing-example-title" data-i18n="settings.routing.example_off_title">Setting OFF (default) — one account at a time</div>
@@ -1505,7 +1508,7 @@
           </div>
           <div class="routing-example">
             <div class="routing-example-title" data-i18n="settings.routing.example_on_title">Setting ON — agents spread across accounts</div>
-            <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. The agent you type at starts on Personal Max, the first subagent on Work Max, the second on Codex — all three at the same time, each on the account that was least busy when it started. Each stays on its own account until it finishes. If Work Max reaches its threshold mid-task, only the subagent on Work Max moves; the other two stay where they are.</div>
+            <div class="routing-example-body" data-i18n="settings.routing.example_on">Example: the same audit, with the setting on. Work Max's week resets tomorrow with half of it unused, so the agent you type at and the first subagent start there; the second subagent starts on Personal Max, whose week has days to go. All three run at the same time, and each stays on its own account until it finishes. If Work Max reaches its threshold mid-task, only the agents on Work Max move; the other one stays where it is.</div>
           </div>
           <div class="routing-note" data-i18n="settings.routing.note">Still available per session either way: cu code --distribute turns balancing on for one session while this is off. cu code --profile &lt;name&gt; always wins over both and pins the main agent to one account; its subagents go to a profile marked "Forced in subagents" if there is one, held just as strictly — never rerouted (if that profile is disabled, they follow the pin).</div>
         </div>
@@ -2003,7 +2006,7 @@
               <span data-i18n="settings.network.copy">Copy</span>
             </div>
           </div>
-          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. --distribute instead balances the session across accounts: the main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. Any other extra arguments pass straight through to claude.</div>
+          <div class="field-sub" data-i18n="help.cmd.code">Starts the daemon if it isn't already running, then launches claude routed through your pool. With more than one enabled Profile, prompts you to pick one for this session (or Rotated accounts for the default automatic behavior) — pass --profile &lt;name&gt; to skip the prompt, or run non-interactively for the same default. --distribute instead balances the session across accounts: the main agent and each subagent start on the account whose unused weekly quota would otherwise go to waste soonest, and stay there, each keeping its own prompt cache warm. Any other extra arguments pass straight through to claude.</div>
         </div>
         <div class="divider"></div>
         <div class="cmd-row">
@@ -2063,7 +2066,7 @@
           </tr>
           <tr>
             <td class="mono">cu code --distribute</td>
-            <td data-i18n="help.routing.r_distribute">The main agent and each subagent start on the least-busy account and stay there, each keeping its own prompt cache warm. No rebalancing mid-session.</td>
+            <td data-i18n="help.routing.r_distribute">The main agent and each subagent start on the account whose unused weekly quota would otherwise go to waste soonest, and stay there, each keeping its own prompt cache warm. No rebalancing mid-session.</td>
           </tr>
           <tr>
             <td data-i18n="help.routing.r_setting_how">Settings → Session routing</td>
