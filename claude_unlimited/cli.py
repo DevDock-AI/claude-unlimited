@@ -689,6 +689,10 @@ def restart(port: int) -> int:
     service = daemon_installer.status()
 
     if service["installed"]:
+        # A daemon that `cu code` or `start` spawned while the service was
+        # down keeps the port, so the service's fresh copy can't bind and the
+        # health probe below would pass against the stale one.
+        _stop_running_daemon(port)
         try:
             daemon_installer.start()  # atomic stop+start
         except daemon_installer.DaemonInstallerError as exc:

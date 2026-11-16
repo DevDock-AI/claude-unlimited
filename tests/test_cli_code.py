@@ -375,3 +375,17 @@ def test_newest_fable_id_ranks_two_digit_minor_above_single_digit():
     from claude_unlimited import cli
     cat = _fable_catalogue("claude-fable-5-1", "claude-fable-5-9", "claude-fable-5-10", "claude-fable-5-5")
     assert cli._newest_fable_id(cat) == "claude-fable-5-10"
+
+
+def test_restart_with_the_service_installed_first_stops_a_stray_daemon(monkeypatch):
+    # A daemon `cu code` spawned while the service was down holds the port;
+    # restarting only the service would leave it serving the old code.
+    from claude_unlimited import cli
+
+    calls = []
+    monkeypatch.setattr(cli.daemon_installer, "status", lambda: {"installed": True})
+    monkeypatch.setattr(cli, "_stop_running_daemon", lambda port: calls.append(("stop", port)))
+    monkeypatch.setattr(cli.daemon_installer, "start", lambda: calls.append(("service-start",)))
+    monkeypatch.setattr(cli, "_probe_health", lambda *a, **k: True)
+    assert cli.restart(4317) == 0
+    assert calls == [("stop", 4317), ("service-start",)]
