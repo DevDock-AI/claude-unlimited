@@ -105,3 +105,50 @@ def test_expired_distribute_token_no_longer_grants_anything():
     data[token]["created_at"] = stale
     session_tokens._save(data)
     assert session_tokens.resolve_grant(token) == session_tokens.SessionGrant()
+
+
+def _age(token, days):
+    data = session_tokens._load()
+    data[token]["created_at"] = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    data[token].pop("last_used_at", None)
+    session_tokens._save(data)
+
+
+def test_a_token_in_use_outlives_the_ttl_counted_from_creation():
+    # A session relaunched onto a reused token, or simply left running,
+    # must not be cut off 30 days after the token was first minted.
+    token = session_tokens.get_or_create_distribute()
+    _age(token, 29)
+    assert session_tokens.resolve_grant(token).distribute
+    data = session_tokens._load()
+    data[token]["created_at"] = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    session_tokens._save(data)
+    assert session_tokens.resolve_grant(token).distribute
+
+
+def test_reusing_a_token_restarts_its_expiry_clock():
+    token = session_tokens.get_or_create("prof-a")
+    _age(token, 29)
+    assert session_tokens.get_or_create("prof-a") == token
+    data = session_tokens._load()
+    data[token]["created_at"] = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    session_tokens._save(data)
+    assert session_tokens.resolve(token) == "prof-a"
+
+
+def test_a_recently_used_token_is_not_rewritten_on_every_request():
+    token = session_tokens.get_or_create("prof-a")
+    session_tokens.resolve(token)
+    before = session_tokens.SESSION_TOKENS_FILE.stat().st_mtime_ns
+    session_tokens.resolve(token)
+    assert session_tokens.SESSION_TOKENS_FILE.stat().st_mtime_ns == before
+
+
+def test_an_unused_token_still_expires():
+    token = session_tokens.get_or_create("prof-a")
+    data = session_tokens._load()
+    stale = (datetime.now(timezone.utc) - session_tokens.SESSION_TOKEN_TTL - timedelta(days=1)).isoformat()
+    data[token]["created_at"] = stale
+    data[token]["last_used_at"] = stale
+    session_tokens._save(data)
+    assert session_tokens.resolve(token) is None

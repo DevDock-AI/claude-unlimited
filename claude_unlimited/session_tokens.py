@@ -8,9 +8,10 @@ session; that is what this module mints.
 
 get_or_create() reuses a live token for the same profile_id instead of
 minting a fresh one per call, so repeated invocations don't grow the file
-unboundedly. Tokens expire after SESSION_TOKEN_TTL: long enough that a
-long-running terminal session isn't invalidated under itself, short enough
-that dead entries don't accumulate indefinitely.
+unboundedly. Tokens expire after SESSION_TOKEN_TTL without use: the clock
+restarts whenever a token is reused or presented, so a long-running terminal
+session (or one relaunched onto a reused token) is never invalidated under
+itself, while dead entries still don't accumulate indefinitely.
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ from .config import APP_DIR, ensure_app_dir
 
 SESSION_TOKENS_FILE = APP_DIR / "session_tokens.json"
 SESSION_TOKEN_TTL = timedelta(days=30)
+# How stale last_used_at may get before a request rewrites it, so a busy
+# session doesn't rewrite the file on every request.
+_TOUCH_INTERVAL = timedelta(hours=1)
 _lock = threading.Lock()
 
 
@@ -46,12 +50,28 @@ def _save(data: dict) -> None:
     tmp.replace(SESSION_TOKENS_FILE)
 
 
-def _is_expired(entry: dict, now: datetime) -> bool:
+def _last_active(entry: dict) -> Optional[datetime]:
+    """When the token was last minted, reused or presented. Entries written
+    before last_used_at existed fall back to created_at."""
     try:
-        created_at = datetime.fromisoformat(entry["created_at"])
-    except (KeyError, ValueError):
-        return True
-    return now - created_at > SESSION_TOKEN_TTL
+        stamps = [datetime.fromisoformat(entry[k]) for k in ("created_at", "last_used_at") if entry.get(k)]
+    except (TypeError, ValueError):
+        return None
+    return max(stamps) if stamps else None
+
+
+def _is_expired(entry: dict, now: datetime) -> bool:
+    last = _last_active(entry)
+    return last is None or now - last > SESSION_TOKEN_TTL
+
+
+def _touch(data: dict, token: str, now: datetime) -> bool:
+    """Restart the token's expiry clock; True if the entry changed."""
+    last = _last_active(data[token])
+    if last is not None and now - last < _TOUCH_INTERVAL:
+        return False
+    data[token] = {**data[token], "last_used_at": now.isoformat()}
+    return True
 
 
 @dataclass(frozen=True)
@@ -92,7 +112,9 @@ def _get_or_create_entry(fields: dict, matches) -> str:
         alive = {tok: entry for tok, entry in data.items() if not _is_expired(entry, now)}
         for tok, entry in alive.items():
             if matches(entry):
-                if len(alive) != len(data):
+                # A relaunch reuses this token, so its 30 days start again
+                # rather than running out mid-session.
+                if _touch(alive, tok, now) or len(alive) != len(data):
                     _save(alive)
                 return tok
         token = secrets.token_urlsafe(32)
@@ -115,9 +137,14 @@ def resolve_grant(token: str) -> SessionGrant:
     now = datetime.now(timezone.utc)
     with _lock:
         data = _load()
-    entry = data.get(token)
-    if entry is None or _is_expired(entry, now):
-        return SessionGrant()
+        entry = data.get(token)
+        if entry is None or _is_expired(entry, now):
+            return SessionGrant()
+        # Presenting the token keeps it alive, so a session that is in use
+        # never expires; only abandoned ones do.
+        if _touch(data, token, now):
+            _save(data)
+            entry = data[token]
     profile_id = entry.get("profile_id")
     if profile_id:
         return SessionGrant(forced_profile_id=profile_id)  # a pin always wins
